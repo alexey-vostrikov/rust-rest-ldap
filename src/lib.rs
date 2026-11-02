@@ -18,6 +18,7 @@ pub mod dn;
 pub mod http;
 pub mod index;
 pub mod ldap;
+pub mod ldif;
 pub mod mapping;
 pub mod model;
 pub mod mutate;

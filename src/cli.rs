@@ -40,6 +40,20 @@ pub struct Cli {
     /// Turn on debug logging
     #[arg(short = 'd', long = "debug")]
     pub debug: bool,
+
+    /// Write the directory as LDIF to PATH and exit ('-' for stdout)
+    ///
+    /// Loads the configured backend and dumps it; the server is not started. The
+    /// output is what `ldapadd -f` expects, so it can be fed to OpenLDAP or 389 DS.
+    #[arg(long = "export-ldif", value_name = "PATH", conflicts_with = "listen")]
+    pub export_ldif: Option<PathBuf>,
+
+    /// Include operational attributes (entryUUID, timestamps, entryCSN) in the export
+    ///
+    /// Off by default: on import the target directory issues its own, and two servers
+    /// would then disagree about which value wins.
+    #[arg(long = "export-operational", requires = "export_ldif")]
+    pub export_operational: bool,
 }
 
 impl From<Cli> for config::Args {
@@ -52,6 +66,8 @@ impl From<Cli> for config::Args {
             interval: cli.interval,
             log_path: cli.log,
             debug: cli.debug,
+            export_ldif: cli.export_ldif,
+            export_operational: cli.export_operational,
         }
     }
 }
@@ -103,6 +119,7 @@ mod tests {
 
         let args: config::Args = cli.into();
 
+        assert_eq!(args.export_ldif, None, "a plain run is not an export");
         assert_eq!(args, config::Args::default());
     }
 
