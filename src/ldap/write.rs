@@ -259,7 +259,8 @@ pub fn handle_add(
 
     let entry = Entry::new(entry_dn.clone(), attributes);
 
-    if let Err((code, detail)) = schema_verdict(&security.schema, security.schema_mode, &entry) {
+    let published = crate::security::current_schema(&security.schema);
+    if let Err((code, detail)) = schema_verdict(&published, security.schema_mode, &entry) {
         return reject(response(code, &detail));
     }
 
@@ -466,7 +467,8 @@ pub fn handle_modify_dn(
 
     let renamed = Entry::new(new_dn.clone(), attributes);
 
-    if let Err((code, detail)) = schema_verdict(&security.schema, security.schema_mode, &renamed) {
+    let published = crate::security::current_schema(&security.schema);
+    if let Err((code, detail)) = schema_verdict(&published, security.schema_mode, &renamed) {
         return reject(response(code, &detail));
     }
 

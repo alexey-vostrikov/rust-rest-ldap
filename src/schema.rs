@@ -295,6 +295,11 @@ pub enum SchemaError {
     UnknownSuperior(String),
     #[error("object class '{0}' has no 'sup' chain ending at 'top'")]
     BrokenClassChain(String),
+    #[error(
+        "the definition starting on line {line} is never closed: its parentheses are still open \
+         at the end of the file ('{text}')"
+    )]
+    Unterminated { line: usize, text: String },
 }
 
 /// Parsed schema: attribute types and object classes, resolved by name or OID.
@@ -316,7 +321,7 @@ impl Schema {
 
     /// Adds definitions, resolving names to OIDs.
     pub fn extend(&mut self, definitions: &str) -> Result<(), SchemaError> {
-        for definition in split_definitions(definitions) {
+        for definition in split_definitions(definitions)? {
             let tokens = tokenize(&definition)?;
             match tokens.first().map(String::as_str) {
                 Some("attributetype") | Some("attributeType") => {
@@ -394,6 +399,19 @@ impl Schema {
         }
         classes.sort_by(|left, right| left.oid.cmp(&right.oid));
         classes
+    }
+
+    /// How many distinct attribute types the schema holds, counted by OID.
+    ///
+    /// By OID rather than by name: an alias is the same type, and a schema that reports its
+    /// size including aliases would look like it grew when a name was added.
+    pub fn attribute_count(&self) -> usize {
+        self.attribute_types().len()
+    }
+
+    /// How many distinct object classes the schema holds, counted by OID.
+    pub fn class_count(&self) -> usize {
+        self.object_classes().len()
     }
 
     pub fn attribute(&self, name: &str) -> Option<&AttributeType> {
@@ -698,11 +716,18 @@ fn names_and_oid(names: &[String], oid: &str) -> Vec<String> {
 }
 
 /// Splits a schema text into definitions: every top-level parenthesised block.
-fn split_definitions(text: &str) -> Vec<String> {
+/// Splits a schema text into its definitions, joining continuation lines.
+///
+/// A definition continues until its parentheses balance. One that never balances is an error
+/// and not a line to drop: a file with a missing `)` is the shape a half-saved edit takes, and
+/// silently ignoring it means the schema in force is not the one somebody wrote - the
+/// definition simply is not there, and nothing says so until a write is refused for an
+/// attribute the operator is sure they defined.
+fn split_definitions(text: &str) -> Result<Vec<String>, SchemaError> {
     let mut definitions = Vec::new();
-    let mut current: Option<String> = None;
+    let mut current: Option<(usize, String)> = None;
 
-    for line in text.lines() {
+    for (index, line) in text.lines().enumerate() {
         let line = match line.split_once('#') {
             Some((before, _)) => before,
             None => line,
@@ -715,23 +740,26 @@ fn split_definitions(text: &str) -> Vec<String> {
         match current.as_mut() {
             None => {
                 if trimmed.contains('(') {
-                    current = Some(trimmed.to_string());
+                    current = Some((index + 1, trimmed.to_string()));
                 }
             }
-            Some(buffer) => {
+            Some((_, buffer)) => {
                 buffer.push(' ');
                 buffer.push_str(trimmed);
             }
         }
 
-        // A definition continues on the next line until its parentheses balance.
-        if let Some(buffer) = current.as_ref().filter(|buffer| balanced(buffer)) {
+        if let Some((_, buffer)) = current.as_ref().filter(|(_, buffer)| balanced(buffer)) {
             definitions.push(buffer.clone());
             current = None;
         }
     }
 
-    definitions
+    if let Some((line, text)) = current {
+        return Err(SchemaError::Unterminated { line, text });
+    }
+
+    Ok(definitions)
 }
 
 fn balanced(text: &str) -> bool {

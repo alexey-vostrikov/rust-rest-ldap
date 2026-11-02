@@ -81,6 +81,11 @@ pub struct Config {
     pub passwords: PasswordPolicy,
     pub schema: Schema,
     pub schema_mode: SchemaMode,
+    /// The files the extra definitions were read from, kept so a reload can re-read them.
+    ///
+    /// The schema itself is a parsed value and cannot be re-derived from it: a reload needs
+    /// the paths, not the result.
+    pub schema_files: Vec<PathBuf>,
     pub indexes: IndexConfig,
     pub acl: Acl,
     /// Simple bind over an unencrypted connection.
@@ -446,6 +451,7 @@ pub fn resolve(
         callback_auth_token: file.callback_auth_token,
         passwords: PasswordPolicy::from_config(file.passwords.as_ref())?,
         schema: load_schema(&file.schema)?,
+        schema_files: file.schema.files.clone(),
         schema_mode: match file.schema.mode.as_deref() {
             None => SchemaMode::Strict,
             Some(text) => text

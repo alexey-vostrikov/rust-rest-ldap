@@ -132,6 +132,14 @@ pub enum BackendError {
     Index(#[from] crate::index::IndexError),
     #[error("data does not match the schema ({count} problems), first ones: {}", first.join("; "))]
     SchemaViolations { count: usize, first: Vec<String> },
+    #[error("cannot read the schema file '{path}': {source}")]
+    SchemaRead {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the schema file '{path}' is not valid: {detail}")]
+    SchemaParse { path: String, detail: String },
 }
 
 /// Selected backend.

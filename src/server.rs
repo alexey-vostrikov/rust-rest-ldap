@@ -631,6 +631,7 @@ mod tests {
             passwords: Default::default(),
             schema: crate::schema::Schema::core(),
             schema_mode: crate::schema::Mode::Strict,
+            schema_files: Vec::new(),
             indexes: crate::index::IndexConfig::default(),
             acl: Default::default(),
             allow_unencrypted_bind: true,

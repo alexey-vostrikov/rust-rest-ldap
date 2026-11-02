@@ -126,9 +126,11 @@ pub fn handle_modify(
 
     // Schema checking decides whether SINGLE-VALUE applies, and `off` means the server
     // does not enforce what it does not publish as enforced.
+    // Read once: one operation must see one schema, even if a reload lands mid-request.
+    let published = crate::security::current_schema(&security.schema);
     let schema = match security.schema_mode {
         SchemaMode::Off => None,
-        _ => Some(&security.schema),
+        _ => Some(published.as_ref()),
     };
 
     let modified = match mutate::apply(entry, &modifications(request), schema) {
@@ -166,7 +168,7 @@ pub fn handle_modify(
     }
 
     // The entry as it would be stored must satisfy the schema it is published under.
-    if let Err(violations) = check(&security.schema, security.schema_mode, &modified) {
+    if let Err(violations) = check(&published, security.schema_mode, &modified) {
         let detail = violations
             .iter()
             .map(|violation| violation.detail.clone())
