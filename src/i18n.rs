@@ -417,6 +417,25 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("error.index", "cannot build the index: {detail}"),
     (
+        "config.store_empty",
+        "'{path}' is a configuration store but holds no generation yet; commit one with --config-commit, or point at a configuration file instead",
+    ),
+    (
+        "config.store",
+        "cannot read the configuration store '{path}': {detail}",
+    ),
+    (
+        "error.store_path_missing",
+        "--{command} needs the store directory: pass it with -c /etc/rust-rest-ldap/config.d",
+    ),
+    (
+        "error.store_not_a_directory",
+        "'{path}' is not a directory; the generation store is a directory, and a plain file is a configuration",
+    ),
+    ("error.store", "configuration store: {detail}"),
+    ("store.done", "committed as {what}"),
+    ("store.collected", "collected generations {numbers}"),
+    (
         "error.schema_reload",
         "cannot reload the schema, the previous one stays in force: {detail}",
     ),
