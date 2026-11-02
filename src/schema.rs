@@ -82,7 +82,9 @@ impl Syntax {
                 let digits = value.strip_prefix('-').unwrap_or(value);
                 !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
             }
-            Syntax::Boolean => value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false"),
+            Syntax::Boolean => {
+                value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false")
+            }
             Syntax::DistinguishedName => crate::dn::is_valid(value),
             // A descriptor is a legal value wherever an OID is: `objectClass: top`
             // is a name, not a dotted number (RFC 4512 §1.4).
@@ -166,10 +168,7 @@ pub enum SchemaError {
     #[error("definition is not a parenthesised list: {0}")]
     NotASequence(String),
     #[error("unknown keyword '{keyword}' in {kind} definition")]
-    UnknownKeyword {
-        keyword: String,
-        kind: &'static str,
-    },
+    UnknownKeyword { keyword: String, kind: &'static str },
     #[error("keyword '{keyword}' needs a value in {kind} definition")]
     MissingValue {
         keyword: &'static str,
@@ -301,7 +300,10 @@ impl Schema {
     }
 
     /// Attribute names an object class allows, following the `SUP` chain.
-    pub fn allowed_attributes(&self, class_name: &str) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+    pub fn allowed_attributes(
+        &self,
+        class_name: &str,
+    ) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
         let mut must = BTreeSet::new();
         let mut may = BTreeSet::new();
         let mut seen = BTreeSet::new();
@@ -651,7 +653,9 @@ fn parse_attribute_type(tokens: &[String]) -> Result<AttributeType, SchemaError>
     let oid = cursor.word().ok_or(SchemaError::MissingOid {
         kind: "attributetype",
     })?;
-    if !is_numeric_oid(&oid) && !is_descriptor(&oid) || ATTRIBUTE_KEYWORDS.contains(&oid.to_ascii_uppercase().as_str()) {
+    if !is_numeric_oid(&oid) && !is_descriptor(&oid)
+        || ATTRIBUTE_KEYWORDS.contains(&oid.to_ascii_uppercase().as_str())
+    {
         return Err(SchemaError::MissingOid {
             kind: "attributetype",
         });
@@ -1020,7 +1024,9 @@ attributetype ( 2.5.4.41 NAME 'name'
             .expect("parse");
 
         assert_eq!(
-            schema.class("organizationalUnit").map(|class| class.must.clone()),
+            schema
+                .class("organizationalUnit")
+                .map(|class| class.must.clone()),
             Some(vec!["ou".to_string()])
         );
     }
@@ -1029,14 +1035,15 @@ attributetype ( 2.5.4.41 NAME 'name'
     fn syntax_with_length_suffix_is_understood() {
         let mut schema = Schema::default();
         schema
-            .extend(
-                "attributetype ( 1.2.3.4 NAME 'x' SYNTAX 1.3.6.1.4.1.1466.115.121.1.27{10} )",
-            )
+            .extend("attributetype ( 1.2.3.4 NAME 'x' SYNTAX 1.3.6.1.4.1.1466.115.121.1.27{10} )")
             .expect("parse");
 
         let attribute = schema.attribute("x").expect("x");
         assert_eq!(attribute.syntax, Some(Syntax::Integer));
-        assert_eq!(attribute.syntax_oid.as_deref(), Some("1.3.6.1.4.1.1466.115.121.1.27"));
+        assert_eq!(
+            attribute.syntax_oid.as_deref(),
+            Some("1.3.6.1.4.1.1466.115.121.1.27")
+        );
     }
 
     #[test]
@@ -1072,7 +1079,12 @@ attributetype ( 2.5.4.41 NAME 'name'
             .extend("attributetype ( 1.2.3.4 NAME 'cn' SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )")
             .expect_err("must reject");
 
-        assert_eq!(error, SchemaError::DuplicateName { name: "cn".to_string() });
+        assert_eq!(
+            error,
+            SchemaError::DuplicateName {
+                name: "cn".to_string()
+            }
+        );
     }
 
     #[test]
@@ -1234,7 +1246,11 @@ attributetype ( 2.5.4.41 NAME 'name'
         let attributes = Attributes::new()
             .push(Attribute::new(
                 "objectClass",
-                vec!["top".to_string(), "person".to_string(), "organizationalUnit".to_string()],
+                vec![
+                    "top".to_string(),
+                    "person".to_string(),
+                    "organizationalUnit".to_string(),
+                ],
             ))
             .push(Attribute::single("cn", "ann"))
             .push(Attribute::single("sn", "Doe"))

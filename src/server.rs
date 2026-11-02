@@ -353,6 +353,7 @@ mod tests {
             passwords: Default::default(),
             schema: crate::schema::Schema::core(),
             schema_mode: crate::schema::Mode::Strict,
+            indexes: crate::index::IndexConfig::default(),
             acl: Default::default(),
             allow_plaintext_simple_bind: true,
         }

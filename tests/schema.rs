@@ -107,7 +107,9 @@ fn violations_carry_the_codes_a_client_expects() {
         .push(Attribute::single("uidNumber", "not-a-number"));
     let entry = Entry::new("cn=x,ou=users,dc=example,dc=com", attributes);
 
-    let violations = schema.check(&entry).expect_err("uidNumber is not allowed here");
+    let violations = schema
+        .check(&entry)
+        .expect_err("uidNumber is not allowed here");
 
     assert!(
         violations
@@ -134,7 +136,11 @@ objectclass ( 1.3.6.1.4.1.99999.2 NAME 'badgeHolder' SUP top AUXILIARY MAY badge
     let with_badge = Attributes::new()
         .push(Attribute::new(
             "objectClass",
-            vec!["top".to_string(), "person".to_string(), "badgeHolder".to_string()],
+            vec![
+                "top".to_string(),
+                "person".to_string(),
+                "badgeHolder".to_string(),
+            ],
         ))
         .push(Attribute::single("cn", "x"))
         .push(Attribute::single("sn", "Y"))

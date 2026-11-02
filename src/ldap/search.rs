@@ -102,8 +102,18 @@ pub fn handle_search(
         .map(|attribute| attribute.0.clone())
         .collect();
 
+    // The index only narrows: every candidate is still checked by the filter below,
+    // so a wrong index costs speed, never correctness.
+    let candidates = directory.candidates(&filter::to_query(&request.filter));
+
     let mut matched: Vec<(String, Attributes)> = Vec::new();
-    for entry in directory.entries(&base_object, scope) {
+    for (position, entry) in directory.entries_with_ids(&base_object, scope) {
+        if candidates
+            .as_ref()
+            .is_some_and(|candidates| !candidates.contains(position as u32))
+        {
+            continue;
+        }
         let entry_dn = entry.dn().to_string();
         if !security
             .acl

@@ -12,6 +12,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 use crate::backend::{Backend, BackendError};
 use crate::config::Config;
 use crate::directory::Directory;
+use crate::index::IndexConfig;
 use crate::schema::{Mode as SchemaMode, Schema};
 
 /// Holds the current directory snapshot and knows how to rebuild it.
@@ -24,6 +25,7 @@ pub struct Source {
     generation: RwLock<u64>,
     schema: Schema,
     schema_mode: SchemaMode,
+    indexes: IndexConfig,
 }
 
 impl Source {
@@ -35,11 +37,14 @@ impl Source {
         backend: Backend,
     ) -> Result<(Arc<Self>, Arc<Directory>), BackendError> {
         let data = backend.load().await?;
-        let directory = Arc::new(data.into_directory(
-            &config.base_dn,
-            &config.users_ou_name,
-            &config.groups_ou_name,
-        ));
+        let directory = data
+            .into_directory(
+                &config.base_dn,
+                &config.users_ou_name,
+                &config.groups_ou_name,
+            )
+            .with_indexes(&config.indexes)?;
+        let directory = Arc::new(directory);
 
         check_schema(&directory, &config.schema, config.schema_mode)?;
 
@@ -50,6 +55,7 @@ impl Source {
             groups_ou_name: config.groups_ou_name.clone(),
             current: RwLock::new(Arc::clone(&directory)),
             generation: RwLock::new(0),
+            indexes: config.indexes.clone(),
             schema: config.schema.clone(),
             schema_mode: config.schema_mode,
         });
@@ -73,8 +79,9 @@ impl Source {
     /// empty the directory that clients are using.
     pub async fn reload(&self) -> Result<usize, BackendError> {
         let data = self.backend.load().await?;
-        let directory =
-            data.into_directory(&self.base_dn, &self.users_ou_name, &self.groups_ou_name);
+        let directory = data
+            .into_directory(&self.base_dn, &self.users_ou_name, &self.groups_ou_name)
+            .with_indexes(&self.indexes)?;
         let entries = directory
             .entries(&self.base_dn, crate::directory::Scope::Subtree)
             .len();
@@ -193,6 +200,7 @@ mod tests {
             passwords: Default::default(),
             schema: crate::schema::Schema::core(),
             schema_mode: crate::schema::Mode::Strict,
+            indexes: crate::index::IndexConfig::default(),
             acl: Default::default(),
             allow_plaintext_simple_bind: true,
         };

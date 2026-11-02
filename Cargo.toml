@@ -26,6 +26,7 @@ pbkdf2 = "0.13.0"
 rasn = "0.30.0"
 rasn-ldap = "0.30.0"
 redb = "4.4.0"
+roaring = "0.12.0"
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2.2.0"
 rustls-rustcrypto = "0.0.2-alpha"
