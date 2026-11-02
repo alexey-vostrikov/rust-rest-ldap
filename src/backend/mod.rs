@@ -83,7 +83,7 @@ impl Backend {
     /// Builds the backend named in the configuration.
     pub fn from_config(
         name: &str,
-        config: Option<&serde_yaml_ng::Value>,
+        config: Option<&serde_json::Value>,
     ) -> Result<Self, BackendError> {
         match name {
             "file" => {

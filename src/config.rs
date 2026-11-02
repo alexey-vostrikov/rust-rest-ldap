@@ -47,7 +47,7 @@ pub struct Config {
     pub debug: bool,
     pub log_timestamp: bool,
     pub log_caller: bool,
-    pub backends: BTreeMap<String, serde_yaml_ng::Value>,
+    pub backends: BTreeMap<String, serde_json::Value>,
     pub respect_control_criticality: bool,
     pub users_ou_name: String,
     pub groups_ou_name: String,
@@ -70,7 +70,7 @@ pub enum ConfigError {
     Parse {
         path: PathBuf,
         #[source]
-        source: serde_yaml_ng::Error,
+        source: Box<serde_saphyr::Error>,
     },
     #[error("error parsing update interval '{value}': {source}")]
     Interval {
@@ -90,7 +90,7 @@ struct FileConfig {
     #[serde(default)]
     log_caller: bool,
     #[serde(default)]
-    backends: BTreeMap<String, serde_yaml_ng::Value>,
+    backends: BTreeMap<String, serde_json::Value>,
     #[serde(default = "default_respect_control_criticality")]
     respect_control_criticality: bool,
     users_ou_name: Option<String>,
@@ -133,9 +133,9 @@ pub fn resolve(
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<Config, ConfigError> {
     let file: FileConfig = match file_text {
-        Some(text) => serde_yaml_ng::from_str(text).map_err(|source| ConfigError::Parse {
+        Some(text) => serde_saphyr::from_str(text).map_err(|source| ConfigError::Parse {
             path: PathBuf::from("<config>"),
-            source,
+            source: Box::new(source),
         })?,
         None => FileConfig {
             respect_control_criticality: default_respect_control_criticality(),
@@ -347,6 +347,28 @@ server_cert: server.crt
             err.to_string(),
             "use_tls is enabled, but server_cert and server_key are not both set"
         );
+    }
+
+    #[test]
+    fn repository_config_file_parses() {
+        let text = std::fs::read_to_string("config.yaml").expect("config.yaml");
+
+        let cfg = resolve(
+            Args {
+                config: Some(PathBuf::from("config.yaml")),
+                ..Args::default()
+            },
+            Some(&text),
+            no_env,
+        )
+        .expect("repository config");
+
+        assert_eq!(cfg.users_ou_name, "users");
+        assert_eq!(cfg.groups_ou_name, "groups");
+        assert_eq!(cfg.http_listen_addr.as_deref(), Some("localhost:8080"));
+        assert!(cfg.backends.contains_key("file"));
+        assert!(cfg.backends.contains_key("rest"));
+        assert!(!cfg.use_tls);
     }
 
     #[test]
