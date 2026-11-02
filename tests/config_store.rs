@@ -77,6 +77,18 @@ fn a_generation_is_a_valid_configuration_on_its_own() {
     let from_body = rust_rest_ldap::config::resolve(Args::default(), Some(&body), |_| None)
         .expect("the body must parse");
 
+    assert_ne!(
+        with_header, body,
+        "the two texts must differ, or this test compares a file with itself"
+    );
+
+    // The document text is provenance, not a setting: what has to match is everything the
+    // server acts on. Dropping the text is the strongest form of that claim that does not
+    // repeat twenty field names.
+    let (mut from_whole, mut from_body) = (from_whole, from_body);
+    from_whole.document = None;
+    from_body.document = None;
+
     assert_eq!(from_whole, from_body);
 }
 

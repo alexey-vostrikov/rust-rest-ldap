@@ -60,6 +60,13 @@ pub struct Security {
     pub schema: SharedSchema,
     /// How strictly the schema is enforced on writes.
     pub schema_mode: SchemaMode,
+    /// The configuration document, published as the `cn=config` subtree.
+    ///
+    /// It rides here because `Security` is the per-server handle the protocol layer already
+    /// receives: a second parameter through every `ldap::handle` call site would be threaded
+    /// for one subtree. What it is used for belongs to the protocol layer, not to security -
+    /// the field is a carrier, and a reader looking for the access rules should look at `acl`.
+    pub config_document: Option<crate::config::Document>,
 }
 
 impl Default for Security {
@@ -76,6 +83,7 @@ impl Default for Security {
             integrity: IntegrityConfig::default(),
             schema: shared_schema(Schema::core()),
             schema_mode: SchemaMode::Strict,
+            config_document: None,
         }
     }
 }
@@ -115,6 +123,7 @@ impl Security {
             integrity: config.integrity.clone(),
             schema: shared_schema(config.schema.clone()),
             schema_mode: config.schema_mode,
+            config_document: config.document.clone(),
         }
     }
 

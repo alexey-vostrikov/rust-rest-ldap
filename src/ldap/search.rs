@@ -137,6 +137,19 @@ pub fn handle_search(
         }
     }
 
+    // `cn=config` is the server's own settings, not the directory's: it is generated from the
+    // configuration document, so it cannot go through the directory lookup below. Handled
+    // after the controls, because an unsupported critical control aborts any search.
+    if super::config_entry::is_config_dn(&base_object) {
+        return super::config_entry::search(
+            session,
+            message_id,
+            request,
+            security.config_document.as_ref(),
+            &base_object,
+        );
+    }
+
     // Access is decided by the rules, per entry and per attribute.
     let requester = session.requester();
     if !security

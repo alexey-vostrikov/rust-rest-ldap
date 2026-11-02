@@ -70,6 +70,31 @@ pub struct Args {
     pub debug: bool,
 }
 
+/// The configuration document the settings were read from.
+///
+/// Kept verbatim, together with where it came from, because `cn=config` publishes the
+/// document rather than an expansion of it: an operator reading the subtree sees the file that
+/// is in force, and a later writer can change a value without inventing the 40 settings that
+/// were only defaults.
+///
+/// The text is attached by [`load`], the only place that knows both the text and its origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Document {
+    /// The document as written, byte for byte.
+    pub text: String,
+    /// Where it was read from, for the operator: `file:/etc/...` or `store:/etc/config.d`.
+    pub origin: String,
+}
+
+impl Document {
+    pub fn new(text: impl Into<String>, origin: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            origin: origin.into(),
+        }
+    }
+}
+
 /// Fully resolved server configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -114,6 +139,12 @@ pub struct Config {
     pub locale: (crate::i18n::Locale, crate::i18n::Source),
     /// Translation file, when one is configured.
     pub locale_file: Option<PathBuf>,
+    /// The configuration document the settings above were read from, if there was one.
+    ///
+    /// `cn=config` publishes this text, so a server started from flags alone has none and says
+    /// so. It is the document, not the resolved settings: command-line and environment
+    /// overrides are not part of it, exactly as `slapd.d` does not record `-h`.
+    pub document: Option<Document>,
 }
 
 #[derive(Debug, Error)]
@@ -332,7 +363,7 @@ fn default_respect_control_criticality() -> bool {
 pub fn load(args: Args) -> Result<Config, ConfigError> {
     let explicit = args.config.clone();
     let from_env = std::env::var_os(ENV_CONFIG_PATH).map(PathBuf::from);
-    let text = match explicit.or(from_env).as_deref() {
+    let (text, origin) = match explicit.or(from_env).as_deref() {
         // A directory is a generation store: the configuration in force is the generation its
         // pointer names. A file is a configuration. The two cannot be confused, so no new key
         // is needed to say which - and pointing at the wrong one gets a message, not a parse
@@ -340,7 +371,21 @@ pub fn load(args: Args) -> Result<Config, ConfigError> {
         Some(path) if crate::config_store::Store::is_store(path) => {
             let store = crate::config_store::Store::open(path);
             match store.read_current() {
-                Ok(Some(text)) => Some(text),
+                Ok(Some(text)) => {
+                    // The generation number belongs in the origin: "which of the ten
+                    // generations am I running" is the first question after a rollback, and
+                    // the directory name alone does not answer it.
+                    let number = store
+                        .current()
+                        .ok()
+                        .flatten()
+                        .map(|generation| generation.number.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    (
+                        Some(text),
+                        format!("store:{} generation {number}", path.display()),
+                    )
+                }
                 Ok(None) => {
                     return Err(ConfigError::StoreEmpty {
                         path: path.to_path_buf(),
@@ -354,10 +399,21 @@ pub fn load(args: Args) -> Result<Config, ConfigError> {
                 }
             }
         }
-        Some(path) => Some(read_file(path)?),
-        None => None,
+        Some(path) => (Some(read_file(path)?), format!("file:{}", path.display())),
+        // Flags and defaults only: there is no document, and `cn=config` says so rather than
+        // publishing an empty subtree that looks the same as a server with no settings.
+        None => (None, String::new()),
     };
-    resolve(args, text.as_deref(), |name| std::env::var(name).ok())
+
+    let mut config = resolve(args, text.as_deref(), |name| std::env::var(name).ok())?;
+
+    // The origin is known here and nowhere else: `resolve` sees the text without knowing where
+    // it came from.
+    if let Some(document) = config.document.as_mut() {
+        document.origin = origin;
+    }
+
+    Ok(config)
 }
 
 fn read_file(path: &Path) -> Result<String, ConfigError> {
@@ -446,6 +502,9 @@ pub fn resolve(
             }
         },
         locale_file: file.locale_file,
+        // The text as it was read. `load` fills in where it came from, which `resolve` cannot
+        // know: it is handed the text, not the path.
+        document: file_text.map(|text| Document::new(text, String::new())),
         dangerous_settings: {
             let mut enabled: Vec<&'static str> = Vec::new();
             if file.bind.allow_unencrypted_bind.is_on() {
