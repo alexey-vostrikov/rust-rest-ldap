@@ -32,12 +32,10 @@ impl Source {
         backend: Backend,
     ) -> Result<(Arc<Self>, Arc<Directory>), BackendError> {
         let data = backend.load().await?;
-        let directory = Arc::new(Directory::new(
+        let directory = Arc::new(data.into_directory(
             &config.base_dn,
             &config.users_ou_name,
             &config.groups_ou_name,
-            data.users,
-            data.groups,
         ));
 
         let source = Arc::new(Self {
@@ -68,13 +66,8 @@ impl Source {
     /// empty the directory that clients are using.
     pub async fn reload(&self) -> Result<usize, BackendError> {
         let data = self.backend.load().await?;
-        let directory = Directory::new(
-            &self.base_dn,
-            &self.users_ou_name,
-            &self.groups_ou_name,
-            data.users,
-            data.groups,
-        );
+        let directory =
+            data.into_directory(&self.base_dn, &self.users_ou_name, &self.groups_ou_name);
         let entries = directory
             .entries(&self.base_dn, crate::directory::Scope::Subtree)
             .len();

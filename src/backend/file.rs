@@ -37,6 +37,7 @@ impl FileBackend {
         Ok(DirectoryData {
             users: read_json(&self.users_path)?,
             groups: read_json(&self.groups_path)?,
+            entries: Vec::new(),
         })
     }
 
@@ -50,6 +51,16 @@ impl FileBackend {
                     .ok_or(BackendError::EntryNotFound)?;
                 users[position] = new.as_ref().clone();
                 write_json(&self.users_path, &users)
+            }
+            // The JSON layout has fixed fields for users and groups; there is no
+            // place for an arbitrary attribute, which is what the redb backend is
+            // for. Say so instead of dropping the data.
+            EntryChange::Upsert { .. } | EntryChange::Delete { .. } => {
+                Err(BackendError::InvalidConfig(
+                    "the file backend stores fixed user and group JSON; \
+                     use the redb backend for whole entries"
+                        .to_string(),
+                ))
             }
             EntryChange::Group { old, new } => {
                 let mut groups: Vec<crate::model::Group> = read_json(&self.groups_path)?;
