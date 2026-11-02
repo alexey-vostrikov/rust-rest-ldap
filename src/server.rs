@@ -17,6 +17,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::directory::Directory;
 use crate::ldap::session::Session;
 use crate::ldap::{Action, codec};
+use crate::reload::Source;
 use crate::security::Security;
 
 /// What one connection did, for logging and tests.
@@ -190,7 +191,7 @@ pub async fn serve(
     listener: TcpListener,
     acceptor: Option<TlsAcceptor>,
     ldaps: bool,
-    directory: Arc<Directory>,
+    source: Arc<Source>,
     security: Arc<Security>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
@@ -208,7 +209,7 @@ pub async fn serve(
                 };
                 let _ = tcp.set_nodelay(true);
 
-                let directory = Arc::clone(&directory);
+                let source = Arc::clone(&source);
                 let security = Arc::clone(&security);
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
@@ -223,6 +224,9 @@ pub async fn serve(
                         _ => Stream::Plain(tcp),
                     };
 
+                    // A fresh snapshot per connection: a reload mid-session swaps the
+                    // Arc and the running session keeps the version it started with.
+                    let directory = source.directory().await;
                     match serve_connection(stream, acceptor, directory, security).await {
                         Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) => {}
                         Ok(Hangup::Malformed) => {
@@ -258,27 +262,64 @@ mod tests {
     const BASE: &str = "dc=example,dc=com";
     const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
 
-    fn directory() -> Arc<Directory> {
-        Arc::new(Directory::new(
-            BASE,
-            "users",
-            "groups",
-            vec![User {
-                ldap_admin: true,
-                object_class: vec!["top".to_string(), "inetOrgPerson".to_string()],
-                cn: "admin".to_string(),
-                uid: Some("admin".to_string()),
-                user_password: Some(
-                    hash_password("admin-secret", StoreScheme::Argon2id).expect("hash"),
-                ),
-                ..User::default()
-            }],
-            vec![Group {
-                object_class: vec!["top".to_string(), "posixGroup".to_string()],
-                cn: "group_a".to_string(),
-                ..Group::default()
-            }],
-        ))
+    async fn test_source() -> Arc<Source> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let users = dir.path().join("users.json");
+        let groups = dir.path().join("groups.json");
+        let password =
+            crate::password::hash("admin-secret", crate::password::StoreScheme::Argon2id)
+                .expect("hash");
+        std::fs::write(
+            &users,
+            serde_json::json!([{
+                "ldapAdmin": true,
+                "objectClass": ["top", "inetOrgPerson"],
+                "cn": "admin",
+                "uid": "admin",
+                "userPassword": password,
+            }])
+            .to_string(),
+        )
+        .expect("users");
+        std::fs::write(
+            &groups,
+            r#"[{"objectClass":["top","posixGroup"],"cn":"group_a"}]"#,
+        )
+        .expect("groups");
+        let backend_config = serde_json::json!({
+            "users_path": users,
+            "groups_path": groups,
+        });
+        let backend =
+            crate::backend::Backend::from_config("file", Some(&backend_config)).expect("backend");
+        let config = test_config();
+        let (source, _) = Source::load(&config, backend).await.expect("load");
+        source
+    }
+
+    fn test_config() -> crate::config::Config {
+        crate::config::Config {
+            backend: "file".to_string(),
+            base_dn: BASE.to_string(),
+            listen_addr: "127.0.0.1:0".to_string(),
+            update_interval: std::time::Duration::from_secs(300),
+            log_path: None,
+            debug: false,
+            log_timestamp: false,
+            log_caller: false,
+            backends: Default::default(),
+            respect_control_criticality: true,
+            users_ou_name: "users".to_string(),
+            groups_ou_name: "groups".to_string(),
+            use_tls: false,
+            server_cert: None,
+            server_key: None,
+            http_listen_addr: None,
+            callback_auth_token: None,
+            passwords: Default::default(),
+            acl: Default::default(),
+            allow_plaintext_simple_bind: true,
+        }
     }
 
     fn default_security() -> Arc<Security> {
@@ -339,8 +380,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (_tx, rx) = tokio::sync::watch::channel(false);
+        let source = test_source().await;
         let task = tokio::spawn(async move {
-            let _ = serve(listener, acceptor, ldaps, directory(), security, rx).await;
+            let _ = serve(listener, acceptor, ldaps, source, security, rx).await;
         });
         let client = TcpStream::connect(addr).await.expect("connect");
         Running {

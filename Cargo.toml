@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 argon2 = { version = "0.6.0", features = ["password-hash"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23.1"
 bcrypt = "0.19.3"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -33,7 +34,7 @@ serde_json = "1.0.154"
 sha-crypt = "0.6.0"
 sha1 = "0.11.0"
 sha2 = "0.11.1"
-subtle = "2.6.1"
+subtle = { version = "2.6.1", features = ["std"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "net", "time", "sync", "rt-multi-thread", "signal"] }
 # default features pull aws-lc-rs and ring, which are C: keep only the wrapper
@@ -45,3 +46,4 @@ yescrypt = "0.1.0"
 rcgen = "0.14.10"
 serde_json = "1.0.154"
 tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
