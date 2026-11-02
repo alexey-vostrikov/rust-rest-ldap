@@ -47,7 +47,10 @@ pub fn handle_search(
     // The subschema subentry does not live under the naming context; a client addresses
     // it by its own name (RFC 4512 §4.2).
     if super::schema_entry::is_schema_dn(&base_object) {
-        return super::schema_entry::search(message_id, request, &security.schema, &base_object);
+        // One read: the answer must describe one schema, not the one before a reload for
+        // its first entry and the one after for its last.
+        let schema = crate::security::current_schema(&security.schema);
+        return super::schema_entry::search(message_id, request, &schema, &base_object);
     }
 
     let mut page = Page::default();

@@ -130,7 +130,7 @@ async fn run_search(
     // The security bundle carries the schema; the write tests need it to match the
     // one the source was loaded with.
     let security = Security {
-        schema: rust_rest_ldap::schema::Schema::core(),
+        schema: rust_rest_ldap::security::shared_schema(rust_rest_ldap::schema::Schema::core()),
         ..security
     };
 

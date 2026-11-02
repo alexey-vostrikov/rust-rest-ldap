@@ -23,7 +23,10 @@ pub struct Source {
     groups_ou_name: String,
     current: RwLock<Arc<Directory>>,
     generation: RwLock<u64>,
-    schema: Schema,
+    /// The published schema, shared with every `Security` the connections hold.
+    schema: crate::security::SharedSchema,
+    /// The files the schema was read from, re-read on a reload.
+    schema_files: Vec<std::path::PathBuf>,
     schema_mode: SchemaMode,
     indexes: IndexConfig,
 }
@@ -56,11 +59,76 @@ impl Source {
             current: RwLock::new(Arc::clone(&directory)),
             generation: RwLock::new(0),
             indexes: config.indexes.clone(),
-            schema: config.schema.clone(),
+            schema: crate::security::shared_schema(config.schema.clone()),
+            schema_files: config.schema_files.clone(),
             schema_mode: config.schema_mode,
         });
 
         Ok((source, directory))
+    }
+
+    /// The schema as it stands now.
+    pub fn schema(&self) -> Arc<Schema> {
+        crate::security::current_schema(&self.schema)
+    }
+
+    /// The shared schema itself.
+    ///
+    /// For building the `Security` that serves the connections: it has to hold *this* handle
+    /// rather than its own copy, or a reload through the source would never reach a write.
+    pub fn shared_schema(&self) -> crate::security::SharedSchema {
+        Arc::clone(&self.schema)
+    }
+
+    /// Re-reads the schema files and adopts the result.
+    ///
+    /// Four steps, in this order, and the order is the whole design:
+    ///
+    /// 1. build a **fresh** schema from `Schema::core()` and the files - never extend the live
+    ///    one, or a reload would accumulate definitions and never retract one;
+    /// 2. validate the entries already in the directory against it, because adopting rules
+    ///    the data breaks turns every later write into a refusal;
+    /// 3. swap the inner `Arc`, so every connection sees the new schema at once and one
+    ///    operation still sees one schema throughout;
+    /// 4. report what it ended up with, which is what tells the operator the file was read.
+    ///
+    /// A step that fails leaves the previous schema in force: running yesterday's rules beats
+    /// refusing everything because somebody's editor saved half a line.
+    pub async fn reload_schema(&self) -> Result<SchemaReloaded, BackendError> {
+        let mut schema = Schema::core();
+
+        for path in &self.schema_files {
+            let text =
+                std::fs::read_to_string(path).map_err(|source| BackendError::SchemaRead {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+
+            schema
+                .extend(&text)
+                .map_err(|source| BackendError::SchemaParse {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+        }
+
+        let directory = self.directory().await;
+        let warnings = check_schema_collect(&directory, &schema, self.schema_mode)?;
+
+        let attributes = schema.attribute_count();
+        let classes = schema.class_count();
+
+        // The swap: one pointer, seen by every holder at once.
+        match self.schema.write() {
+            Ok(mut guard) => *guard = Arc::new(schema),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(schema),
+        }
+
+        Ok(SchemaReloaded {
+            attributes,
+            classes,
+            warnings,
+        })
     }
 
     pub async fn directory(&self) -> Arc<Directory> {
@@ -125,13 +193,43 @@ impl Source {
             .entries(&self.base_dn, crate::directory::Scope::Subtree)
             .len();
 
-        check_schema(&directory, &self.schema, self.schema_mode)?;
+        check_schema(&directory, &self.schema(), self.schema_mode)?;
 
         *self.current.write().await = Arc::new(directory);
         *self.generation.write().await += 1;
 
         Ok(entries)
     }
+}
+
+/// Validates every entry according to the configured mode.
+///
+/// `strict` refuses the load, so a directory that does not match its schema never comes up
+/// looking healthy; `warn` reports and proceeds, which is what a migration from foreign data
+/// needs; `off` skips checking and keeps the schema published.
+fn check_schema(
+    directory: &Directory,
+    schema: &crate::schema::Schema,
+    mode: SchemaMode,
+) -> Result<(), BackendError> {
+    // In `warn` mode the problems come back as a list and are reported here; in `strict` the
+    // collect step has already refused. Either way the message is one place.
+    for problem in check_schema_collect(directory, schema, mode)? {
+        eprintln!("{}", crate::i18n::t("warn.schema", &[("detail", &problem)]));
+    }
+
+    Ok(())
+}
+
+/// What a schema reload ended up with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaReloaded {
+    /// Attribute types in force afterwards.
+    pub attributes: usize,
+    /// Object classes in force afterwards.
+    pub classes: usize,
+    /// Entries that break the new schema, accepted because the mode is `warn`.
+    pub warnings: Vec<String>,
 }
 
 /// What a rebuild of the indexes did.
@@ -146,18 +244,18 @@ pub struct Reindexed {
     pub elapsed: std::time::Duration,
 }
 
-/// Validates every entry according to the configured mode.
+/// Validates every entry, returning the problems instead of deciding what to do with them.
 ///
-/// `strict` refuses the load, so a directory that does not match its schema never
-/// comes up looking healthy; `warn` reports and proceeds, which is what a migration
-/// from foreign data needs; `off` skips checking and keeps the schema published.
-fn check_schema(
+/// Split from `check_schema` because a reload needs the list: in `warn` mode the violations
+/// are reported to the operator and the schema adopted anyway, and the caller has nowhere to
+/// put them if the function only returns `Ok`.
+fn check_schema_collect(
     directory: &Directory,
     schema: &crate::schema::Schema,
     mode: SchemaMode,
-) -> Result<(), BackendError> {
+) -> Result<Vec<String>, BackendError> {
     if mode == SchemaMode::Off {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut problems = Vec::new();
@@ -175,16 +273,13 @@ fn check_schema(
     }
 
     if problems.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     match mode {
-        SchemaMode::Warn => {
-            for problem in &problems {
-                eprintln!("{}", crate::i18n::t("warn.schema", &[("detail", problem)]));
-            }
-            Ok(())
-        }
+        // `warn` reports and proceeds: it is the mode an operator picks when the data is
+        // older than the schema, and a reload that refused would make the mode pointless.
+        SchemaMode::Warn => Ok(problems),
         _ => Err(BackendError::SchemaViolations {
             count: problems.len(),
             first: problems.into_iter().take(10).collect(),
@@ -273,6 +368,7 @@ mod tests {
             passwords: Default::default(),
             schema: crate::schema::Schema::core(),
             schema_mode: crate::schema::Mode::Strict,
+            schema_files: Vec::new(),
             indexes: crate::index::IndexConfig::default(),
             acl: Default::default(),
             allow_unencrypted_bind: true,

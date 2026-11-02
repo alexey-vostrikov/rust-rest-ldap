@@ -358,7 +358,9 @@ async fn main() {
         Ok(loaded) => loaded,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
     };
-    let security = Security::from_config(&config);
+    // The same schema handle the source holds: a reload through the source has to reach
+    // the write path, and a copy would make the two disagree after the first reload.
+    let security = Security::from_config(&config).with_schema(source.shared_schema());
 
     println!(
         "{}",
@@ -499,6 +501,7 @@ async fn main() {
 
     // SIGUSR1 is the "reload now" switch gorestldap documented for systemd.
     spawn_usr1_reloader(Arc::clone(&source), Arc::clone(&metrics));
+    spawn_usr2_schema_reloader(Arc::clone(&source));
 
     let http_task = match &config.http_listen_addr {
         Some(addr) => {
@@ -599,6 +602,60 @@ fn spawn_usr1_reloader(
     #[cfg(not(unix))]
     {
         let _ = (source, metrics);
+    }
+}
+
+/// SIGUSR2 re-reads the schema files and adopts them if the data still holds.
+///
+/// A separate signal from SIGUSR1 on purpose: reloading the data and reloading the rules are
+/// different operations with different failure modes, and an operator debugging a schema
+/// change does not want the directory reloaded underneath at the same time.
+fn spawn_usr2_schema_reloader(source: Arc<rust_rest_ldap::reload::Source>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut usr2 = match signal(SignalKind::user_defined2()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    i18n::t("error.signal", &[("detail", &err.to_string())])
+                );
+                return;
+            }
+        };
+
+        tokio::spawn(async move {
+            while usr2.recv().await.is_some() {
+                match source.reload_schema().await {
+                    Ok(done) => {
+                        for warning in &done.warnings {
+                            eprintln!("{}", i18n::t("warn.schema", &[("detail", warning)]));
+                        }
+                        println!(
+                            "{}",
+                            i18n::t(
+                                "start.schema_reloaded",
+                                &[
+                                    ("attributes", &done.attributes.to_string()),
+                                    ("classes", &done.classes.to_string()),
+                                ],
+                            )
+                        );
+                    }
+                    // The old schema stays in force, and saying so is what stops an operator
+                    // from believing the change took.
+                    Err(err) => eprintln!(
+                        "{}",
+                        i18n::t("error.schema_reload", &[("detail", &err.to_string())])
+                    ),
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
     }
 }
 

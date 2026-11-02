@@ -417,6 +417,14 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("error.index", "cannot build the index: {detail}"),
     (
+        "error.schema_reload",
+        "cannot reload the schema, the previous one stays in force: {detail}",
+    ),
+    (
+        "start.schema_reloaded",
+        "schema reloaded: {attributes} attribute types, {classes} object classes",
+    ),
+    (
         "check.index_mismatch",
         "index disagrees with the data for {query}: missing [{lost}], unexpected [{extra}]",
     ),
