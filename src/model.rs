@@ -17,6 +17,10 @@ use serde::Deserialize;
 
 /// Attribute description returned for every entry when `entryDN` is requested.
 pub const ATTR_ENTRY_DN: &str = "entryDN";
+/// Operational attribute pointing at the schema governing this entry (RFC 4512 §3.4).
+pub const ATTR_SUBSCHEMA_SUBENTRY: &str = "subschemaSubentry";
+/// The DN of that subentry, as OpenLDAP spells it.
+pub const SUBSCHEMA_SUBENTRY_DN: &str = "cn=Subschema";
 /// Attribute description returned for every entry when `+` is requested.
 pub const ATTR_HAS_SUBORDINATES: &str = "hasSubordinates";
 pub const ATTR_ENTRY_UUID: &str = "entryUUID";
@@ -210,6 +214,10 @@ impl Attributes {
         let mut seen: Vec<Arc<str>> = Vec::new();
 
         let entry_dn = || Attribute::single(ATTR_ENTRY_DN, dn).operational();
+        // Every entry names where its schema lives; a client that wants to render an
+        // entry reads it from there. Returned with `+` or by name, like `entryDN`.
+        let subschema =
+            || Attribute::single(ATTR_SUBSCHEMA_SUBENTRY, SUBSCHEMA_SUBENTRY_DN).operational();
 
         if selection.is_empty() {
             self.push_regular(&mut out, &mut seen);
@@ -221,6 +229,7 @@ impl Attributes {
                 "*" => self.push_regular(&mut out, &mut seen),
                 "+" => {
                     push_unique(entry_dn(), &mut out, &mut seen);
+                    push_unique(subschema(), &mut out, &mut seen);
                     for attribute in &self.inner {
                         if attribute.flags.operational
                             && !attribute.flags.sensitive
@@ -232,6 +241,9 @@ impl Attributes {
                 }
                 _ if requested.eq_ignore_ascii_case(ATTR_ENTRY_DN) => {
                     push_unique(entry_dn(), &mut out, &mut seen);
+                }
+                _ if requested.eq_ignore_ascii_case(ATTR_SUBSCHEMA_SUBENTRY) => {
+                    push_unique(subschema(), &mut out, &mut seen);
                 }
                 _ => {
                     if let Some(attribute) = self.get(requested) {
@@ -479,7 +491,12 @@ mod tests {
         let names: Vec<&str> = selected.iter().map(|a| &*a.name).collect();
         assert_eq!(
             names,
-            vec![ATTR_ENTRY_DN, ATTR_ENTRY_UUID, ATTR_HAS_SUBORDINATES]
+            vec![
+                ATTR_ENTRY_DN,
+                ATTR_SUBSCHEMA_SUBENTRY,
+                ATTR_ENTRY_UUID,
+                ATTR_HAS_SUBORDINATES
+            ]
         );
     }
 

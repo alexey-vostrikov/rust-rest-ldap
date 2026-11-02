@@ -8,6 +8,7 @@ pub mod filter;
 pub mod modify;
 pub mod paged;
 pub mod responses;
+pub mod schema_entry;
 pub mod search;
 pub mod session;
 pub mod starttls;
