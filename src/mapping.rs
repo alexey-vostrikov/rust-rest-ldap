@@ -275,11 +275,11 @@ mod tests {
         let attributes = entry.attributes();
 
         assert_eq!(
-            attributes.get("cn").map(|a| a.values.clone()),
+            attributes.get("cn").map(|a| a.values.to_vec()),
             Some(vec!["Admin".to_string()])
         );
         assert_eq!(
-            attributes.get("mail").map(|a| a.values.clone()),
+            attributes.get("mail").map(|a| a.values.to_vec()),
             Some(vec!["i.petrov@example.com".to_string()])
         );
         assert!(
@@ -352,7 +352,7 @@ mod tests {
             entry
                 .attributes()
                 .get("memberUid")
-                .map(|a| a.values.clone()),
+                .map(|a| a.values.to_vec()),
             Some(vec!["admin".to_string()])
         );
     }
@@ -379,16 +379,16 @@ mod tests {
 
         assert_eq!(entry.dn(), "cn=jane doe,ou=people,dc=example,dc=com");
         assert_eq!(
-            attributes.get("telephoneNumber").map(|a| a.values.clone()),
+            attributes.get("telephoneNumber").map(|a| a.values.to_vec()),
             Some(vec!["+7 495 000-00-00".to_string()]),
             "an attribute the ported server never knew about must survive"
         );
         assert_eq!(
-            attributes.get("employeeNumber").map(|a| a.values.clone()),
+            attributes.get("employeeNumber").map(|a| a.values.to_vec()),
             Some(vec!["42".to_string()])
         );
         assert_eq!(
-            attributes.get("active").map(|a| a.values.clone()),
+            attributes.get("active").map(|a| a.values.to_vec()),
             Some(vec!["true".to_string()])
         );
         assert!(attributes.get("room").is_none(), "empty list is dropped");

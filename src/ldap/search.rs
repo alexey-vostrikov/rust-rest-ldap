@@ -172,7 +172,7 @@ pub fn handle_search(
                 .filter(|attribute| {
                     security
                         .acl
-                        .rights(&requester, directory, dn, Some(attribute.name.as_str()))
+                        .rights(&requester, directory, dn, Some(&*attribute.name))
                         .read
                 })
                 .collect();
@@ -213,7 +213,7 @@ pub fn handle_search(
 
 fn without_values(attribute: crate::model::Attribute) -> crate::model::Attribute {
     crate::model::Attribute {
-        values: Vec::new(),
+        values: Vec::new().into_boxed_slice(),
         ..attribute
     }
 }

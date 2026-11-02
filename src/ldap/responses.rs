@@ -42,7 +42,7 @@ pub fn search_result_entry(
         .iter()
         .map(|attribute| {
             PartialAttribute::new(
-                AttributeDescription::from(attribute.name.clone()),
+                AttributeDescription::from(attribute.name.to_string()),
                 SetOf::from_vec(
                     attribute
                         .values

@@ -226,11 +226,11 @@ fn the_admin_flag_of_a_direct_entry_is_internal_and_grants_admin() {
         .attributes()
         .select(entry.dn(), &["*".to_string()])
         .into_iter()
-        .map(|attribute| attribute.name)
+        .map(|attribute| attribute.name.to_string())
         .collect::<Vec<_>>();
     assert_eq!(
         visible,
-        vec!["cn", "objectClass"],
+        vec!["cn".to_string(), "objectClass".to_string()],
         "the admin flag must not be projected, whichever adapter produced the entry"
     );
     assert!(
@@ -244,6 +244,6 @@ fn model_attribute_builder_is_public_for_other_crates() {
     // The integration test crate builds entries itself; the constructors it needs
     // must stay public.
     let attribute = Attribute::single("cn", "x").case_sensitive();
-    assert_eq!(attribute.name, "cn");
+    assert_eq!(&*attribute.name, "cn");
     assert!(attribute.flags.case_sensitive);
 }
