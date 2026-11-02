@@ -20,8 +20,8 @@ pub struct FileBackend {
 }
 
 impl FileBackend {
-    pub fn from_config(config: &serde_yaml_ng::Value) -> Result<Self, BackendError> {
-        let config: FileBackendConfig = serde_yaml_ng::from_value(config.clone())
+    pub fn from_config(config: &serde_json::Value) -> Result<Self, BackendError> {
+        let config: FileBackendConfig = serde_json::from_value(config.clone())
             .map_err(|err| BackendError::InvalidConfig(err.to_string()))?;
         Ok(Self::new(config.users_path, config.groups_path))
     }
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn config_section_is_parsed_into_paths() {
-        let config: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        let config: serde_json::Value = serde_saphyr::from_str(
             "users_path: examples/file/users.json\ngroups_path: examples/file/groups.json\n",
         )
         .expect("yaml");
@@ -280,8 +280,8 @@ mod tests {
 
     #[test]
     fn config_without_paths_is_rejected() {
-        let config: serde_yaml_ng::Value =
-            serde_yaml_ng::from_str("users_path: users.json").expect("yaml");
+        let config: serde_json::Value =
+            serde_saphyr::from_str("users_path: users.json").expect("yaml");
 
         let err = FileBackend::from_config(&config).expect_err("must reject");
 

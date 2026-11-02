@@ -3,6 +3,11 @@
 //! Port of gorestldap: the server keeps the directory in memory, reloads it from
 //! a backend (file or REST) on an interval or on demand, and answers LDAP
 //! requests (bind, search, compare, modify) over BER.
+//!
+//! The crate forbids `unsafe`: protocol parsing, TLS and HTTP all come from safe
+//! crates, and nothing here needs to step outside them.
+
+#![forbid(unsafe_code)]
 
 pub mod backend;
 pub mod cli;
