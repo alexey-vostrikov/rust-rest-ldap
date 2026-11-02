@@ -602,7 +602,7 @@ mod tests {
             domain
                 .attributes()
                 .get(ATTR_HAS_SUBORDINATES)
-                .map(|attribute| attribute.values.clone()),
+                .map(|attribute| attribute.values.to_vec()),
             Some(vec!["TRUE".to_string()])
         );
     }

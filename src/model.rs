@@ -10,6 +10,9 @@
 //! are not the directory model any more. Turning them into entries is the job of
 //! [`crate::mapping`].
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use serde::Deserialize;
 
 /// Attribute description returned for every entry when `entryDN` is requested.
@@ -22,7 +25,7 @@ pub const ATTR_OBJECT_CLASS: &str = "objectClass";
 pub const ATTR_LDAP_ADMIN: &str = "ldapAdmin";
 
 /// How an attribute behaves in projection and matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct AttributeFlags {
     /// Returned only when asked for explicitly or with `+`, never with `*`.
     pub operational: bool,
@@ -36,26 +39,51 @@ pub struct AttributeFlags {
     pub internal: bool,
 }
 
+/// Attribute descriptions repeat across every entry, so the text is interned and
+/// shared: 20 000 entries with eight attributes otherwise cost 160 000 small
+/// allocations for a handful of distinct names.
+static NAME_CACHE: OnceLock<Mutex<HashMap<String, Arc<str>>>> = OnceLock::new();
+
+/// Returns the shared, interned attribute description for `name`.
+pub fn attribute_name(name: &str) -> Arc<str> {
+    let cache = NAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // A poisoned lock only means another thread panicked mid-insert; the cache is
+    // still usable and the worst case is interning the same name twice.
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(existing) = cache.get(name) {
+        return Arc::clone(existing);
+    }
+    let interned: Arc<str> = Arc::from(name);
+    cache.insert(name.to_string(), Arc::clone(&interned));
+    interned
+}
+
 /// One attribute of an entry: description, values and behaviour.
+///
+/// `values` is a boxed slice rather than a `Vec`: the list never grows after the
+/// entry is built, and a `Vec` of one value carries a spare capacity of four.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribute {
-    pub name: String,
-    pub values: Vec<String>,
+    pub name: Arc<str>,
+    pub values: Box<[String]>,
     pub flags: AttributeFlags,
 }
 
 impl Attribute {
     /// Attribute with explicit values.
-    pub fn new(name: impl Into<String>, values: Vec<String>) -> Self {
+    pub fn new(name: impl AsRef<str>, values: Vec<String>) -> Self {
         Self {
-            name: name.into(),
-            values,
+            name: attribute_name(name.as_ref()),
+            values: values.into_boxed_slice(),
             flags: AttributeFlags::default(),
         }
     }
 
     /// Single-valued attribute with a borrowed value.
-    pub fn single(name: impl Into<String>, value: &str) -> Self {
+    pub fn single(name: impl AsRef<str>, value: &str) -> Self {
         Self::new(name, vec![value.to_string()])
     }
 
@@ -149,7 +177,7 @@ impl Attributes {
     /// An empty selection means `*`, as in RFC 4511 and in gorestldap.
     pub fn select(&self, dn: &str, selection: &[String]) -> Vec<Attribute> {
         let mut out: Vec<Attribute> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: Vec<Arc<str>> = Vec::new();
 
         let entry_dn = || Attribute::single(ATTR_ENTRY_DN, dn).operational();
 
@@ -187,7 +215,7 @@ impl Attributes {
     }
 
     /// Regular (non-operational, non-sensitive, non-internal) attributes.
-    fn push_regular(&self, out: &mut Vec<Attribute>, seen: &mut Vec<String>) {
+    fn push_regular(&self, out: &mut Vec<Attribute>, seen: &mut Vec<Arc<str>>) {
         for attribute in &self.inner {
             if !attribute.flags.operational && !attribute.flags.sensitive && attribute.is_visible()
             {
@@ -198,14 +226,14 @@ impl Attributes {
 }
 
 /// Appends the attribute unless one with the same description is already there.
-fn push_unique(attribute: Attribute, out: &mut Vec<Attribute>, seen: &mut Vec<String>) {
+fn push_unique(attribute: Attribute, out: &mut Vec<Attribute>, seen: &mut Vec<Arc<str>>) {
     if seen
         .iter()
         .any(|name| name.eq_ignore_ascii_case(&attribute.name))
     {
         return;
     }
-    seen.push(attribute.name.clone());
+    seen.push(Arc::clone(&attribute.name));
     out.push(attribute);
 }
 
@@ -248,7 +276,7 @@ impl Entry {
     pub fn object_classes(&self) -> &[String] {
         self.attributes
             .get(ATTR_OBJECT_CLASS)
-            .map(|attribute| attribute.values.as_slice())
+            .map(|attribute| &attribute.values[..])
             .unwrap_or_default()
     }
 }
@@ -409,7 +437,7 @@ mod tests {
         let attributes = sample();
         let selected = attributes.select("cn=admin,ou=users,dc=example,dc=com", &["*".to_string()]);
 
-        let names: Vec<&str> = selected.iter().map(|a| a.name.as_str()).collect();
+        let names: Vec<&str> = selected.iter().map(|a| &*a.name).collect();
         assert_eq!(names, vec!["objectClass", "cn", "mail"]);
     }
 
@@ -418,7 +446,7 @@ mod tests {
         let attributes = sample();
         let selected = attributes.select("cn=admin,ou=users,dc=example,dc=com", &["+".to_string()]);
 
-        let names: Vec<&str> = selected.iter().map(|a| a.name.as_str()).collect();
+        let names: Vec<&str> = selected.iter().map(|a| &*a.name).collect();
         assert_eq!(
             names,
             vec![ATTR_ENTRY_DN, ATTR_ENTRY_UUID, ATTR_HAS_SUBORDINATES]
@@ -459,7 +487,7 @@ mod tests {
             &["MAIL".to_string(), "cn".to_string(), "nosuch".to_string()],
         );
 
-        let names: Vec<&str> = selected.iter().map(|a| a.name.as_str()).collect();
+        let names: Vec<&str> = selected.iter().map(|a| &*a.name).collect();
         assert_eq!(names, vec!["mail", "cn"]);
     }
 
@@ -471,7 +499,7 @@ mod tests {
             &["cn".to_string(), "cn".to_string(), "*".to_string()],
         );
 
-        assert_eq!(selected.iter().filter(|a| a.name == "cn").count(), 1);
+        assert_eq!(selected.iter().filter(|a| &*a.name == "cn").count(), 1);
     }
 
     #[test]
