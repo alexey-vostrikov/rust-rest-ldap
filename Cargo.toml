@@ -1,0 +1,14 @@
+[package]
+name = "rust-rest-ldap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+description = "LDAP server with REST API & file backends"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "rust-rest-ldap"
+path = "src/main.rs"
+
+[dependencies]
