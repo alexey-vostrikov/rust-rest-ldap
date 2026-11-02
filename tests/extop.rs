@@ -160,7 +160,7 @@ fn run(
             let last = messages.last().expect("a response");
             (code(last), value_of(last))
         }
-        Action::Persist { success, .. } => (code(&success), value_of(&success)),
+        Action::Persist(action) => (code(&action.success), value_of(&action.success)),
         other => panic!("unexpected action: {other:?}"),
     }
 }
@@ -336,7 +336,7 @@ fn the_hash_is_written_with_the_configured_scheme() {
         &security(),
         extended(1, PASSWORD_MODIFY_OID, Some(value)),
     ) {
-        Action::Persist { changes, .. } => changes,
+        Action::Persist(action) => action.changes,
         other => panic!("expected a write, got {other:?}"),
     };
 
@@ -412,7 +412,7 @@ async fn bind_code(directory: &Directory, dn: &str, secret: &str) -> ResultCode 
                 other => panic!("not a bind response: {other:?}"),
             }
         }
-        Action::Persist { success, .. } => match &success.protocol_op {
+        Action::Persist(action) => match &action.success.protocol_op {
             ProtocolOp::BindResponse(response) => response.result_code,
             other => panic!("not a bind response: {other:?}"),
         },
@@ -456,7 +456,7 @@ async fn the_new_password_binds_and_the_old_one_stops_working() {
         &security(),
         extended(1, PASSWORD_MODIFY_OID, Some(value)),
     ) {
-        Action::Persist { changes, .. } => changes,
+        Action::Persist(action) => action.changes,
         other => panic!("expected a write, got {other:?}"),
     };
     source.apply(&changes).await.expect("persist");
@@ -504,7 +504,7 @@ async fn the_change_survives_a_reload() {
         &security(),
         extended(1, PASSWORD_MODIFY_OID, Some(value)),
     ) {
-        Action::Persist { changes, .. } => changes,
+        Action::Persist(action) => action.changes,
         other => panic!("expected a write, got {other:?}"),
     };
     source.apply(&changes).await.expect("persist");

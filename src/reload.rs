@@ -156,7 +156,17 @@ fn check_schema(
 pub async fn reload_on_interval(
     source: Arc<Source>,
     interval: Duration,
+    stop: watch::Receiver<bool>,
+) {
+    reload_on_interval_with(source, interval, stop, crate::metrics::Metrics::new()).await
+}
+
+/// The same, reporting to the shared metrics.
+pub async fn reload_on_interval_with(
+    source: Arc<Source>,
+    interval: Duration,
     mut stop: watch::Receiver<bool>,
+    metrics: std::sync::Arc<crate::metrics::Metrics>,
 ) {
     if interval.is_zero() {
         return;
@@ -170,11 +180,20 @@ pub async fn reload_on_interval(
     loop {
         tokio::select! {
             _ = ticker.tick() => match source.reload().await {
-                Ok(entries) => println!("reload: {entries} entries (generation {})", source.generation().await),
-                Err(err) => eprintln!(
-                    "{}",
-                    crate::i18n::t("error.reload", &[("detail", &err.to_string())])
-                ),
+                Ok(entries) => {
+                    // The gauge follows what is actually in the directory, so a scrape after
+                    // a reload reports the new size rather than the startup one.
+                    metrics.set_entries(entries);
+                    metrics.reload_succeeded();
+                    println!("reload: {entries} entries (generation {})", source.generation().await)
+                }
+                Err(err) => {
+                    metrics.reload_failed();
+                    eprintln!(
+                        "{}",
+                        crate::i18n::t("error.reload", &[("detail", &err.to_string())])
+                    )
+                }
             },
             _ = stop.changed() => {
                 if *stop.borrow() {
@@ -219,6 +238,7 @@ mod tests {
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),
             integrity: crate::integrity::IntegrityConfig::default(),
+            observability: crate::config::ObservabilityConfig::default(),
             locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),
             locale_file: None,
         };

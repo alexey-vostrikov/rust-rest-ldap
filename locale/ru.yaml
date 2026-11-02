@@ -14,6 +14,9 @@ start.listening: "ldap: слушаю {addr}"
 start.language: "диагностика: язык '{locale}' (источник: {source})"
 start.shutting_down: "останавливаюсь"
 start.export_done: "выгружено записей: {entries} в {path}"
+start.http: "http: слушаю {addr} (health, метрики, callback)"
+start.journal: "журнал изменений: {path}"
+start.journal_stdout: "журнал изменений: стандартный вывод"
 
 # Ошибки для оператора
 error.config: "ошибка конфигурации: {detail}"
@@ -30,6 +33,7 @@ error.tls_handshake: "клиент {peer}: TLS-рукопожатие не уд�
 error.starttls_handshake: "клиент {peer}: StartTLS-рукопожатие не удалось"
 error.malformed: "клиент {peer} прислал некорректное сообщение, соединение закрыто"
 error.client: "клиент {peer}: {detail}"
+error.journal: "не удаётся записать журнал изменений: {detail}"
 error.shutdown_timeout: "плавная остановка не уложилась в {grace}, закрываю оставшиеся соединения"
 warn.schema: "предупреждение схемы: {detail}"
 

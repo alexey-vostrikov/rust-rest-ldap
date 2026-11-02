@@ -16,6 +16,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::ldap::session::Session;
 use crate::ldap::{Action, codec};
+use crate::metrics::{Metrics, Operation};
 use crate::reload::Source;
 use crate::security::Security;
 
@@ -91,17 +92,107 @@ impl Stream {
     }
 }
 
+/// Writes the journal line for a write.
+fn journal_note(
+    journal: &crate::metrics::Journal,
+    note: &crate::metrics::Note,
+    peer: &str,
+    result: rasn_ldap::ResultCode,
+) {
+    if !journal.is_on() {
+        return;
+    }
+
+    // The journal keeps the number, because whoever reads the file has the RFC and not this
+    // code. `ResultCode` is a C-like enum, so the number is its discriminant.
+    let change = note.change(peer, result as u8);
+
+    if let Err(err) = journal.record(&change) {
+        // A journal that cannot be written is reported and not raised: a full disk must not
+        // take the directory down for a reason unrelated to the directory.
+        eprintln!(
+            "{}",
+            crate::i18n::t("error.journal", &[("detail", &err.to_string())])
+        );
+    }
+}
+
+/// The metric label for a protocol operation.
+fn operation_of(operation: &rasn_ldap::ProtocolOp) -> Option<Operation> {
+    use rasn_ldap::ProtocolOp;
+
+    match operation {
+        ProtocolOp::BindRequest(_) => Some(Operation::Bind),
+        ProtocolOp::SearchRequest(_) => Some(Operation::Search),
+        ProtocolOp::CompareRequest(_) => Some(Operation::Compare),
+        ProtocolOp::ModifyRequest(_) => Some(Operation::Modify),
+        ProtocolOp::AddRequest(_) => Some(Operation::Add),
+        ProtocolOp::DelRequest(_) => Some(Operation::Delete),
+        ProtocolOp::ModDnRequest(_) => Some(Operation::ModifyDn),
+        ProtocolOp::ExtendedReq(_) => Some(Operation::Extended),
+        ProtocolOp::AbandonRequest(_) => Some(Operation::Abandon),
+        ProtocolOp::UnbindRequest(_) => Some(Operation::Unbind),
+        // A response arriving at the server is a protocol violation, not an operation.
+        _ => None,
+    }
+}
+
+/// True when a response carries a success code.
+fn succeeded(response: &rasn_ldap::ProtocolOp) -> bool {
+    use rasn_ldap::{ProtocolOp, ResultCode};
+
+    let code = match response {
+        ProtocolOp::BindResponse(response) => response.result_code,
+        ProtocolOp::SearchResDone(done) => done.0.result_code,
+        ProtocolOp::CompareResponse(response) => response.0.result_code,
+        ProtocolOp::ModifyResponse(response) => response.0.result_code,
+        ProtocolOp::AddResponse(response) => response.0.result_code,
+        ProtocolOp::DelResponse(response) => response.0.result_code,
+        ProtocolOp::ModDnResponse(response) => response.0.result_code,
+        ProtocolOp::ExtendedResp(response) => response.result_code,
+        // An entry or a reference is part of a search whose done carries the verdict.
+        _ => return true,
+    };
+
+    matches!(
+        code,
+        ResultCode::Success | ResultCode::CompareTrue | ResultCode::CompareFalse
+    )
+}
+
 /// Serves one connection until the client leaves.
 ///
 /// `acceptor` enables StartTLS on a plain connection; without it the extended
 /// operation is refused with `unavailable`. A connection that arrives already
 /// encrypted (LDAPS) comes in as [`Stream::Tls`] and cannot be upgraded again.
 pub async fn serve_connection(
+    stream: Stream,
+    acceptor: Option<TlsAcceptor>,
+    source: Arc<Source>,
+    security: Arc<Security>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<Hangup, codec::CodecError> {
+    serve_connection_as(
+        stream,
+        acceptor,
+        source,
+        security,
+        shutdown,
+        Observers::default(),
+        String::new(),
+    )
+    .await
+}
+
+/// The same, with the shared observers and the peer address for the journal.
+pub async fn serve_connection_as(
     mut stream: Stream,
     acceptor: Option<TlsAcceptor>,
     source: Arc<Source>,
     security: Arc<Security>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    observers: Observers,
+    peer: String,
 ) -> Result<Hangup, codec::CodecError> {
     let mut session = Session::new();
     session.set_encrypted(stream.is_encrypted());
@@ -143,21 +234,65 @@ pub async fn serve_connection(
         // immediately, while a single operation still sees one consistent directory.
         let directory = source.directory().await;
 
+        let operation = operation_of(&message.protocol_op);
+        let started = std::time::Instant::now();
+
         match crate::ldap::handle(&mut session, &directory, &security, message) {
             Action::Reply(messages) => {
+                let returned = messages
+                    .iter()
+                    .filter(|message| {
+                        matches!(
+                            message.protocol_op,
+                            rasn_ldap::ProtocolOp::SearchResEntry(_)
+                        )
+                    })
+                    .count();
+
+                // The result of the LAST message is the answer: a search ends with a done,
+                // and a failure anywhere else is a single response.
+                if let (Some(last), Some(operation)) = (messages.last(), operation) {
+                    observers
+                        .metrics
+                        .record(operation, succeeded(&last.protocol_op));
+                }
+                if operation == Some(Operation::Search) {
+                    observers.metrics.record_search(started.elapsed(), returned);
+                }
+
                 for message in messages {
                     codec::write_message(&mut stream, &message).await?;
                 }
             }
-            Action::Persist {
-                changes,
-                success,
-                message_id,
-                failure,
-            } => {
+            Action::Persist(action) => {
+                let crate::ldap::PersistAction {
+                    changes,
+                    success,
+                    message_id,
+                    failure,
+                    journal,
+                } = *action;
                 // The reply follows the write, so `success` is never sent for a change
                 // that did not reach the store.
-                match source.apply(&changes).await {
+                let outcome = source.apply(&changes).await;
+                let code = if outcome.is_ok() {
+                    rasn_ldap::ResultCode::Success
+                } else {
+                    rasn_ldap::ResultCode::UnwillingToPerform
+                };
+
+                // Recorded either way: "who tried" is a different question from "who
+                // succeeded", and a journal that only holds successes cannot answer why a
+                // change did not happen.
+                if let Some(note) = &journal {
+                    journal_note(&observers.journal, note, &peer, code);
+                }
+
+                if outcome.is_ok() {
+                    observers.metrics.write_stored();
+                }
+
+                match outcome {
                     Ok(_) => codec::write_message(&mut stream, &success).await?,
                     Err(err) => {
                         eprintln!(
@@ -248,9 +383,71 @@ pub async fn serve(
     ldaps: bool,
     source: Arc<Source>,
     security: Arc<Security>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     grace: std::time::Duration,
 ) -> Result<(), std::io::Error> {
+    // No observers: the tests and any caller that only wants the protocol.
+    serve_with(
+        listener,
+        Listener {
+            acceptor,
+            ldaps,
+            grace,
+        },
+        source,
+        security,
+        shutdown,
+        Observers::default(),
+    )
+    .await
+}
+
+/// What the server reports to: counters and the change journal.
+///
+/// One value rather than two parameters, because every caller that wants one wants both,
+/// and a growing parameter list to the accept loop is the kind of change that makes a
+/// function unreviewable.
+#[derive(Clone)]
+pub struct Observers {
+    pub metrics: Arc<Metrics>,
+    pub journal: Arc<crate::metrics::Journal>,
+}
+
+impl Default for Observers {
+    fn default() -> Self {
+        Self {
+            metrics: Metrics::new(),
+            journal: Arc::new(crate::metrics::Journal::off()),
+        }
+    }
+}
+
+/// What the listener is configured with, apart from the directory it serves.
+///
+/// Bundled because the accept loop already took eight arguments and the next knob would have
+/// made nine: a signature nobody can read is where parameters start getting swapped by
+/// mistake.
+pub struct Listener {
+    pub acceptor: Option<TlsAcceptor>,
+    /// The listener speaks TLS from the first byte (LDAPS).
+    pub ldaps: bool,
+    /// How long a client gets to finish the operation it is in the middle of.
+    pub grace: std::time::Duration,
+}
+
+pub async fn serve_with(
+    listener: TcpListener,
+    settings: Listener,
+    source: Arc<Source>,
+    security: Arc<Security>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    observers: Observers,
+) -> Result<(), std::io::Error> {
+    let Listener {
+        acceptor,
+        ldaps,
+        grace,
+    } = settings;
     // Every connection task holds one clone of this sender; the receiver reports
     // "all gone" once the last one finishes, which is the condition to wait for
     // after the listener closes.
@@ -275,6 +472,7 @@ pub async fn serve(
 
                 let source = Arc::clone(&source);
                 let security = Arc::clone(&security);
+                let observers = observers.clone();
                 let acceptor = acceptor.clone();
                 let stop = shutdown.clone();
                 let finished = finished_tx.clone();
@@ -296,9 +494,20 @@ pub async fn serve(
                         _ => Stream::Plain(tcp),
                     };
 
-                    match serve_connection(stream, acceptor, Arc::clone(&source), security, stop)
-                        .await
-                    {
+                    observers.metrics.connection_opened();
+                    let outcome = serve_connection_as(
+                        stream,
+                        acceptor,
+                        Arc::clone(&source),
+                        Arc::clone(&security),
+                        stop,
+                        observers.clone(),
+                        peer.to_string(),
+                    )
+                    .await;
+                    observers.metrics.connection_closed();
+
+                    match outcome {
                         Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) | Ok(Hangup::Shutdown) => {}
                         Ok(Hangup::Malformed) => {
                             eprintln!(
@@ -427,6 +636,7 @@ mod tests {
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),
             integrity: crate::integrity::IntegrityConfig::default(),
+            observability: crate::config::ObservabilityConfig::default(),
             locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),
             locale_file: None,
         }

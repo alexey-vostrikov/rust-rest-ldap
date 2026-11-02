@@ -361,6 +361,12 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("start.shutting_down", "shutting down"),
     ("start.export_done", "exported {entries} entries to {path}"),
+    (
+        "start.http",
+        "http: listening on {addr} (health, metrics, callback)",
+    ),
+    ("start.journal", "change journal: {path}"),
+    ("start.journal_stdout", "change journal: standard output"),
     // Operator-facing failures
     ("error.config", "configuration error: {detail}"),
     ("error.backend", "backend error: {detail}"),
@@ -397,6 +403,7 @@ const ENGLISH: &[(&str, &str)] = &[
         "client {peer} sent a malformed message, connection closed",
     ),
     ("error.client", "client {peer}: {detail}"),
+    ("error.journal", "cannot write the change journal: {detail}"),
     (
         "error.shutdown_timeout",
         "graceful shutdown timed out after {grace}, closing remaining connections",

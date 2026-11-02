@@ -95,6 +95,24 @@ fn schema_verdict(
     })
 }
 
+/// The old and new DN of a rename, for the journal.
+///
+/// Derived from the change set rather than passed out of the handler because that is where
+/// the answer already is: the first change deletes the entry and the last upserts it under
+/// the new name. Everything between them is the subtree and the groups following the move.
+pub fn renamed_dn(changes: &[EntryChange]) -> Option<(String, String)> {
+    let old = match changes.first()? {
+        EntryChange::Delete { dn } => dn.clone(),
+        _ => return None,
+    };
+    let new = match changes.last()? {
+        EntryChange::Upsert { entry } => entry.dn().to_string(),
+        _ => return None,
+    };
+
+    (old != new).then_some((old, new))
+}
+
 /// Updates the naming attribute for a rename.
 ///
 /// Three cases, and the difference between them is why this is a function:

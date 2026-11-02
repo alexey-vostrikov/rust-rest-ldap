@@ -80,6 +80,8 @@ pub struct Config {
     pub dangerous_settings: Vec<&'static str>,
     /// Uniqueness and referential integrity of account attributes.
     pub integrity: IntegrityConfig,
+    /// Where the change journal goes, if anywhere.
+    pub observability: ObservabilityConfig,
     /// Language for operator diagnostics, and where it came from.
     pub locale: (crate::i18n::Locale, crate::i18n::Source),
     /// Translation file, when one is configured.
@@ -150,6 +152,8 @@ pub enum ConfigError {
 struct FileConfig {
     #[serde(default)]
     integrity: IntegrityConfig,
+    #[serde(default)]
+    observability: ObservabilityConfig,
     /// Language for operator-facing diagnostics: `ru`, `en`. Empty means "ask the
     /// environment". Client-visible protocol text is always English.
     locale: Option<String>,
@@ -210,6 +214,20 @@ pub struct SchemaConfig {
     pub mode: Option<String>,
     /// Extra `.schema` files, read after the built-in definitions.
     pub files: Vec<PathBuf>,
+}
+
+/// `observability:` section of the configuration file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ObservabilityConfig {
+    /// Path of the change journal. Absent means no journal.
+    ///
+    /// One JSON object per line: the change, the DN, the actor and the result, so "who
+    /// removed that entry" has an answer after the entry is gone.
+    pub journal: Option<PathBuf>,
+    /// Write the journal to standard output instead of a file, for a container that
+    /// collects it.
+    pub journal_stdout: bool,
 }
 
 /// `bind:` section of the configuration file.
@@ -314,6 +332,7 @@ pub fn resolve(
         server_cert: file.server_cert,
         server_key: file.server_key,
         integrity: file.integrity,
+        observability: file.observability,
         locale: {
             // The configuration wins over the host: an operator who wrote `locale: ru`
             // wants Russian even on an English machine.
