@@ -18,6 +18,8 @@ use crate::reload::Source;
 /// Shared state of the HTTP surface.
 pub struct HttpState {
     pub source: Arc<Source>,
+    /// Counters to expose at `/metrics`.
+    pub metrics: Arc<crate::metrics::Metrics>,
     /// Token expected in `Authorization: Token <token>`; `None` disables the
     /// callback entirely.
     pub callback_token: Option<String>,
@@ -28,11 +30,32 @@ pub fn router(state: Arc<HttpState>) -> Router {
     Router::new()
         .route("/callback", head(callback))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 
 async fn healthz() -> (StatusCode, &'static str) {
     (StatusCode::OK, "ok\n")
+}
+
+/// Prometheus text exposition.
+///
+/// No authentication, deliberately: the numbers describe the software, not the data — how
+/// many searches, how many failed, how big the directory is. A scraper that needs a secret
+/// is a scraper that gets configured wrong once and then goes unwatched.
+async fn metrics(
+    State(state): State<Arc<HttpState>>,
+) -> (StatusCode, [(String, String); 1], String) {
+    (
+        StatusCode::OK,
+        [(
+            "content-type".to_string(),
+            // The versioned content type: Prometheus 2.x negotiates it, and an unversioned
+            // one is deprecated.
+            "text/plain; version=0.0.4; charset=utf-8".to_string(),
+        )],
+        state.metrics.render(),
+    )
 }
 
 async fn callback(
@@ -114,6 +137,7 @@ mod tests {
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),
             integrity: crate::integrity::IntegrityConfig::default(),
+            observability: crate::config::ObservabilityConfig::default(),
             locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),
             locale_file: None,
         };
@@ -132,6 +156,7 @@ mod tests {
 
     fn state(source: Arc<Source>, token: Option<&str>) -> Arc<HttpState> {
         Arc::new(HttpState {
+            metrics: crate::metrics::Metrics::new(),
             source,
             callback_token: token.map(|token| token.to_string()),
         })

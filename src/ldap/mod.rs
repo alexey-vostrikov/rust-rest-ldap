@@ -20,6 +20,7 @@ use rasn_ldap::{LdapMessage, ProtocolOp, ResultCode};
 
 use crate::backend::EntryChange;
 use crate::directory::Directory;
+use crate::metrics::{ChangeKind, Note};
 use crate::security::Security;
 use session::Session;
 
@@ -36,14 +37,7 @@ pub enum Action {
     ///
     /// The reply is only sent after the write, so a client never sees `success` for a
     /// change that did not reach the store.
-    Persist {
-        changes: Vec<EntryChange>,
-        success: LdapMessage,
-        message_id: rasn_ldap::MessageId,
-        /// Which response carries the failure; the diagnostic has to include the
-        /// backend's error text, which is only known when the write failed.
-        failure: FailureResponse,
-    },
+    Persist(Box<PersistAction>),
     /// Send these messages, then persist `changes` without letting a failure change
     /// the answer.
     ///
@@ -56,6 +50,50 @@ pub enum Action {
     },
     /// Close the connection (unbind, protocol violation).
     Close,
+}
+
+/// The DN of the entry a single-entry change set is about.
+fn entry_dn_of(changes: &[EntryChange]) -> String {
+    changes
+        .first()
+        .map(|change| match change {
+            EntryChange::Upsert { entry } => entry.dn().to_string(),
+            EntryChange::Delete { dn } => dn.clone(),
+            _ => String::new(),
+        })
+        .unwrap_or_default()
+}
+
+/// Who is making this change, for the journal.
+///
+/// The empty string means anonymous, which no write allows: seeing it in a journal entry
+/// would mean a write got past the access checks, and that is worth noticing.
+fn actor(session: &Session) -> String {
+    session
+        .identity()
+        .map(|identity| identity.dn.clone())
+        .unwrap_or_default()
+}
+
+/// What a write turned into.
+///
+/// A boxed struct rather than fields on the variant: with the response messages and the
+/// journal note it is nearly 300 bytes, and `Action` is returned for every message on every
+/// connection. One allocation per write — writes are rare next to searches — is cheaper than
+/// copying that payload through every dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistAction {
+    pub changes: Vec<EntryChange>,
+    pub success: LdapMessage,
+    pub message_id: rasn_ldap::MessageId,
+    /// Which response carries the failure; the diagnostic has to include the backend's
+    /// error text, which is only known when the write failed.
+    pub failure: FailureResponse,
+    /// What to write into the change journal: the operation as the client sees it, not as
+    /// the change set looks. The handler knows which DN it addressed and where a rename
+    /// went; the change set also contains side effects that are not the operation and must
+    /// not be journalled as if they were.
+    pub journal: Option<crate::metrics::Note>,
 }
 
 /// Response to send when a write does not reach the store.
@@ -144,45 +182,70 @@ pub fn handle(
                 security,
             ) {
                 modify::Outcome::Reject(message) => Action::Reply(vec![message]),
-                modify::Outcome::Persist { entry, success } => Action::Persist {
-                    changes: vec![EntryChange::Upsert { entry }],
-                    success,
-                    message_id,
-                    failure: FailureResponse::Modify,
-                },
+                modify::Outcome::Persist { entry, success } => {
+                    let note = Note::new(ChangeKind::Modify, entry.dn(), actor(session));
+
+                    Action::Persist(Box::new(PersistAction {
+                        changes: vec![EntryChange::Upsert { entry }],
+                        success,
+                        message_id,
+                        failure: FailureResponse::Modify,
+                        journal: Some(note),
+                    }))
+                }
             }
         }
         ProtocolOp::AddRequest(request) => {
             match write::handle_add(session, directory, message_id, &request, security) {
                 write::Outcome::Reject(message) => Action::Reply(vec![message]),
-                write::Outcome::Persist { changes, success } => Action::Persist {
-                    changes,
-                    success,
-                    message_id,
-                    failure: FailureResponse::Add,
-                },
+                write::Outcome::Persist { changes, success } => {
+                    let note = Note::new(ChangeKind::Add, entry_dn_of(&changes), actor(session));
+
+                    Action::Persist(Box::new(PersistAction {
+                        changes,
+                        success,
+                        message_id,
+                        failure: FailureResponse::Add,
+                        journal: Some(note),
+                    }))
+                }
             }
         }
         ProtocolOp::DelRequest(request) => {
             match write::handle_delete(session, directory, message_id, &request, security) {
                 write::Outcome::Reject(message) => Action::Reply(vec![message]),
-                write::Outcome::Persist { changes, success } => Action::Persist {
-                    changes,
-                    success,
-                    message_id,
-                    failure: FailureResponse::Del,
-                },
+                write::Outcome::Persist { changes, success } => {
+                    let note = Note::new(ChangeKind::Delete, entry_dn_of(&changes), actor(session));
+
+                    Action::Persist(Box::new(PersistAction {
+                        changes,
+                        success,
+                        message_id,
+                        failure: FailureResponse::Del,
+                        journal: Some(note),
+                    }))
+                }
             }
         }
         ProtocolOp::ModDnRequest(request) => {
             match write::handle_modify_dn(session, directory, message_id, &request, security) {
                 write::Outcome::Reject(message) => Action::Reply(vec![message]),
-                write::Outcome::Persist { changes, success } => Action::Persist {
-                    changes,
-                    success,
-                    message_id,
-                    failure: FailureResponse::ModDn,
-                },
+                write::Outcome::Persist { changes, success } => {
+                    // The rename is the pair the handler knows: the DN the client addressed
+                    // and the one it asked for. The change set also moves a subtree and
+                    // rewrites the groups that list the user, and none of that is a second
+                    // rename.
+                    let note = write::renamed_dn(&changes)
+                        .map(|(old, new)| Note::renamed(old, new, actor(session)));
+
+                    Action::Persist(Box::new(PersistAction {
+                        changes,
+                        success,
+                        message_id,
+                        failure: FailureResponse::ModDn,
+                        journal: note,
+                    }))
+                }
             }
         }
         ProtocolOp::ExtendedReq(request) => {
@@ -210,12 +273,18 @@ pub fn handle(
                         security,
                     ) {
                         extop::Outcome::Reply(message) => Action::Reply(vec![message]),
-                        extop::Outcome::Persist { entry, success } => Action::Persist {
-                            changes: vec![EntryChange::Upsert { entry }],
-                            success,
-                            message_id,
-                            failure: FailureResponse::Extended,
-                        },
+                        extop::Outcome::Persist { entry, success } => {
+                            let note =
+                                Note::new(ChangeKind::PasswordChange, entry.dn(), actor(session));
+
+                            Action::Persist(Box::new(PersistAction {
+                                changes: vec![EntryChange::Upsert { entry }],
+                                success,
+                                message_id,
+                                failure: FailureResponse::Extended,
+                                journal: Some(note),
+                            }))
+                        }
                     }
                 }
                 extop::Operation::Unknown => Action::Reply(vec![responses::extended_response(

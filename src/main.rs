@@ -193,27 +193,66 @@ async fn main() {
         println!("starttls: enabled");
     }
 
+    // One metrics registry and one journal for the process. The metrics are lock-free, so
+    // the accept loop and every connection task can share this without contention.
+    let metrics = rust_rest_ldap::metrics::Metrics::new();
+    metrics.set_entries(directory.len());
+
+    let journal = match (
+        config.observability.journal_stdout,
+        config.observability.journal.clone(),
+    ) {
+        (true, _) => {
+            println!("{}", i18n::plain("start.journal_stdout"));
+            Arc::new(rust_rest_ldap::metrics::Journal::stdout())
+        }
+        (false, Some(path)) => match rust_rest_ldap::metrics::Journal::file(&path) {
+            Ok(journal) => {
+                println!(
+                    "{}",
+                    i18n::t("start.journal", &[("path", &path.display().to_string())])
+                );
+                Arc::new(journal)
+            }
+            // A journal the operator asked for and the server cannot write is a startup
+            // error: silently running without it would leave "who deleted it" unanswerable
+            // for as long as nobody notices.
+            Err(err) => fatal(&i18n::t(
+                "error.journal",
+                &[("detail", &format!("'{}': {err}", path.display()))],
+            )),
+        },
+        (false, None) => Arc::new(rust_rest_ldap::metrics::Journal::off()),
+    };
+
+    let observers = rust_rest_ldap::server::Observers {
+        metrics: Arc::clone(&metrics),
+        journal,
+    };
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let reloading = tokio::spawn(rust_rest_ldap::reload::reload_on_interval(
+    let reloading = tokio::spawn(rust_rest_ldap::reload::reload_on_interval_with(
         Arc::clone(&source),
         config.update_interval,
         shutdown_rx.clone(),
+        Arc::clone(&metrics),
     ));
 
     // SIGUSR1 is the "reload now" switch gorestldap documented for systemd.
-    spawn_usr1_reloader(Arc::clone(&source));
+    spawn_usr1_reloader(Arc::clone(&source), Arc::clone(&metrics));
 
     let http_task = match &config.http_listen_addr {
         Some(addr) => {
             let state = Arc::new(rust_rest_ldap::http::HttpState {
                 source: Arc::clone(&source),
+                metrics: Arc::clone(&metrics),
                 callback_token: config.callback_auth_token.clone(),
             });
             let router = rust_rest_ldap::http::router(state);
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
-                    println!("http: listening on {addr}");
+                    println!("{}", i18n::t("start.http", &[("addr", addr)]));
                     Some(tokio::spawn(async move {
                         if let Err(err) = axum::serve(listener, router).await {
                             eprintln!("{}", i18n::t("error.http", &[("detail", &err.to_string())]));
@@ -229,15 +268,18 @@ async fn main() {
         None => None,
     };
 
-    let serving = tokio::spawn(rust_rest_ldap::server::serve(
+    let serving = tokio::spawn(rust_rest_ldap::server::serve_with(
         listener,
-        acceptor,
-        config.use_tls,
+        rust_rest_ldap::server::Listener {
+            acceptor,
+            ldaps: config.use_tls,
+            // Clients get this long to finish the operation they are in the middle of.
+            grace: std::time::Duration::from_secs(10),
+        },
         Arc::clone(&source),
         Arc::new(security),
         shutdown_rx,
-        // Clients get this long to finish the operation they are in the middle of.
-        std::time::Duration::from_secs(10),
+        observers,
     ));
 
     wait_for_signal().await;
@@ -260,7 +302,10 @@ async fn main() {
     }
 }
 
-fn spawn_usr1_reloader(source: Arc<rust_rest_ldap::reload::Source>) {
+fn spawn_usr1_reloader(
+    source: Arc<rust_rest_ldap::reload::Source>,
+    metrics: Arc<rust_rest_ldap::metrics::Metrics>,
+) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -278,19 +323,24 @@ fn spawn_usr1_reloader(source: Arc<rust_rest_ldap::reload::Source>) {
             while usr1.recv().await.is_some() {
                 match source.reload().await {
                     Ok(entries) => {
+                        metrics.set_entries(entries);
+                        metrics.reload_succeeded();
                         println!("reload (SIGUSR1): {entries} entries");
                     }
-                    Err(err) => eprintln!(
-                        "{}",
-                        i18n::t("error.reload", &[("detail", &err.to_string())])
-                    ),
+                    Err(err) => {
+                        metrics.reload_failed();
+                        eprintln!(
+                            "{}",
+                            i18n::t("error.reload", &[("detail", &err.to_string())])
+                        )
+                    }
                 }
             }
         });
     }
     #[cfg(not(unix))]
     {
-        let _ = source;
+        let _ = (source, metrics);
     }
 }
 

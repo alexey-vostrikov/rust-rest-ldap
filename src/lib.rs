@@ -23,6 +23,7 @@ pub mod integrity;
 pub mod ldap;
 pub mod ldif;
 pub mod mapping;
+pub mod metrics;
 pub mod model;
 pub mod mutate;
 pub mod operational;

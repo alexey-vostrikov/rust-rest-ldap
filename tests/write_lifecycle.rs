@@ -92,11 +92,9 @@ async fn run(source: &Arc<Source>, message: LdapMessage) -> Result<ResultCode, R
             let code = messages.last().map(code_of).expect("a response");
             Err(code)
         }
-        Action::Persist {
-            changes, success, ..
-        } => {
-            source.apply(&changes).await.expect("persist");
-            Ok(code_of(&success))
+        Action::Persist(action) => {
+            source.apply(&action.changes).await.expect("persist");
+            Ok(code_of(&action.success))
         }
         other => panic!("unexpected action: {other:?}"),
     }

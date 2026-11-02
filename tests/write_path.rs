@@ -195,12 +195,12 @@ async fn a_modify_reaches_the_store_and_a_search_finds_it() {
     );
 
     let (changes, success, message_id, failure) = match action {
-        Action::Persist {
-            changes,
-            success,
-            message_id,
-            failure,
-        } => (changes, success, message_id, failure),
+        Action::Persist(action) => (
+            action.changes,
+            action.success,
+            action.message_id,
+            action.failure,
+        ),
         other => panic!("expected a write, got {other:?}"),
     };
 
@@ -249,10 +249,10 @@ async fn the_write_survives_a_restart_of_the_source() {
             ProtocolOp::ModifyRequest(modify_request(ALICE_DN, "mail", "durable@example.com")),
         ),
     );
-    let Action::Persist { changes, .. } = action else {
+    let Action::Persist(action) = action else {
         panic!("expected a write");
     };
-    source.apply(&changes).await.expect("apply");
+    source.apply(&action.changes).await.expect("apply");
 
     // redb holds an exclusive lock on the file, so a restart means the old handle
     // has to be gone first — exactly as it would be when the process exits.
@@ -300,10 +300,10 @@ async fn a_snapshot_taken_before_the_write_keeps_the_old_value() {
             ProtocolOp::ModifyRequest(modify_request(ALICE_DN, "mail", "after@example.com")),
         ),
     );
-    let Action::Persist { changes, .. } = action else {
+    let Action::Persist(action) = action else {
         panic!("expected a write");
     };
-    source.apply(&changes).await.expect("apply");
+    source.apply(&action.changes).await.expect("apply");
 
     assert_eq!(
         before

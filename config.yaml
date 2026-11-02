@@ -123,6 +123,19 @@ use_tls: false
 # The callback listener has no TLS, so callback_auth_token travels in the clear on
 # every reload request. Set the address only on a trusted network, and say so here.
 AllowPlainHttpRest: "Yes I know this is bad idea"
+# Observability.
+#   journal        - path of the change journal, one JSON object per accepted write:
+#                    time, op, dn, actor, peer, result code. A delete leaves no entry to
+#                    carry modifiersName, so "who removed it" is only answerable if it was
+#                    written down when it happened.
+#   journal_stdout - send the journal to standard output instead, for a container.
+observability:
+  #journal: /var/log/rust-rest-ldap/changes.jsonl
+  journal_stdout: false
+
+# Metrics are always on: GET /metrics on the HTTP listener above, in the Prometheus text
+# format. They describe the software, not the data, so they need no authentication.
+
 http_listen_addr: localhost:8080
 
 callback_auth_token: qwertyuiop1234567890
