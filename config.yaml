@@ -41,9 +41,13 @@ integrity:
   referential_integrity: true
 
 # Search indexes, built when the directory is loaded and rebuilt on every reload.
-# `pres` answers (attribute=*), `eq` answers (attribute=value); both are supersets of
-# the answer, the filter still runs on every candidate. Per-attribute kinds replace
-# the default; an attribute that is not configured uses `default`.
+# `pres` answers (attribute=*), `eq` answers (attribute=value), `sub` answers
+# (attribute=*part*) through three-character windows, `ord` answers (attribute>=value)
+# and (attribute<=value). All four are supersets of the answer: the filter still runs on
+# every candidate, so an index can only make a search faster, never change it.
+# Per-attribute kinds replace the default; an attribute that is not configured uses
+# `default`. `sub` costs memory in proportion to the text, so give it to the attributes
+# people actually search by name.
 indexes:
   default: [pres]
   attributes:

@@ -36,7 +36,11 @@ fn entries(count: usize) -> Vec<Entry> {
             ))
             .push(Attribute::single("cn", &name))
             .push(Attribute::single("sn", &format!("Surname{index:03}")))
-            .push(Attribute::single("uid", &name));
+            .push(Attribute::single("uid", &name))
+            // Numbers of *different width* on purpose. A fixed-width column orders the same
+            // way as text, so an index that keyed numbers as strings would pass every test
+            // written against it; `13` sorts before `9` as text and after it as a number.
+            .push(Attribute::single("uidNumber", &format!("{}", index * 37)));
 
         // Only every third entry has mail, so `presence` and `equality` disagree.
         if index % 3 == 0 {
@@ -89,13 +93,14 @@ fn directory(indexed: bool) -> Directory {
     let config = IndexConfig {
         default: vec!["pres".to_string()],
         attributes: [
-            ("cn", vec!["eq", "pres"]),
+            ("cn", vec!["eq", "pres", "sub", "ord"]),
             ("objectClass", vec!["eq", "pres"]),
-            ("mail", vec!["eq", "pres"]),
-            ("uid", vec!["eq"]),
+            ("mail", vec!["eq", "pres", "sub"]),
+            ("uid", vec!["eq", "sub"]),
             ("userPassword", vec!["eq"]),
-            ("gidNumber", vec!["eq"]),
-            ("sn", vec!["eq"]),
+            ("gidNumber", vec!["eq", "ord"]),
+            ("sn", vec!["eq", "sub", "ord"]),
+            ("uidNumber", vec!["eq", "ord"]),
         ]
         .into_iter()
         .map(|(attribute, kinds)| {
@@ -127,6 +132,33 @@ fn substring(name: &str, part: &str) -> Filter {
         vec![rasn_ldap::SubstringChoice::Initial(OctetString::from(
             part.as_bytes(),
         ))],
+    ))
+}
+
+/// `(name=*part*)`, the interior form.
+fn substring_any(name: &str, part: &str) -> Filter {
+    Filter::Substrings(rasn_ldap::SubstringFilter::new(
+        AttributeDescription::from(name),
+        vec![rasn_ldap::SubstringChoice::Any(OctetString::from(
+            part.as_bytes(),
+        ))],
+    ))
+}
+
+/// `(name=*part)`, the final form.
+fn substring_final(name: &str, part: &str) -> Filter {
+    Filter::Substrings(rasn_ldap::SubstringFilter::new(
+        AttributeDescription::from(name),
+        vec![rasn_ldap::SubstringChoice::Final(OctetString::from(
+            part.as_bytes(),
+        ))],
+    ))
+}
+
+fn less(name: &str, value: &str) -> Filter {
+    Filter::LessOrEqual(AttributeValueAssertion::new(
+        AttributeDescription::from(name),
+        OctetString::from(value.as_bytes()),
     ))
 }
 
@@ -185,8 +217,8 @@ fn assert_same(filter: &Filter, label: &str) {
     );
 }
 
-/// Compares the answers without requiring a match, for filters that answer with an
-/// error (or with nothing) on purpose.
+/// Compares the answers without requiring a match, for filters that answer with an error
+/// or with nothing on purpose.
 fn assert_same_answer(filter: &Filter, label: &str) {
     assert_eq!(
         search(&directory(true), filter.clone()),
@@ -289,14 +321,71 @@ fn negations_agree() {
 }
 
 #[test]
-fn filters_the_index_cannot_use_still_agree() {
-    // Substrings and ordering have no index in this step: the answer must come from
-    // the scan, unchanged.
+fn substring_filters_agree() {
+    // The trigram index narrows all three shapes, and the answer must still be the scan's:
+    // an index may only add candidates, and the filter decides.
     assert_same(&substring("cn", "user1"), "(cn=user1*)");
-    assert_same(&substring("mail", "user02"), "(mail=user02*)");
-    // `>=` is not implemented by the filter yet, so both paths must agree on the
-    // empty answer rather than the index quietly inventing one.
-    assert_same_answer(&greater("gidNumber", "2005"), "(gidNumber>=2005)");
+    assert_same(&substring("cn", "user"), "(cn=user*)");
+    assert_same(&substring_any("cn", "ser01"), "(cn=*ser01*)");
+    assert_same(&substring_any("cn", "er1"), "(cn=*er1*)");
+    assert_same(&substring_final("cn", "07"), "(cn=*07)");
+    assert_same(
+        &substring_final("mail", "@example.com"),
+        "(mail=*@example.com)",
+    );
+    assert_same(&substring_any("sn", "name12"), "(sn=*name12*)");
+    assert_same(&substring_any("uid", "user04"), "(uid=*user04*)");
+}
+
+#[test]
+fn substring_filters_that_cannot_be_indexed_agree_too() {
+    // Two characters make no trigram: the index stands aside and the scan answers.
+    assert_same(&substring("cn", "us"), "(cn=us*)");
+    assert_same(&substring_any("cn", "7"), "(cn=*7*)");
+    // A pattern nobody can match: both paths must be empty, and the test says so.
+    let plain = search(&directory(false), substring_any("cn", "zzzz"));
+    let indexed = search(&directory(true), substring_any("cn", "zzzz"));
+    assert_eq!(indexed, plain);
+    assert!(plain.is_empty());
+}
+
+#[test]
+fn ordering_filters_agree() {
+    assert_same(&greater("gidNumber", "2005"), "(gidNumber>=2005)");
+    assert_same(&less("gidNumber", "2005"), "(gidNumber<=2005)");
+    assert_same(&greater("gidNumber", "2000"), "(gidNumber>=2000)");
+    // Variable-width numbers: `(uidNumber>=100)` has to include 3700 and 1110 and exclude 74,
+    // which is exactly where a text ordering would answer differently.
+    assert_same(&greater("uidNumber", "100"), "(uidNumber>=100)");
+    assert_same(&less("uidNumber", "100"), "(uidNumber<=100)");
+    assert_same(&less("gidNumber", "2999"), "(gidNumber<=2999)");
+    // Text ordering, folded: `user010` is below `user020` as text as well as as a number,
+    // which is why the fixture uses a fixed width.
+    assert_same(&greater("cn", "user010"), "(cn>=user010)");
+    assert_same(&less("sn", "Surname100"), "(sn<=Surname100)");
+}
+
+#[test]
+fn an_ordering_filter_with_no_match_agrees() {
+    let plain = search(&directory(false), greater("gidNumber", "99999"));
+    let indexed = search(&directory(true), greater("gidNumber", "99999"));
+
+    assert_eq!(indexed, plain);
+    assert!(plain.is_empty());
+}
+
+#[test]
+fn filters_the_index_cannot_use_still_agree() {
+    // Approximate matching and extensible matching have no index and no evaluation: the
+    // answer is the scan's, unchanged. Substrings and ordering used to be listed here and
+    // moved out when they gained both an index and a comparison of their own.
+    assert_same_answer(
+        &Filter::ApproxMatch(AttributeValueAssertion::new(
+            AttributeDescription::from("cn"),
+            OctetString::from("user007".as_bytes()),
+        )),
+        "(cn~=user007)",
+    );
     assert_same(
         &Filter::And(rasn::types::SetOf::from_vec(vec![
             substring("cn", "user1"),
@@ -310,6 +399,27 @@ fn filters_the_index_cannot_use_still_agree() {
             equality("cn", "user001"),
         ])),
         "(|(cn=user29*)(cn=user001))",
+    );
+}
+
+#[test]
+fn substring_and_ordering_filters_combined_agree() {
+    // Users carry `mail` and groups carry `gidNumber`: an intersection of the two on one
+    // entry is empty, so the pair below combines an interior substring with a range that can
+    // both apply to a user - `mail` present, `cn` containing "user1".
+    assert_same(
+        &Filter::And(rasn::types::SetOf::from_vec(vec![
+            substring_any("cn", "user1"),
+            present("mail"),
+        ])),
+        "(&(cn=*user1*)(mail=*))",
+    );
+    assert_same(
+        &Filter::Or(rasn::types::SetOf::from_vec(vec![
+            substring_final("cn", "00"),
+            less("gidNumber", "2002"),
+        ])),
+        "(|(cn=*00)(gidNumber<=2002))",
     );
 }
 
@@ -358,6 +468,67 @@ fn the_index_actually_narrows() {
         candidates.len(),
         1,
         "an equality on an indexed attribute should leave one candidate, not {}",
+        candidates.len()
+    );
+}
+
+#[test]
+fn the_substring_index_actually_narrows() {
+    // Without this the step could be "correct" by never being used: an index that always
+    // answers with everything agrees with the scan perfectly and buys nothing.
+    let directory = directory(true);
+
+    let narrow = directory
+        .candidates(&rust_rest_ldap::index::Query::Substring {
+            attribute: "cn".into(),
+            initial: None,
+            any: vec!["user007".to_string()],
+            final_part: None,
+        })
+        .expect("cn has a substring index");
+
+    assert_eq!(
+        narrow.len(),
+        1,
+        "one value holds the trigram '007', so one candidate is expected, not {}",
+        narrow.len()
+    );
+
+    // "ser2" is in "user200".."user299" only: fewer than everything, more than one. A
+    // trigram shared by every value - "use", for instance - would narrow nothing at all,
+    // which is a property of the data rather than of the index.
+    let broad = directory
+        .candidates(&rust_rest_ldap::index::Query::Substring {
+            attribute: "cn".into(),
+            initial: None,
+            any: vec!["ser2".to_string()],
+            final_part: None,
+        })
+        .expect("cn has a substring index");
+
+    assert_eq!(
+        broad.len(),
+        100,
+        "user200..user299 is a hundred entries, not {}",
+        broad.len()
+    );
+}
+
+#[test]
+fn the_ordered_index_actually_narrows() {
+    let directory = directory(true);
+
+    let candidates = directory
+        .candidates(&rust_rest_ldap::index::Query::Range {
+            attribute: "gidNumber".into(),
+            bound: rust_rest_ldap::index::RangeBound::AtLeast,
+            value: "2990".to_string(),
+        })
+        .expect("gidNumber has an ordered index");
+
+    assert!(
+        candidates.len() < 30,
+        "`>= 2990` should leave the top of the range, not {} entries",
         candidates.len()
     );
 }

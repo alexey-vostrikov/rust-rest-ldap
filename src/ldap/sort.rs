@@ -527,15 +527,30 @@ fn compare_values(left: &str, right: &str, key: &SortKey) -> Ordering {
         })
         .unwrap_or_else(|| looks_numeric(left) && looks_numeric(right));
 
-    if numeric && let (Ok(left), Ok(right)) = (left.parse::<i64>(), right.parse::<i64>()) {
-        return left.cmp(&right);
-    }
-
     let case_sensitive = key
         .ordering_rule
         .as_deref()
         .map(|rule| rule.to_ascii_lowercase().contains("exact"))
         .unwrap_or(false);
+
+    order_values(left, right, numeric, case_sensitive)
+}
+
+/// The one ordering the whole server uses: numeric when both sides are numbers, folded text
+/// otherwise.
+///
+/// Shared with the filter's `>=` and `<=` on purpose. Two implementations of "which of these
+/// is greater" would agree until the day one of them gained a rule the other did not, and a
+/// search would then sort one way and select another.
+pub(crate) fn order_values(
+    left: &str,
+    right: &str,
+    numeric: bool,
+    case_sensitive: bool,
+) -> Ordering {
+    if numeric && let (Ok(left), Ok(right)) = (left.parse::<i64>(), right.parse::<i64>()) {
+        return left.cmp(&right);
+    }
 
     if case_sensitive {
         left.cmp(right)
@@ -545,7 +560,8 @@ fn compare_values(left: &str, right: &str, key: &SortKey) -> Ordering {
     }
 }
 
-fn looks_numeric(value: &str) -> bool {
+/// Whether a value is a plain integer, which is what makes a comparison numeric.
+pub(crate) fn looks_numeric(value: &str) -> bool {
     let digits = value.strip_prefix('-').unwrap_or(value);
     !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
