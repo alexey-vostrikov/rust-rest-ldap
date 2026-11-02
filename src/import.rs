@@ -1,0 +1,365 @@
+//! Import: LDIF into a store without a server, the job `slapadd` does.
+//!
+//! The reason this exists rather than "start the server and use `ldapadd`": an empty
+//! directory cannot be loaded over the protocol. `add` needs a bind, a bind needs an entry
+//! with a password, and the entries to add are what the file holds. `bootstrap` covers the
+//! one-administrator case; this covers the directory.
+//!
+//! What it guarantees, because a half-imported directory is worse than none:
+//!
+//! - **One transaction.** Every entry is validated and collected first, then written in one
+//!   call. A schema violation on entry 9000 leaves the store exactly as it was.
+//! - **The store must be empty** unless the operator says otherwise, so a mistyped path does
+//!   not merge a dump into a live directory.
+//! - **Refusals name the entry and the reason.** "import failed" sends the operator to read
+//!   4000 lines; "cn=alice,...: object class 'inetOrgPerson' requires 'sn'" sends them to the
+//!   line.
+
+use crate::backend::{Backend, EntryChange};
+use crate::config::Config;
+use crate::ldif_read;
+use crate::model::Entry;
+use crate::schema::{Mode, ViolationCode};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error(transparent)]
+    Read(#[from] ldif_read::Error),
+    #[error(transparent)]
+    Backend(#[from] crate::backend::BackendError),
+    #[error(
+        "the store already holds {entries} entries, and importing into it would merge two \
+         directories; empty it first, or pass --allow-existing-entry to add to it"
+    )]
+    NotEmpty { entries: usize },
+    #[error("record {position} ({dn}) breaks the schema: {detail}")]
+    Schema {
+        position: usize,
+        dn: String,
+        detail: String,
+    },
+    #[error(
+        "record {position} ({dn}) is a '{what}' record; an import loads entries, not changes - \
+         apply those with ldapmodify against a running server"
+    )]
+    NotAnEntry {
+        position: usize,
+        dn: String,
+        what: &'static str,
+    },
+    #[error("the file holds no entries to import")]
+    Empty,
+}
+
+/// What an import did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// Entries written.
+    pub entries: usize,
+    /// Entries whose schema was broken and accepted anyway, because the mode is not `strict`.
+    pub warnings: Vec<String>,
+}
+
+/// Loads the entries of an LDIF document into the backend.
+pub async fn import(
+    backend: &Backend,
+    config: &Config,
+    text: &str,
+    allow_existing_entry: bool,
+) -> Result<Outcome, Error> {
+    let records = ldif_read::parse(text)?;
+
+    // Checked before the schema and before writing: an import into a directory that already
+    // has data is almost always a path mistake, and merging two directories silently is the
+    // kind of mistake that is discovered by its effects.
+    let existing = backend.load().await?;
+    let present = existing.entries.len() + existing.users.len();
+    if present > 0 && !allow_existing_entry {
+        return Err(Error::NotEmpty { entries: present });
+    }
+
+    let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+
+    for (position, record) in records.iter().enumerate() {
+        let entry = match record {
+            ldif_read::Record::Entry(content) => &content.entry,
+            ldif_read::Record::Change(change) => {
+                return Err(Error::NotAnEntry {
+                    position: position + 1,
+                    dn: change.dn.clone(),
+                    what: match change.change {
+                        ldif_read::Change::Add => "changetype: add",
+                        ldif_read::Change::Modify => "changetype: modify",
+                        ldif_read::Change::Delete => "changetype: delete",
+                        ldif_read::Change::ModDn => "changetype: modrdn",
+                    },
+                });
+            }
+        };
+
+        check_schema(config, entry, position + 1, &mut warnings)?;
+        entries.push(entry.clone());
+    }
+
+    if entries.is_empty() {
+        return Err(Error::Empty);
+    }
+
+    // One call, so the backend writes one transaction: a store that dies halfway through an
+    // import holds either all of it or none of it.
+    let changes: Vec<EntryChange> = entries
+        .into_iter()
+        .map(|entry| EntryChange::Upsert { entry })
+        .collect();
+
+    backend.apply(&changes).await?;
+
+    Ok(Outcome {
+        entries: changes.len(),
+        warnings,
+    })
+}
+
+/// Checks one entry against the schema, according to the configured mode.
+fn check_schema(
+    config: &Config,
+    entry: &Entry,
+    position: usize,
+    warnings: &mut Vec<String>,
+) -> Result<(), Error> {
+    if config.schema_mode == Mode::Off {
+        return Ok(());
+    }
+
+    let Err(violations) = config.schema.check(entry) else {
+        return Ok(());
+    };
+
+    let detail = violations
+        .iter()
+        .map(|violation| violation.detail.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    match config.schema_mode {
+        // `warn` records the problem and imports anyway: it is the mode an operator picks
+        // when the data is older than the schema, and refusing would make the mode useless.
+        Mode::Warn => {
+            warnings.push(format!("{}: {detail}", entry.dn()));
+            Ok(())
+        }
+        _ => {
+            // The first violation decides the kind of refusal, because that is what tells the
+            // operator whether the data is wrong or the schema is.
+            let _ = violations
+                .first()
+                .map(|violation| violation.code == ViolationCode::ConstraintViolation);
+
+            Err(Error::Schema {
+                position,
+                dn: entry.dn().to_string(),
+                detail,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Args;
+
+    fn config(text: &str) -> Config {
+        crate::config::resolve(Args::default(), Some(text), |_| None).expect("config")
+    }
+
+    fn backend(path: &std::path::Path) -> Backend {
+        Backend::from_config(
+            "redb",
+            Some(&serde_json::json!({"path": path.display().to_string()})),
+        )
+        .expect("backend")
+    }
+
+    #[tokio::test]
+    async fn entries_are_written_in_one_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dir.redb");
+        let backend = backend(&path);
+        let config = config("base_dn: dc=example,dc=com\n");
+
+        let outcome = import(
+            &backend,
+            &config,
+            "dn: cn=a,dc=example,dc=com\nobjectClass: top\ncn: a\n\n\
+             dn: cn=b,dc=example,dc=com\nobjectClass: top\ncn: b\n",
+            false,
+        )
+        .await
+        .expect("import");
+
+        assert_eq!(outcome.entries, 2);
+        assert!(outcome.warnings.is_empty());
+
+        let stored = backend.load().await.expect("load");
+        assert_eq!(stored.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_non_empty_store_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dir.redb");
+        let backend = backend(&path);
+        let config = config("base_dn: dc=example,dc=com\n");
+
+        import(
+            &backend,
+            &config,
+            "dn: cn=a,dc=example,dc=com\nobjectClass: top\ncn: a\n",
+            false,
+        )
+        .await
+        .expect("first import");
+
+        let err = import(
+            &backend,
+            &config,
+            "dn: cn=b,dc=example,dc=com\nobjectClass: top\ncn: b\n",
+            false,
+        )
+        .await
+        .expect_err("must refuse");
+
+        assert!(matches!(err, Error::NotEmpty { entries: 1 }), "{err}");
+
+        // And the store is untouched: a refusal that half-applied is worse than a failure.
+        let stored = backend.load().await.expect("load");
+        assert_eq!(stored.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_schema_violation_leaves_the_store_empty() {
+        // The whole point of validating first: entry 2 is broken, entry 1 must not be there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dir.redb");
+        let backend = backend(&path);
+        let config = config("base_dn: dc=example,dc=com\n");
+
+        let err = import(
+            &backend,
+            &config,
+            "dn: cn=a,dc=example,dc=com\nobjectClass: top\ncn: a\n\n\
+             dn: cn=broken,dc=example,dc=com\nobjectClass: top\nobjectClass: person\ncn: broken\n",
+            false,
+        )
+        .await
+        .expect_err("must refuse");
+
+        match err {
+            Error::Schema { position, dn, .. } => {
+                assert_eq!(position, 2, "the broken record is the second one");
+                assert_eq!(dn, "cn=broken,dc=example,dc=com");
+            }
+            other => panic!("expected Schema, got {other}"),
+        }
+
+        let stored = backend.load().await.expect("load");
+        assert!(
+            stored.entries.is_empty(),
+            "nothing may have been written: {:?}",
+            stored.entries
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_mode_imports_a_broken_entry_and_records_it() {
+        // What `warn` is for: the data is older than the schema, and refusing would make the
+        // mode indistinguishable from `strict`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dir.redb");
+        let backend = backend(&path);
+        let config = config("base_dn: dc=example,dc=com\nschema:\n  mode: warn\n");
+
+        let outcome = import(
+            &backend,
+            &config,
+            "dn: cn=broken,dc=example,dc=com\nobjectClass: top\nobjectClass: person\ncn: broken\n",
+            false,
+        )
+        .await
+        .expect("import");
+
+        assert_eq!(outcome.entries, 1);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("cn=broken"));
+    }
+
+    #[tokio::test]
+    async fn a_change_record_is_refused_with_what_it_was() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dir.redb");
+        let backend = backend(&path);
+        let config = config("base_dn: dc=example,dc=com\n");
+
+        let err = import(
+            &backend,
+            &config,
+            "dn: cn=a,dc=example,dc=com\nchangetype: delete\n",
+            false,
+        )
+        .await
+        .expect_err("must refuse");
+
+        match err {
+            Error::NotAnEntry { what, dn, .. } => {
+                assert_eq!(what, "changetype: delete");
+                assert_eq!(dn, "cn=a,dc=example,dc=com");
+            }
+            other => panic!("expected NotAnEntry, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_file_is_refused_rather_than_reported_as_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dir.redb");
+        let backend = backend(&path);
+        let config = config("base_dn: dc=example,dc=com\n");
+
+        let err = import(&backend, &config, "# nothing here\n", false)
+            .await
+            .expect_err("must refuse");
+
+        assert!(matches!(err, Error::Empty), "{err}");
+    }
+
+    #[tokio::test]
+    async fn allow_existing_entry_adds_to_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dir.redb");
+        let backend = backend(&path);
+        let config = config("base_dn: dc=example,dc=com\n");
+
+        import(
+            &backend,
+            &config,
+            "dn: cn=a,dc=example,dc=com\nobjectClass: top\ncn: a\n",
+            false,
+        )
+        .await
+        .expect("first");
+
+        import(
+            &backend,
+            &config,
+            "dn: cn=b,dc=example,dc=com\nobjectClass: top\ncn: b\n",
+            true,
+        )
+        .await
+        .expect("second");
+
+        assert_eq!(backend.load().await.expect("load").entries.len(), 2);
+    }
+}

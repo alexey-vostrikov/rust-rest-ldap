@@ -12,6 +12,9 @@ async fn main() {
     let export = args.export_ldif.clone();
     let export_yaml = args.export_yaml.clone();
     let export_operational = args.export_operational;
+    let import_ldif = args.import_ldif.clone();
+    let allow_existing_entry = args.allow_existing_entry;
+    let check_config = args.check_config;
 
     // The language has to be known before the configuration parses, so that a typo in a
     // Russian config is reported in Russian: the environment answers first, and the raw
@@ -40,6 +43,103 @@ async fn main() {
         Ok(backend) => backend,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
     };
+    // A check-only run reports whether this configuration would start, the way `slaptest`
+    // does, and never binds a port. The backend open above already proved the store is
+    // readable; what is left is the data itself.
+    if check_config {
+        let data = match backend.load().await {
+            Ok(data) => data,
+            Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
+        };
+
+        let count = data.entries.len() + data.users.len() + data.groups.len();
+        let directory = data.into_directory(
+            &config.base_dn,
+            &config.users_ou_name,
+            &config.groups_ou_name,
+        );
+
+        // The schema is checked over the real entries, not a sample: a violation is what
+        // would make the first client complain, and this run exists to find it earlier.
+        let mut broken = 0;
+        if config.schema_mode != rust_rest_ldap::schema::Mode::Off {
+            for entry in directory.all() {
+                let Err(violations) = config.schema.check(entry) else {
+                    continue;
+                };
+
+                broken += 1;
+                for violation in violations {
+                    eprintln!(
+                        "{}",
+                        i18n::t(
+                            "check.schema_violation",
+                            &[("dn", entry.dn()), ("detail", &violation.detail)],
+                        )
+                    );
+                }
+            }
+        }
+
+        println!(
+            "{}",
+            i18n::t(
+                "check.ok",
+                &[
+                    ("backend", &config.backend),
+                    ("base_dn", &config.base_dn),
+                    ("entries", &count.to_string()),
+                    ("broken", &broken.to_string()),
+                ],
+            )
+        );
+
+        // The exit code is the answer, so a deployment script can branch on it without
+        // parsing prose.
+        if broken > 0 && config.schema_mode == rust_rest_ldap::schema::Mode::Strict {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // An import is a one-shot write, not a server: same shape as the export below, and for
+    // the same reason.
+    if let Some(path) = import_ldif {
+        let text = if path.as_os_str() == "-" {
+            {
+                let mut text = String::new();
+                match std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
+                    Ok(_) => text,
+                    Err(err) => fatal(&i18n::t("error.read", &[("detail", &err.to_string())])),
+                }
+            }
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) => fatal(&i18n::t(
+                    "error.read",
+                    &[("detail", &format!("'{}': {err}", path.display()))],
+                )),
+            }
+        };
+
+        match rust_rest_ldap::import::import(&backend, &config, &text, allow_existing_entry).await {
+            Ok(outcome) => {
+                for warning in &outcome.warnings {
+                    eprintln!("{}", i18n::t("warn.schema", &[("detail", warning)]));
+                }
+
+                println!(
+                    "{}",
+                    i18n::t("import.done", &[("entries", &outcome.entries.to_string())],)
+                );
+            }
+            Err(err) => fatal(&i18n::t("error.import", &[("detail", &err.to_string())])),
+        }
+
+        return;
+    }
+
     // An export is a one-shot read of the backend, not a server: it must not bind a
     // port, and it must not rewrite data on its way out.
     let as_yaml = export.is_none() && export_yaml.is_some();

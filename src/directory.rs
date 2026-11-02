@@ -121,6 +121,15 @@ impl Directory {
         let (mut users, mut groups, mut other): (Vec<Entry>, Vec<Entry>, Vec<Entry>) =
             (Vec::new(), Vec::new(), Vec::new());
         for entry in extra {
+            // The naming context and the two units are synthesised above when the store does
+            // not carry them - which is every JSON backend and every directory grown over the
+            // protocol. A store that *does* carry them (an import, a migration from OpenLDAP)
+            // would otherwise hold each one twice: a search would return two entries with the
+            // same DN, and an export would write both.
+            if entry.dn() == base_dn || entry.dn() == users_ou_dn || entry.dn() == groups_ou_dn {
+                continue;
+            }
+
             if is_descendant(entry.dn(), &users_ou_dn) {
                 users.push(entry);
             } else if is_descendant(entry.dn(), &groups_ou_dn) {
@@ -457,6 +466,49 @@ mod tests {
 
     fn dns(entries: &[&Entry]) -> Vec<String> {
         entries.iter().map(|entry| entry.dn().to_string()).collect()
+    }
+
+    #[test]
+    fn a_store_that_carries_the_base_and_the_units_does_not_get_them_twice() {
+        // An imported or migrated store holds its own `dc=` and `ou=` entries. Synthesising
+        // them on top would put two entries with the same DN in the directory: a search
+        // returns both and an export writes both, which is how a round trip through
+        // `--export-ldif` came to hold `dc=example,dc=com` twice.
+        let base = "dc=example,dc=com";
+        let users = "ou=users,dc=example,dc=com";
+        let groups = "ou=groups,dc=example,dc=com";
+
+        let stored = vec![
+            Entry::new(
+                base,
+                Attributes::new()
+                    .push(Attribute::single("objectClass", "top"))
+                    .push(Attribute::single("objectClass", "domain"))
+                    .push(Attribute::single("dc", "example")),
+            ),
+            Entry::new(
+                users,
+                Attributes::new()
+                    .push(Attribute::single("objectClass", "organizationalUnit"))
+                    .push(Attribute::single("ou", "users")),
+            ),
+        ];
+
+        let directory = Directory::from_entries(base, "users", "groups", stored);
+
+        let dns: Vec<&str> = directory.all().iter().map(|entry| entry.dn()).collect();
+        assert_eq!(
+            dns.iter().filter(|dn| **dn == base).count(),
+            1,
+            "the base appears once, whichever side supplied it: {dns:?}"
+        );
+        assert_eq!(
+            dns.iter().filter(|dn| **dn == users).count(),
+            1,
+            "and so does the users unit: {dns:?}"
+        );
+        // The unit the store did not carry is still synthesised.
+        assert!(dns.contains(&groups));
     }
 
     #[test]

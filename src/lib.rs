@@ -20,6 +20,7 @@ pub mod directory;
 pub mod dn;
 pub mod http;
 pub mod i18n;
+pub mod import;
 pub mod index;
 pub mod integrity;
 pub mod ldap;

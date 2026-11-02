@@ -41,6 +41,11 @@ pub struct Args {
     /// The same, in YAML instead of LDIF.
     pub export_yaml: Option<PathBuf>,
     pub export_operational: bool,
+    /// Present when the run imports an LDIF file rather than serving.
+    pub import_ldif: Option<PathBuf>,
+    pub allow_existing_entry: bool,
+    /// Present when the run only checks that the configuration would start.
+    pub check_config: bool,
     pub backend: Option<String>,
     pub base_dn: Option<String>,
     pub listen_addr: Option<String>,

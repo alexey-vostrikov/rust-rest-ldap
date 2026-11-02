@@ -408,6 +408,17 @@ const ENGLISH: &[(&str, &str)] = &[
         "error.bootstrap",
         "cannot create the first administrator: {detail}",
     ),
+    ("error.import", "cannot import: {detail}"),
+    ("error.read", "cannot read the file: {detail}"),
+    ("import.done", "imported {entries} entries"),
+    (
+        "check.schema_violation",
+        "schema violation in '{dn}': {detail}",
+    ),
+    (
+        "check.ok",
+        "configuration is usable: backend '{backend}', base '{base_dn}', {entries} entries, {broken} with schema violations",
+    ),
     (
         "start.bootstrap_created",
         "created the first administrator '{dn}' with a {scheme} hash; remove the bootstrap section from the configuration",
