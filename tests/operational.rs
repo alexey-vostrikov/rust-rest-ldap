@@ -201,7 +201,14 @@ fn a_client_cannot_write_the_operational_attributes() {
         }],
     };
 
-    match modify::handle_modify(&admin(), &directory, 1, &request, &Security::default()) {
+    match modify::handle_modify(
+        &admin(),
+        &directory,
+        1,
+        &request,
+        None,
+        &Security::default(),
+    ) {
         Outcome::Reject(message) => {
             let code = match &message.protocol_op {
                 ProtocolOp::ModifyResponse(response) => response.0.result_code,
@@ -228,11 +235,17 @@ fn a_modify_through_the_protocol_stamps_the_write() {
     };
 
     let before = SystemTime::now();
-    let stored =
-        match modify::handle_modify(&admin(), &directory, 1, &request, &Security::default()) {
-            Outcome::Persist { entry, .. } => entry,
-            Outcome::Reject(message) => panic!("expected a write: {message:?}"),
-        };
+    let stored = match modify::handle_modify(
+        &admin(),
+        &directory,
+        1,
+        &request,
+        None,
+        &Security::default(),
+    ) {
+        Outcome::Persist { entry, .. } => entry,
+        Outcome::Reject(message) => panic!("expected a write: {message:?}"),
+    };
 
     let created = value(
         &stored
@@ -272,11 +285,17 @@ fn a_second_write_moves_the_modification_and_keeps_the_creation() {
         }],
     };
 
-    let second =
-        match modify::handle_modify(&admin(), &directory, 1, &request, &Security::default()) {
-            Outcome::Persist { entry, .. } => entry,
-            Outcome::Reject(message) => panic!("expected a write: {message:?}"),
-        };
+    let second = match modify::handle_modify(
+        &admin(),
+        &directory,
+        1,
+        &request,
+        None,
+        &Security::default(),
+    ) {
+        Outcome::Persist { entry, .. } => entry,
+        Outcome::Reject(message) => panic!("expected a write: {message:?}"),
+    };
 
     assert_eq!(
         second

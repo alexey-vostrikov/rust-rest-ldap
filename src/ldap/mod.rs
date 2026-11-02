@@ -1,5 +1,6 @@
 //! LDAP protocol layer: framing, operations and the per-message dispatcher.
 
+pub mod assertion;
 pub mod bind;
 pub mod codec;
 pub mod compare;
@@ -102,7 +103,14 @@ pub fn handle(
             session, directory, message_id, &request, security,
         )]),
         ProtocolOp::ModifyRequest(request) => {
-            match modify::handle_modify(session, directory, message_id, &request, security) {
+            match modify::handle_modify(
+                session,
+                directory,
+                message_id,
+                &request,
+                controls.as_ref(),
+                security,
+            ) {
                 modify::Outcome::Reject(message) => Action::Reply(vec![message]),
                 modify::Outcome::Persist { entry, success } => Action::Persist {
                     changes: vec![EntryChange::Upsert { entry }],

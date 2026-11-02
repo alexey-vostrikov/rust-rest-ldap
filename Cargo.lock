@@ -1597,8 +1597,6 @@ dependencies = [
 [[package]]
 name = "rasn-ldap"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ad40189e6c500716d2b02fad43deb375d4f7c67d6fddd2b1918f09e75e450ae"
 dependencies = [
  "rasn",
 ]

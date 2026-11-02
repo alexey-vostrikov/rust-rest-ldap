@@ -10,6 +10,7 @@
 
 use rasn_ldap::{LdapMessage, MessageId, ModifyRequest, ResultCode};
 
+use super::assertion;
 use super::session::Session;
 use crate::acl::Requester;
 use crate::directory::Directory;
@@ -57,6 +58,7 @@ pub fn handle_modify(
     directory: &Directory,
     message_id: MessageId,
     request: &ModifyRequest,
+    controls: Option<&rasn_ldap::Controls>,
     security: &Security,
 ) -> Outcome {
     use super::responses::modify_response;
@@ -100,6 +102,27 @@ pub fn handle_modify(
             "target entry not found",
         ));
     };
+
+    // Assertion control (RFC 4528): the change lands only if the entry still looks
+    // the way the client expects. Checked after the entry is found and before anything
+    // is mutated, and a failure writes nothing.
+    match assertion::evaluate(controls, entry) {
+        assertion::Assertion::Matches | assertion::Assertion::Absent => {}
+        assertion::Assertion::Failed => {
+            return Outcome::Reject(modify_response(
+                message_id,
+                ResultCode::AssertionFailed,
+                "assertion control: the entry does not match",
+            ));
+        }
+        assertion::Assertion::Unusable(reason) => {
+            return Outcome::Reject(modify_response(
+                message_id,
+                ResultCode::UnavailableCriticalExtension,
+                &reason,
+            ));
+        }
+    }
 
     // Schema checking decides whether SINGLE-VALUE applies, and `off` means the server
     // does not enforce what it does not publish as enforced.
