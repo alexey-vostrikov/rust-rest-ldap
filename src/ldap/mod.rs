@@ -41,6 +41,16 @@ pub enum Action {
         /// backend's error text, which is only known when the write failed.
         failure: FailureResponse,
     },
+    /// Send these messages, then persist `changes` without letting a failure change
+    /// the answer.
+    ///
+    /// For a write the client did not ask for and that cannot invalidate the reply: the
+    /// password-hash upgrade after a successful bind. The bind is correct whether or not
+    /// the new hash is stored, so an error here is logged, not reported.
+    PersistAfterReply {
+        messages: Vec<LdapMessage>,
+        changes: Vec<EntryChange>,
+    },
     /// Close the connection (unbind, protocol violation).
     Close,
 }
@@ -86,9 +96,18 @@ pub fn handle(
     let controls = message.controls.clone();
 
     match message.protocol_op {
-        ProtocolOp::BindRequest(request) => Action::Reply(vec![bind::handle_bind(
-            session, directory, message_id, &request, security,
-        )]),
+        ProtocolOp::BindRequest(request) => {
+            let outcome =
+                bind::handle_bind_outcome(session, directory, message_id, &request, security);
+
+            match outcome.upgrade {
+                None => Action::Reply(vec![outcome.message]),
+                Some(entry) => Action::PersistAfterReply {
+                    messages: vec![outcome.message],
+                    changes: vec![EntryChange::Upsert { entry }],
+                },
+            }
+        }
         ProtocolOp::UnbindRequest(_) => {
             session.reset();
             Action::Close
@@ -189,8 +208,14 @@ mod tests {
     const BASE: &str = "dc=example,dc=com";
     const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
 
+    /// Policy for the dispatcher tests: they talk to handlers, not to a socket, and
+    /// several of them bind in the clear. The setting is switched on here so the
+    /// unencrypted-bind refusal does not hide what the test is about.
     fn security() -> Security {
-        Security::default()
+        Security {
+            allow_unencrypted_bind: true,
+            ..Security::default()
+        }
     }
 
     fn directory() -> Directory {

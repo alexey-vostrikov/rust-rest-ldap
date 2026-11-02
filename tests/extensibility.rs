@@ -56,12 +56,17 @@ fn security() -> Arc<Security> {
     // `{SSHA}` is what the fixture uses, so the strict default has to be relaxed for
     // this one scheme — which is exactly the per-scheme policy of the previous step.
     let config = rust_rest_ldap::password::policy::PasswordConfig {
-        allow_weak: vec!["ssha".to_string()],
+        allow_weak_hashes: Some(rust_rest_ldap::password::policy::WEAK_ACKNOWLEDGEMENT.to_string()),
+        allowed_weak_hashes: Some("ssha".to_string()),
+        upgrade_on_bind: None,
+        allow_weak: Vec::new(),
         store_scheme: None,
     };
     Arc::new(Security {
         passwords: rust_rest_ldap::password::PasswordPolicy::from_config(Some(&config))
             .expect("policy"),
+        // The fixture binds over a duplex stream, not TLS.
+        allow_unencrypted_bind: true,
         ..Security::default()
     })
 }
@@ -106,6 +111,9 @@ fn equality(name: &str, value: &str) -> Filter {
 fn messages(action: Action) -> Vec<LdapMessage> {
     match action {
         Action::Reply(messages) => messages,
+        // A bind against a `{SSHA}` entry answers and then rewrites the hash; the
+        // answer is what this test is after.
+        Action::PersistAfterReply { messages, .. } => messages,
         other => panic!("unexpected action: {other:?}"),
     }
 }

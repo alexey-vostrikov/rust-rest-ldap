@@ -42,6 +42,13 @@ indexes:
     gidNumber: [eq]
     uidNumber: [eq]
 
+# DANGEROUS SETTINGS. A setting that weakens the server does not take `true`: it takes
+# the sentence below, word for word, and the master switch here must be on as well.
+# Two locks on purpose - the master says "I read this file", the specific one says "I
+# meant that particular line". Remove this line and every dangerous setting below stops
+# working, which is what a config copied from somewhere else should do.
+AllowDangerousSettings: "Yes I know this is bad idea"
+
 respect_control_criticality: true
 
 # Password hashes: weak schemes are refused unless listed one by one here.
@@ -49,12 +56,22 @@ respect_control_criticality: true
 # sha384, sha512, crypt-md5, crypt-sha256, crypt-sha512, cleartext.
 passwords:
   store_scheme: argon2id      # argon2id (default) or pbkdf2-sha512
-  allow_weak: [ssha]          # gorestldap data uses {SSHA}
+  # Rewrite a stored hash into store_scheme on a successful bind: the only moment
+  # the password itself is known. Off means an old {SSHA} directory stays as it is.
+  upgrade_on_bind: true
+  # DANGEROUS. A weak hash is readable by anyone who steals the file, so the server
+  # only verifies one if the operator says so in words. Without the sentence below
+  # and a non-empty list, the server refuses weak schemes - and refuses to start if a
+  # list is given without it. This example acknowledges {SSHA} because the shipped
+  # example data uses it; a directory written by this server needs neither.
+  AllowWeakHashes: "Yes I know this is bad idea"
+  AllowedWeakHashes: "ssha"
 
 # Simple bind over an unencrypted connection. false matches Samba AD: the
 # password is refused with strongerAuthRequired until LDAPS or StartTLS is used.
 bind:
-  allow_plaintext_simple: true
+  # The sentence, not `true`: a password in the clear is readable on the path.
+  AllowUnencryptedBind: "Yes I know this is bad idea"
 
 # Access rules, evaluated in order: the first rule matching subject + base +
 # attributes decides. An empty rights list is an explicit deny.
@@ -84,6 +101,9 @@ use_tls: false
 #server_cert: server.crt
 #server_key: server.key
 
+# The callback listener has no TLS, so callback_auth_token travels in the clear on
+# every reload request. Set the address only on a trusted network, and say so here.
+AllowPlainHttpRest: "Yes I know this is bad idea"
 http_listen_addr: localhost:8080
 
 callback_auth_token: qwertyuiop1234567890

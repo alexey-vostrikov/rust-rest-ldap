@@ -109,6 +109,14 @@ pub enum StoreScheme {
 }
 
 impl StoreScheme {
+    /// The `Scheme` a hash written with this store scheme is detected as.
+    pub fn scheme(&self) -> super::Scheme {
+        match self {
+            StoreScheme::Argon2id => super::Scheme::Argon2id,
+            StoreScheme::Pbkdf2Sha512 => super::Scheme::Pbkdf2Sha512,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             StoreScheme::Argon2id => "argon2id",
@@ -138,19 +146,41 @@ pub enum PolicyError {
     UnknownWeakScheme { name: String },
     #[error("unknown password storage scheme '{0}', known schemes: argon2id, pbkdf2-sha512")]
     UnknownStoreScheme(String),
+    #[error(
+        "weak password schemes are configured ({requested}) but AllowWeakHashes is not set; \
+         if that is really what you want, add AllowWeakHashes: 'Yes I know this is bad idea' \
+         to the passwords section"
+    )]
+    WeakSchemesNotAcknowledged { requested: String },
 }
+
+/// The sentence that unlocks weak password schemes.
+///
+/// Shared with every other dangerous setting, so an operator has one sentence to
+/// remember and the code has one place to change the wording.
+pub use crate::danger::ACKNOWLEDGEMENT as WEAK_ACKNOWLEDGEMENT;
 
 /// What the server does with password hashes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PasswordPolicy {
     allowed_weak: BTreeSet<WeakScheme>,
     store_scheme: StoreScheme,
+    /// Rewrite a stored hash into `store_scheme` on a successful bind.
+    ///
+    /// The bind is the only moment the server sees the password itself, so it is the
+    /// only moment a weak hash can be upgraded without asking the user for anything.
+    upgrade_on_bind: bool,
 }
 
 impl PasswordPolicy {
-    /// Default: every weak scheme refused, new passwords in Argon2id.
+    /// Default: every weak scheme refused, new passwords in Argon2id, and a stored
+    /// hash that is not already in that scheme is rewritten on the next successful
+    /// bind.
     pub fn strict() -> Self {
-        Self::default()
+        Self {
+            upgrade_on_bind: true,
+            ..Self::default()
+        }
     }
 
     /// Policy taken from the `passwords:` configuration section.
@@ -159,8 +189,19 @@ impl PasswordPolicy {
             return Ok(Self::strict());
         };
 
+        let requested = config.requested_weak();
+
+        // A list without the sentence is a configuration error, not a warning: the
+        // operator asked for something dangerous and did not say they meant it. The
+        // server refuses to start rather than quietly deciding for them.
+        if !requested.is_empty() && !config.acknowledges_weak_hashes() {
+            return Err(PolicyError::WeakSchemesNotAcknowledged {
+                requested: requested.join(", "),
+            });
+        }
+
         let mut allowed_weak = BTreeSet::new();
-        for name in &config.allow_weak {
+        for name in &requested {
             allowed_weak.insert(WeakScheme::from_str(name)?);
         }
         let store_scheme = match &config.store_scheme {
@@ -171,6 +212,9 @@ impl PasswordPolicy {
         Ok(Self {
             allowed_weak,
             store_scheme,
+            // Off only when the operator says so: a directory full of `{SSHA}` is the
+            // reason this exists, and the safe default is to fix it quietly.
+            upgrade_on_bind: config.upgrade_on_bind.unwrap_or(true),
         })
     }
 
@@ -186,6 +230,27 @@ impl PasswordPolicy {
         }
     }
 
+    pub fn upgrade_on_bind(&self) -> bool {
+        self.upgrade_on_bind
+    }
+
+    /// True when `stored` is not in the configured storage scheme and should be
+    /// rewritten the next time the password is known.
+    ///
+    /// A value the server cannot parse is not a candidate: rewriting it would mean
+    /// guessing what it is. A value already in the configured scheme needs nothing.
+    pub fn needs_rehash(&self, stored: &str) -> bool {
+        if !self.upgrade_on_bind {
+            return false;
+        }
+
+        let Ok((scheme, _)) = super::detect(stored) else {
+            return false;
+        };
+
+        scheme != self.store_scheme.scheme()
+    }
+
     pub fn allowed_weak(&self) -> impl Iterator<Item = WeakScheme> + '_ {
         self.allowed_weak.iter().copied()
     }
@@ -195,11 +260,47 @@ impl PasswordPolicy {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PasswordConfig {
-    /// Weak schemes that may still be verified, e.g. `[ssha, crypt-sha512]`.
+    /// The sentence that unlocks weak schemes: `Yes I know this is bad idea`.
+    ///
+    /// A list on its own is not enough. A weak hash is not a preference, it is a
+    /// decision to keep a directory readable by anyone who steals the file, and the
+    /// operator has to say so in words before the server agrees to verify one.
+    #[serde(rename = "AllowWeakHashes", alias = "allow_weak_hashes")]
+    pub allow_weak_hashes: Option<String>,
+    /// Weak schemes that may still be verified: `ssha, crypt-sha512`.
+    #[serde(rename = "AllowedWeakHashes", alias = "allowed_weak_hashes")]
+    pub allowed_weak_hashes: Option<String>,
+    /// Old spelling: a bare list. Still read, but only together with the sentence.
     pub allow_weak: Vec<String>,
+    /// Rewrite a stored hash into `store_scheme` on a successful bind; default true.
+    pub upgrade_on_bind: Option<bool>,
     /// Scheme used when the server writes a password: `argon2id` (default) or
     /// `pbkdf2-sha512`.
     pub store_scheme: Option<String>,
+}
+
+impl PasswordConfig {
+    /// Every weak scheme the operator asked for, from whichever spelling was used.
+    pub fn requested_weak(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.allow_weak.clone();
+
+        if let Some(list) = &self.allowed_weak_hashes {
+            names.extend(
+                list.split(',')
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty()),
+            );
+        }
+
+        names
+    }
+
+    /// True when the operator wrote the sentence that unlocks weak schemes.
+    pub fn acknowledges_weak_hashes(&self) -> bool {
+        self.allow_weak_hashes
+            .as_deref()
+            .is_some_and(crate::danger::Danger::acknowledges)
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +351,9 @@ mod tests {
     #[test]
     fn weak_schemes_shown_in_config_are_verified_individually() {
         let config = PasswordConfig {
+            allow_weak_hashes: Some(super::WEAK_ACKNOWLEDGEMENT.to_string()),
+            allowed_weak_hashes: None,
+            upgrade_on_bind: None,
             allow_weak: vec!["ssha".to_string()],
             store_scheme: None,
         };
@@ -270,6 +374,9 @@ mod tests {
     #[test]
     fn several_weak_schemes_can_be_allowed_together() {
         let config = PasswordConfig {
+            allow_weak_hashes: Some(super::WEAK_ACKNOWLEDGEMENT.to_string()),
+            allowed_weak_hashes: None,
+            upgrade_on_bind: None,
             allow_weak: vec!["SSHA".to_string(), "crypt-sha512".to_string()],
             store_scheme: None,
         };
@@ -287,6 +394,9 @@ mod tests {
     #[test]
     fn unknown_weak_scheme_is_rejected_with_the_list() {
         let config = PasswordConfig {
+            allow_weak_hashes: Some(super::WEAK_ACKNOWLEDGEMENT.to_string()),
+            allowed_weak_hashes: None,
+            upgrade_on_bind: None,
             allow_weak: vec!["ssha1".to_string()],
             store_scheme: None,
         };
@@ -308,6 +418,9 @@ mod tests {
     #[test]
     fn store_scheme_is_read_from_config() {
         let config = PasswordConfig {
+            allow_weak_hashes: Some(super::WEAK_ACKNOWLEDGEMENT.to_string()),
+            allowed_weak_hashes: None,
+            upgrade_on_bind: None,
             allow_weak: Vec::new(),
             store_scheme: Some("PBKDF2-SHA512".to_string()),
         };
@@ -320,6 +433,9 @@ mod tests {
     #[test]
     fn unknown_store_scheme_is_rejected() {
         let config = PasswordConfig {
+            allow_weak_hashes: Some(super::WEAK_ACKNOWLEDGEMENT.to_string()),
+            allowed_weak_hashes: None,
+            upgrade_on_bind: None,
             allow_weak: Vec::new(),
             store_scheme: Some("md5".to_string()),
         };

@@ -170,6 +170,16 @@ pub async fn serve_connection(
                     }
                 }
             }
+            Action::PersistAfterReply { messages, changes } => {
+                for message in &messages {
+                    codec::write_message(&mut stream, message).await?;
+                }
+                // The reply is already out and it is correct; a failure here is an
+                // operational problem to log, not an error to report to this client.
+                if let Err(err) = source.apply(&changes).await {
+                    eprintln!("could not persist the password hash upgrade: {err}");
+                }
+            }
             Action::Silent => {}
             Action::StartTls(message_id) => {
                 if acceptor.is_none() {
@@ -378,12 +388,21 @@ mod tests {
             schema_mode: crate::schema::Mode::Strict,
             indexes: crate::index::IndexConfig::default(),
             acl: Default::default(),
-            allow_plaintext_simple_bind: true,
+            allow_unencrypted_bind: true,
+            dangerous_settings: Vec::new(),
         }
     }
 
+    /// Security for the socket tests.
+    ///
+    /// They speak LDAP over a plain TCP socket on purpose - a TLS handshake is a
+    /// different test - so the unencrypted bind has to be on, exactly as a lab server
+    /// would have it in its configuration.
     fn default_security() -> Arc<Security> {
-        Arc::new(Security::default())
+        Arc::new(Security {
+            allow_unencrypted_bind: true,
+            ..Security::default()
+        })
     }
 
     fn bind_message(message_id: u32, password: &[u8]) -> LdapMessage {
@@ -682,7 +701,7 @@ mod tests {
     #[tokio::test]
     async fn plaintext_bind_is_refused_when_encryption_is_required() {
         let security = Arc::new(Security {
-            allow_plaintext_simple_bind: false,
+            allow_unencrypted_bind: false,
             ..Security::default()
         });
         let mut running = start(None, false, security).await;
@@ -768,7 +787,7 @@ mod tests {
     async fn starttls_then_bind_is_allowed_when_plaintext_is_refused() {
         let (acceptor, anchor) = test_acceptor();
         let security = Arc::new(Security {
-            allow_plaintext_simple_bind: false,
+            allow_unencrypted_bind: false,
             ..Security::default()
         });
         let mut running = start(Some(acceptor), false, security).await;

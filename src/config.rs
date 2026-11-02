@@ -12,6 +12,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::acl::{AccessRuleConfig, Acl, AclError};
+use crate::danger::Danger;
 use crate::index::{IndexConfig, IndexError};
 use crate::password::PasswordPolicy;
 use crate::password::policy::{PasswordConfig, PolicyError};
@@ -70,7 +71,10 @@ pub struct Config {
     pub schema_mode: SchemaMode,
     pub indexes: IndexConfig,
     pub acl: Acl,
-    pub allow_plaintext_simple_bind: bool,
+    /// Simple bind over an unencrypted connection.
+    pub allow_unencrypted_bind: bool,
+    /// Dangerous settings this configuration turned on, named for the startup banner.
+    pub dangerous_settings: Vec<&'static str>,
 }
 
 #[derive(Debug, Error)]
@@ -113,6 +117,19 @@ pub enum ConfigError {
     },
     #[error("unknown schema mode: {0}")]
     SchemaMode(String),
+    #[error(
+        "this configuration turns on {settings}, which weakens the server, but \
+         AllowDangerousSettings is not set; add \
+         AllowDangerousSettings: 'Yes I know this is bad idea' at the top level if that \
+         is really what you want"
+    )]
+    DangerousSettingsNotAcknowledged { settings: String },
+    #[error(
+        "http_listen_addr is set to '{address}' but the callback listener speaks plain HTTP, \
+         so its token travels in the clear; add AllowPlainHttpRest: \
+         'Yes I know this is bad idea' next to it if that is acceptable"
+    )]
+    PlainHttpNotAcknowledged { address: String },
     #[error("error in the 'indexes' section: {0}")]
     Index(#[from] IndexError),
 }
@@ -120,6 +137,19 @@ pub enum ConfigError {
 /// Subset of the configuration that lives in the YAML file.
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
+    /// Master acknowledgement: this configuration contains settings that weaken the
+    /// server, and the operator knows it.
+    ///
+    /// Every dangerous setting also has to carry its own sentence, so this is a second
+    /// lock, not a substitute: the master one says "I read the config", the specific one
+    /// says "I meant this particular line". A config that copies a hardening list from
+    /// the documentation has neither.
+    #[serde(
+        default,
+        rename = "AllowDangerousSettings",
+        alias = "allow_dangerous_settings"
+    )]
+    allow_dangerous_settings: Danger,
     #[serde(default)]
     log_timestamp: bool,
     #[serde(default)]
@@ -135,6 +165,13 @@ struct FileConfig {
     server_cert: Option<PathBuf>,
     server_key: Option<PathBuf>,
     http_listen_addr: Option<String>,
+    /// The callback listener speaks plain HTTP, so its token travels in the clear.
+    #[serde(
+        default,
+        rename = "AllowPlainHttpRest",
+        alias = "allow_plain_http_rest"
+    )]
+    allow_plain_http_rest: Danger,
     callback_auth_token: Option<String>,
     passwords: Option<PasswordConfig>,
     #[serde(default)]
@@ -158,20 +195,22 @@ pub struct SchemaConfig {
 }
 
 /// `bind:` section of the configuration file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct BindConfig {
-    /// Allow simple bind over an unencrypted connection. Samba refuses it; this
-    /// server allows it for lab use unless the operator says otherwise.
-    pub allow_plaintext_simple: bool,
-}
-
-impl Default for BindConfig {
-    fn default() -> Self {
-        Self {
-            allow_plaintext_simple: true,
-        }
-    }
+    /// Allow a simple bind over an unencrypted connection.
+    ///
+    /// Off by default: a password sent in the clear is readable by anyone on the path,
+    /// and Samba refuses it for the same reason. Turning it on takes the sentence from
+    /// `crate::danger`, not a boolean, because this is the setting most likely to be
+    /// copied between configurations without a thought.
+    #[serde(
+        default,
+        rename = "AllowUnencryptedBind",
+        alias = "allow_unencrypted_bind",
+        alias = "allow_plaintext_simple"
+    )]
+    pub allow_unencrypted_bind: Danger,
 }
 
 fn default_respect_control_criticality() -> bool {
@@ -256,7 +295,48 @@ pub fn resolve(
         use_tls: file.use_tls,
         server_cert: file.server_cert,
         server_key: file.server_key,
-        http_listen_addr: file.http_listen_addr.filter(|addr| !addr.trim().is_empty()),
+        dangerous_settings: {
+            let mut enabled: Vec<&'static str> = Vec::new();
+            if file.bind.allow_unencrypted_bind.is_on() {
+                enabled.push("bind.AllowUnencryptedBind");
+            }
+            if file.allow_plain_http_rest.is_on() {
+                enabled.push("AllowPlainHttpRest");
+            }
+            if file
+                .passwords
+                .as_ref()
+                .is_some_and(|passwords| !passwords.requested_weak().is_empty())
+            {
+                enabled.push("passwords.AllowedWeakHashes");
+            }
+
+            // Both locks, and the master one is checked over the whole file: a
+            // dangerous line that was pasted in without its sentence has already
+            // failed to parse, and one that carries a sentence without the master
+            // acknowledgement fails here.
+            if !enabled.is_empty() && !file.allow_dangerous_settings.is_on() {
+                return Err(ConfigError::DangerousSettingsNotAcknowledged {
+                    settings: enabled.join(", "),
+                });
+            }
+
+            enabled
+        },
+        http_listen_addr: {
+            let addr = file.http_listen_addr.filter(|addr| !addr.trim().is_empty());
+
+            // The callback listener has no TLS: the token that authorises a reload
+            // would travel in the clear on every request. Enabling it is a decision
+            // the operator has to write down, not a line to leave in a copied config.
+            if addr.is_some() && !file.allow_plain_http_rest.is_on() {
+                return Err(ConfigError::PlainHttpNotAcknowledged {
+                    address: addr.clone().unwrap_or_default(),
+                });
+            }
+
+            addr
+        },
         callback_auth_token: file.callback_auth_token,
         passwords: PasswordPolicy::from_config(file.passwords.as_ref())?,
         schema: load_schema(&file.schema)?,
@@ -273,7 +353,7 @@ pub fn resolve(
             file.indexes
         },
         acl: crate::acl::from_config(file.access.as_deref())?,
-        allow_plaintext_simple_bind: file.bind.allow_plaintext_simple,
+        allow_unencrypted_bind: file.bind.allow_unencrypted_bind.is_on(),
     };
 
     if config.use_tls && (config.server_cert.is_none() || config.server_key.is_none()) {
@@ -377,10 +457,12 @@ mod tests {
 
     #[test]
     fn file_values_are_used_when_no_flag_or_variable_is_set() {
-        let text = "
+        let text = r#"
 users_ou_name: People
 groups_ou_name: Teams
 respect_control_criticality: false
+AllowDangerousSettings: "Yes I know this is bad idea"
+AllowPlainHttpRest: "Yes I know this is bad idea"
 http_listen_addr: localhost:8080
 callback_auth_token: secret
 use_tls: true
@@ -389,7 +471,7 @@ server_key: server.key
 backends:
   file:
     users_path: examples/file/users.json
-";
+"#;
 
         let cfg = resolve(Args::default(), Some(text), no_env).expect("file config");
 
