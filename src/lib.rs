@@ -19,3 +19,4 @@ pub mod ldap;
 pub mod model;
 pub mod password;
 pub mod security;
+pub mod server;

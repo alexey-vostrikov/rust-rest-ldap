@@ -32,7 +32,7 @@ sha1 = "0.11.0"
 sha2 = "0.11.1"
 subtle = "2.6.1"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "net", "time", "sync"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "net", "time", "sync", "rt-multi-thread", "signal"] }
 uuid = { version = "1.29.0", features = ["v5"] }
 yescrypt = "0.1.0"
 
