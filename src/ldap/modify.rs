@@ -119,6 +119,10 @@ pub fn handle_modify(
         }
     };
 
+    // Stamped here, not in the backend: only this layer knows who is writing; the
+    // clock is read once so the two timestamps of one write cannot disagree.
+    let modified = stamp(&modified, session, &requester);
+
     // The entry as it would be stored must satisfy the schema it is published under.
     if let Err(violations) = check(&security.schema, security.schema_mode, &modified) {
         let detail = violations
@@ -140,6 +144,17 @@ pub fn handle_modify(
         entry: modified,
         success: modify_response(message_id, ResultCode::Success, ""),
     }
+}
+
+/// Adds the operational attributes that describe this write.
+fn stamp(entry: &Entry, session: &Session, requester: &Requester) -> Entry {
+    let actor = requester
+        .dn
+        .clone()
+        .or_else(|| session.identity().map(|identity| identity.dn.clone()))
+        .unwrap_or_default();
+
+    crate::operational::stamp_write(entry, &actor, std::time::SystemTime::now())
 }
 
 /// True when the requester is the entry being modified.

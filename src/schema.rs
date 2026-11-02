@@ -89,9 +89,21 @@ impl Syntax {
             // A descriptor is a legal value wherever an OID is: `objectClass: top`
             // is a name, not a dotted number (RFC 4512 §1.4).
             Syntax::Oid => is_descriptor(value) || is_numeric_oid(value),
+            // `YYYYmmddHHMMSS[.fraction]Z`; the server writes the fraction, so the
+            // validator has to accept the form it produces (RFC 4517 §3.3.13).
             Syntax::GeneralizedTime => {
-                let digits = value.strip_suffix('Z').unwrap_or(value);
-                digits.len() == 14 && digits.bytes().all(|byte| byte.is_ascii_digit())
+                let body = value.strip_suffix('Z').unwrap_or(value);
+                let (main, fraction) = match body.split_once('.') {
+                    Some((main, fraction)) => (main, Some(fraction)),
+                    None => (body, None),
+                };
+                main.len() == 14
+                    && main.bytes().all(|byte| byte.is_ascii_digit())
+                    && fraction.is_none_or(|fraction| {
+                        !fraction.is_empty()
+                            && fraction.len() <= 6
+                            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+                    })
             }
         }
     }
@@ -1292,6 +1304,12 @@ attributetype ( 2.5.4.41 NAME 'name'
         assert!(Syntax::DistinguishedName.accepts("cn=a,dc=example,dc=com"));
         assert!(!Syntax::DistinguishedName.accepts("not a dn"));
         assert!(Syntax::GeneralizedTime.accepts("20261102120000Z"));
+        assert!(
+            Syntax::GeneralizedTime.accepts("20261102120000.123456Z"),
+            "the server writes a fractional part"
+        );
+        assert!(!Syntax::GeneralizedTime.accepts("20261102120000.Z"));
+        assert!(!Syntax::GeneralizedTime.accepts("20261102120000.1234567Z"));
         assert!(!Syntax::GeneralizedTime.accepts("2026-11-02"));
     }
 
