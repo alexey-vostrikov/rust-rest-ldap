@@ -13,6 +13,7 @@ pub mod acl;
 pub mod backend;
 pub mod bootstrap;
 pub mod cli;
+pub mod client;
 pub mod config;
 pub mod danger;
 pub mod directory;

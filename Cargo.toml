@@ -42,6 +42,9 @@ tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "net", "tim
 # default features pull aws-lc-rs and ring, which are C: keep only the wrapper
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["logging", "tls12"] }
 uuid = { version = "1.29.0", features = ["v5"] }
+# The public certificate authorities, compiled in: a client that trusts whatever the
+# filesystem happens to hold is a client that works on one machine only.
+webpki-roots = "1.0.4"
 yescrypt = "0.1.0"
 
 [dev-dependencies]
