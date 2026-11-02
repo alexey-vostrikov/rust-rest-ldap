@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acl;
 pub mod backend;
 pub mod cli;
 pub mod config;
@@ -17,3 +18,4 @@ pub mod dn;
 pub mod ldap;
 pub mod model;
 pub mod password;
+pub mod security;

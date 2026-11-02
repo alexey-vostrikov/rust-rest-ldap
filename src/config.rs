@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::acl::{AccessRuleConfig, Acl, AclError};
 use crate::password::PasswordPolicy;
 use crate::password::policy::{PasswordConfig, PolicyError};
 
@@ -60,6 +61,8 @@ pub struct Config {
     pub http_listen_addr: Option<String>,
     pub callback_auth_token: Option<String>,
     pub passwords: PasswordPolicy,
+    pub acl: Acl,
+    pub allow_plaintext_simple_bind: bool,
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +89,8 @@ pub enum ConfigError {
     MissingTlsMaterial,
     #[error(transparent)]
     Password(#[from] PolicyError),
+    #[error(transparent)]
+    Access(#[from] AclError),
 }
 
 /// Subset of the configuration that lives in the YAML file.
@@ -108,6 +113,27 @@ struct FileConfig {
     http_listen_addr: Option<String>,
     callback_auth_token: Option<String>,
     passwords: Option<PasswordConfig>,
+    #[serde(default)]
+    access: Option<Vec<AccessRuleConfig>>,
+    #[serde(default)]
+    bind: BindConfig,
+}
+
+/// `bind:` section of the configuration file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BindConfig {
+    /// Allow simple bind over an unencrypted connection. Samba refuses it; this
+    /// server allows it for lab use unless the operator says otherwise.
+    pub allow_plaintext_simple: bool,
+}
+
+impl Default for BindConfig {
+    fn default() -> Self {
+        Self {
+            allow_plaintext_simple: true,
+        }
+    }
 }
 
 fn default_respect_control_criticality() -> bool {
@@ -195,6 +221,8 @@ pub fn resolve(
         http_listen_addr: file.http_listen_addr.filter(|addr| !addr.trim().is_empty()),
         callback_auth_token: file.callback_auth_token,
         passwords: PasswordPolicy::from_config(file.passwords.as_ref())?,
+        acl: crate::acl::from_config(file.access.as_deref())?,
+        allow_plaintext_simple_bind: file.bind.allow_plaintext_simple,
     };
 
     if config.use_tls && (config.server_cert.is_none() || config.server_key.is_none()) {
