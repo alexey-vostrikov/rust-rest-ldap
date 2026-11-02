@@ -16,12 +16,55 @@ async fn main() {
     let allow_existing_entry = args.allow_existing_entry;
     let check_config = args.check_config;
     let check_index = args.check_index;
+    let config_path = args.config.clone();
+    let config_commit = args.config_commit;
+    let config_rollback = args.config_rollback;
+    let config_history = args.config_history;
+    let config_keep = args.config_keep;
+    let note = args.note.clone();
+    let from = args.from.clone();
     let reindex = args.reindex;
 
     // The language has to be known before the configuration parses, so that a typo in a
     // Russian config is reported in Russian: the environment answers first, and the raw
     // text is scanned for `locale:` because the parsed value is not available yet.
     install_language(&args, None);
+
+    // The store commands run before the configuration is parsed: they are about the
+    // configuration itself, and `--config-history` on a store that holds no generation yet
+    // must list nothing rather than fail to load what is not there.
+    if let Some(command) = store_command(config_commit, config_rollback, config_history) {
+        let store_path = match config_path
+            .clone()
+            .or_else(|| std::env::var_os(config::ENV_CONFIG_PATH).map(std::path::PathBuf::from))
+        {
+            Some(path) => path,
+            None => fatal(&i18n::t(
+                "error.store_path_missing",
+                &[("command", command.name())],
+            )),
+        };
+
+        // A store that does not exist yet is created by the first commit: refusing here would
+        // mean an operator has to `mkdir` a directory whose layout is this program's business.
+        // An existing *file* is refused, because that is a configuration and the operator
+        // pointed at the wrong thing.
+        if store_path.exists() && !rust_rest_ldap::config_store::Store::is_store(&store_path) {
+            fatal(&i18n::t(
+                "error.store_not_a_directory",
+                &[("path", &store_path.display().to_string())],
+            ));
+        }
+
+        run_store_command(
+            command,
+            &store_path,
+            config_keep,
+            note.as_deref(),
+            from.as_deref(),
+        );
+        return;
+    }
 
     let config = match config::load(args) {
         Ok(config) => config,
@@ -737,6 +780,110 @@ fn install_language(
 /// The error type keeps its English `Display` (tests match on it and it is the developer's
 /// view); this is the operator's view, in their language, with the English detail kept
 /// where it names a file or a parser position.
+/// Which store command the flags asked for, if any.
+fn store_command(
+    commit: bool,
+    rollback: Option<u64>,
+    history: bool,
+) -> Option<rust_rest_ldap::config_store::Command> {
+    use rust_rest_ldap::config_store::Command;
+
+    if commit {
+        return Some(Command::Commit);
+    }
+    if let Some(number) = rollback {
+        return Some(Command::Rollback(number));
+    }
+    if history {
+        return Some(Command::History);
+    }
+    None
+}
+
+/// Runs a store command and exits.
+fn run_store_command(
+    command: rust_rest_ldap::config_store::Command,
+    path: &std::path::Path,
+    keep: Option<usize>,
+    note: Option<&str>,
+    from: Option<&std::path::Path>,
+) {
+    let store = rust_rest_ldap::config_store::Store::open(path);
+
+    let outcome = match command {
+        rust_rest_ldap::config_store::Command::Commit => match from {
+            // Seeding: the document comes from a file, and the store may be empty.
+            Some(source) => std::fs::read_to_string(source)
+                .map_err(|err| format!("'{}': {err}", source.display()))
+                .and_then(|body| {
+                    store
+                        .commit(&body, "cli", note.unwrap_or_default())
+                        .map_err(|err| err.to_string())
+                }),
+            None => store
+                .commit_current("cli", note.unwrap_or_default())
+                .map_err(|err| err.to_string()),
+        }
+        .map(|generation| format!("generation {}", generation.number)),
+        rust_rest_ldap::config_store::Command::Rollback(number) => store
+            .rollback(number, "cli")
+            .map(|generation| format!("generation {}", generation.number))
+            .map_err(|err| err.to_string()),
+        rust_rest_ldap::config_store::Command::History => match store.history() {
+            Ok(generations) => {
+                let current = store.current().ok().flatten().map(|g| g.number);
+                for generation in generations {
+                    let mark = if Some(generation.number) == current {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!(
+                        "{mark} {:>4}  {}  {:<24} {}",
+                        generation.number, generation.created, generation.author, generation.note
+                    );
+                }
+                return;
+            }
+            Err(err) => Err(err.to_string()),
+        },
+    };
+
+    match outcome {
+        Ok(what) => {
+            // Collect as part of the commit: a store that only ever grew would be a store
+            // somebody has to clean by hand, which is the problem this replaces.
+            if let rust_rest_ldap::config_store::Command::Commit = command {
+                let keep = keep.unwrap_or(rust_rest_ldap::config_store::KEEP);
+                match store.collect(keep) {
+                    Ok(removed) if removed.is_empty() => {}
+                    Ok(removed) => println!(
+                        "{}",
+                        i18n::t(
+                            "store.collected",
+                            &[(
+                                "numbers",
+                                &removed
+                                    .iter()
+                                    .map(u64::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )]
+                        )
+                    ),
+                    Err(err) => eprintln!(
+                        "{}",
+                        i18n::t("error.store", &[("detail", &err.to_string())])
+                    ),
+                }
+            }
+
+            println!("{}", i18n::t("store.done", &[("what", &what)]));
+        }
+        Err(detail) => fatal(&i18n::t("error.store", &[("detail", &detail)])),
+    }
+}
+
 fn config_message(err: &config::ConfigError) -> String {
     let english = err.to_string();
 
@@ -755,6 +902,15 @@ fn config_message(err: &config::ConfigError) -> String {
             key = "config.locale";
             owned.push(("value".to_string(), value.clone()));
             owned.push(("path".to_string(), format!("locale/{value}.yaml")));
+        }
+        config::ConfigError::StoreEmpty { path } => {
+            key = "config.store_empty";
+            owned.push(("path".to_string(), path.display().to_string()));
+        }
+        config::ConfigError::Store { path, detail } => {
+            key = "config.store";
+            owned.push(("path".to_string(), path.display().to_string()));
+            owned.push(("detail".to_string(), detail.clone()));
         }
         config::ConfigError::BootstrapPasswordMissing => {
             key = "config.bootstrap_password_missing";

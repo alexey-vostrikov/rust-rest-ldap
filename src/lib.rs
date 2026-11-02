@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod config_store;
 pub mod danger;
 pub mod directory;
 pub mod dn;

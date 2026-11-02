@@ -48,6 +48,18 @@ pub struct Args {
     pub check_config: bool,
     /// Present when the run verifies the indexes against the data.
     pub check_index: bool,
+    /// Present when the run commits the configuration as a new generation.
+    pub config_commit: bool,
+    /// Present when the run rolls back to a generation.
+    pub config_rollback: Option<u64>,
+    /// Present when the run lists the generations.
+    pub config_history: bool,
+    /// How many generations to keep when collecting.
+    pub config_keep: Option<usize>,
+    /// Why the generation was committed.
+    pub note: Option<String>,
+    /// The file to seed a generation from, instead of the one in force.
+    pub from: Option<PathBuf>,
     /// Present when the run rebuilds the indexes and reports the cost.
     pub reindex: bool,
     pub backend: Option<String>,
@@ -144,6 +156,13 @@ pub enum ConfigError {
     },
     #[error("unknown schema mode: {0}")]
     SchemaMode(String),
+    #[error(
+        "'{path}' is a configuration store but holds no generation yet; commit one with \
+         --config-commit, or point at a configuration file instead"
+    )]
+    StoreEmpty { path: PathBuf },
+    #[error("cannot read the configuration store '{path}': {detail}")]
+    Store { path: PathBuf, detail: String },
     #[error("unknown language '{value}'")]
     Locale { value: String },
     #[error(
@@ -314,6 +333,27 @@ pub fn load(args: Args) -> Result<Config, ConfigError> {
     let explicit = args.config.clone();
     let from_env = std::env::var_os(ENV_CONFIG_PATH).map(PathBuf::from);
     let text = match explicit.or(from_env).as_deref() {
+        // A directory is a generation store: the configuration in force is the generation its
+        // pointer names. A file is a configuration. The two cannot be confused, so no new key
+        // is needed to say which - and pointing at the wrong one gets a message, not a parse
+        // error about a directory.
+        Some(path) if crate::config_store::Store::is_store(path) => {
+            let store = crate::config_store::Store::open(path);
+            match store.read_current() {
+                Ok(Some(text)) => Some(text),
+                Ok(None) => {
+                    return Err(ConfigError::StoreEmpty {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(err) => {
+                    return Err(ConfigError::Store {
+                        path: path.to_path_buf(),
+                        detail: err.to_string(),
+                    });
+                }
+            }
+        }
         Some(path) => Some(read_file(path)?),
         None => None,
     };

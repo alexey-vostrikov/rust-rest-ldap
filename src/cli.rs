@@ -82,6 +82,38 @@ pub struct Cli {
     #[arg(long = "allow-existing-entry", requires = "import_ldif")]
     pub allow_existing_entry: bool,
 
+    /// Commit the current configuration as a new generation, then exit
+    ///
+    /// `-c` names the store directory. The configuration in force is read, written as a new
+    /// generation, and `current` is pointed at it - atomically, so a crash leaves either the
+    /// old generation or the new one. With `--note` the history says why.
+    #[arg(long = "config-commit", conflicts_with_all = ["listen", "import_ldif"])]
+    pub config_commit: bool,
+
+    /// Go back to a generation by number, as a new commit
+    #[arg(long = "config-rollback", value_name = "NUMBER", conflicts_with_all = ["listen", "import_ldif"])]
+    pub config_rollback: Option<u64>,
+
+    /// List the generations with their author and note, then exit
+    #[arg(long = "config-history", conflicts_with_all = ["listen", "import_ldif"])]
+    pub config_history: bool,
+
+    /// Keep this many generations when collecting; the default is ten
+    #[arg(long = "config-keep", value_name = "N", requires = "config_commit")]
+    pub config_keep: Option<usize>,
+
+    /// Why this generation was committed, for the history
+    #[arg(long = "note", value_name = "TEXT", requires = "config_commit")]
+    pub note: Option<String>,
+
+    /// Read the configuration from this file instead of the one in force
+    ///
+    /// What seeds an empty store: `-c config.d --config-commit --from config.yaml` writes the
+    /// first generation. Without it a commit re-commits what is already in force, which is how
+    /// an operator marks a point before editing by hand.
+    #[arg(long = "from", value_name = "PATH", requires = "config_commit")]
+    pub from: Option<PathBuf>,
+
     /// Verify the search indexes against the data and exit
     ///
     /// Compares what each index answers with what a scan finds. A false negative - an entry
@@ -124,6 +156,12 @@ impl From<Cli> for config::Args {
             allow_existing_entry: cli.allow_existing_entry,
             check_config: cli.check_config,
             check_index: cli.check_index,
+            config_commit: cli.config_commit,
+            config_rollback: cli.config_rollback,
+            config_history: cli.config_history,
+            config_keep: cli.config_keep,
+            note: cli.note,
+            from: cli.from,
             reindex: cli.reindex,
         }
     }
