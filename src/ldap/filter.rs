@@ -13,6 +13,7 @@ use rasn_ldap::{Filter, SubstringChoice};
 use thiserror::Error;
 
 use crate::dn;
+use crate::index::Query;
 use crate::model::{Attribute, Attributes};
 
 /// Attribute description that matches on the entry's DN instead of its values.
@@ -22,6 +23,31 @@ pub const ATTR_ENTRY_DN: &str = "entryDN";
 pub enum FilterError {
     #[error("unsupported filter type '{0}'")]
     Unsupported(&'static str),
+}
+
+/// Reduces a filter to what an index can answer.
+///
+/// Anything the index does not cover becomes `Query::Unindexed`, which narrows
+/// nothing; the filter itself still runs on the candidates.
+pub fn to_query(filter: &Filter) -> Query {
+    match filter {
+        Filter::And(filters) => Query::And(filters.iter().map(to_query).collect()),
+        Filter::Or(filters) => Query::Or(filters.iter().map(to_query).collect()),
+        Filter::Not(inner) => Query::Not(Box::new(to_query(inner))),
+        Filter::Present(present) => Query::Presence(present.0.to_lowercase().into()),
+        Filter::EqualityMatch(assertion) => {
+            let name = assertion.attribute_desc.0.to_lowercase();
+            // `entryDN` is computed from the DN and never stored as an attribute.
+            if name == "entrydn" {
+                return Query::Unindexed;
+            }
+            Query::Equality {
+                attribute: name.into(),
+                value: String::from_utf8_lossy(assertion.assertion_value.as_ref()).into_owned(),
+            }
+        }
+        _ => Query::Unindexed,
+    }
 }
 
 /// Evaluates `filter` against the entry.

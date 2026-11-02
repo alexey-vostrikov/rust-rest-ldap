@@ -28,6 +28,20 @@ schema:
   #files:
   #  - /etc/rust-rest-ldap/local.schema
 
+# Search indexes, built when the directory is loaded and rebuilt on every reload.
+# `pres` answers (attribute=*), `eq` answers (attribute=value); both are supersets of
+# the answer, the filter still runs on every candidate. Per-attribute kinds replace
+# the default; an attribute that is not configured uses `default`.
+indexes:
+  default: [pres]
+  attributes:
+    cn: [eq, pres]
+    uid: [eq]
+    mail: [eq]
+    objectClass: [eq, pres]
+    gidNumber: [eq]
+    uidNumber: [eq]
+
 respect_control_criticality: true
 
 # Password hashes: weak schemes are refused unless listed one by one here.

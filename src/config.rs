@@ -12,9 +12,10 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::acl::{AccessRuleConfig, Acl, AclError};
+use crate::index::{IndexConfig, IndexError};
 use crate::password::PasswordPolicy;
-use crate::schema::{Mode as SchemaMode, Schema, SchemaError};
 use crate::password::policy::{PasswordConfig, PolicyError};
+use crate::schema::{Mode as SchemaMode, Schema, SchemaError};
 
 pub const DEFAULT_BACKEND: &str = "rest";
 pub const DEFAULT_BASE_DN: &str = "dc=example,dc=com";
@@ -64,6 +65,7 @@ pub struct Config {
     pub passwords: PasswordPolicy,
     pub schema: Schema,
     pub schema_mode: SchemaMode,
+    pub indexes: IndexConfig,
     pub acl: Acl,
     pub allow_plaintext_simple_bind: bool,
 }
@@ -108,6 +110,8 @@ pub enum ConfigError {
     },
     #[error("unknown schema mode: {0}")]
     SchemaMode(String),
+    #[error("error in the 'indexes' section: {0}")]
+    Index(#[from] IndexError),
 }
 
 /// Subset of the configuration that lives in the YAML file.
@@ -136,6 +140,8 @@ struct FileConfig {
     bind: BindConfig,
     #[serde(default)]
     schema: SchemaConfig,
+    #[serde(default)]
+    indexes: IndexConfig,
 }
 
 /// `schema:` section of the configuration file.
@@ -257,6 +263,12 @@ pub fn resolve(
                 .parse()
                 .map_err(|err: String| ConfigError::SchemaMode(err))?,
         },
+        // Resolved here so a misspelled index kind fails at startup, not on the
+        // first search that would have used it.
+        indexes: {
+            file.indexes.resolve()?;
+            file.indexes
+        },
         acl: crate::acl::from_config(file.access.as_deref())?,
         allow_plaintext_simple_bind: file.bind.allow_plaintext_simple,
     };
@@ -277,12 +289,10 @@ fn load_schema(config: &SchemaConfig) -> Result<Schema, ConfigError> {
             path: path.display().to_string(),
             source,
         })?;
-        schema
-            .extend(&text)
-            .map_err(|source| ConfigError::Schema {
-                path: path.display().to_string(),
-                source,
-            })?;
+        schema.extend(&text).map_err(|source| ConfigError::Schema {
+            path: path.display().to_string(),
+            source,
+        })?;
     }
 
     Ok(schema)

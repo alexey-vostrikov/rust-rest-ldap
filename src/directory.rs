@@ -11,10 +11,12 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use uuid::Uuid;
 
 use crate::dn;
+use crate::index::{Index, IndexConfig, IndexError, Query};
 use crate::mapping::gorestldap;
 use crate::model::{
     ATTR_ENTRY_UUID, ATTR_HAS_SUBORDINATES, ATTR_OBJECT_CLASS, Attribute, Attributes, Entry, Group,
@@ -41,6 +43,8 @@ pub struct Directory {
     users: Range<usize>,
     groups: Range<usize>,
     by_dn: HashMap<String, usize>,
+    /// Search indexes over the same id numbering. Empty unless `with_indexes` ran.
+    index: Arc<Index>,
 }
 
 impl Directory {
@@ -170,6 +174,7 @@ impl Directory {
             users,
             groups,
             by_dn,
+            index: Arc::new(Index::default()),
         }
     }
 
@@ -218,6 +223,41 @@ impl Directory {
     /// Every entry, in canonical order.
     pub fn all(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// Builds the configured indexes over this snapshot.
+    ///
+    /// Kept separate from the constructors so every existing caller keeps working
+    /// without a configuration, and so a test can compare an indexed directory with
+    /// the same directory unindexed.
+    pub fn with_indexes(mut self, config: &IndexConfig) -> Result<Self, IndexError> {
+        self.index = Arc::new(Index::build(&self.entries, config)?);
+        Ok(self)
+    }
+
+    pub fn index(&self) -> &Index {
+        &self.index
+    }
+
+    /// Position of an entry in the canonical order, which is its id in the indexes.
+    pub fn position(&self, entry_dn: &str) -> Option<usize> {
+        self.by_dn.get(&dn::normalize(entry_dn)).copied()
+    }
+
+    /// Entries matching `base_object` and `scope` together with their ids.
+    pub fn entries_with_ids(&self, base_object: &str, scope: Scope) -> Vec<(usize, &Entry)> {
+        let base_object = dn::normalize(base_object);
+
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| in_scope(entry.dn(), &base_object, scope))
+            .collect()
+    }
+
+    /// Candidate ids for a query, or `None` when the index cannot help.
+    pub fn candidates(&self, query: &Query) -> Option<roaring::RoaringBitmap> {
+        self.index.candidates(query)
     }
 
     /// Entries matching `base_object` and `scope`, in canonical order.
