@@ -214,25 +214,39 @@ impl OrganizationalUnit {
 }
 
 /// User entry loaded from the backend.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct User {
     pub ldap_admin: bool,
     #[serde(rename = "entryUUID")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub has_subordinates: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub object_class: Vec<String>,
     pub cn: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uid_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user_password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gid_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub given_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub home_directory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub login_shell: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub member_of: Vec<String>,
 }
 
@@ -289,16 +303,22 @@ impl User {
 }
 
 /// Group entry loaded from the backend.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Group {
     #[serde(rename = "entryUUID")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub has_subordinates: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub object_class: Vec<String>,
     pub cn: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gid_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub member_uid: Vec<String>,
 }
 
