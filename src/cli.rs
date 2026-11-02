@@ -65,6 +65,29 @@ pub struct Cli {
     // "requires one of two flags" in a readable way.
     #[arg(long = "export-operational")]
     pub export_operational: bool,
+
+    /// Load an LDIF file into the configured store and exit
+    ///
+    /// The offline counterpart of ldapadd, and the way an empty directory is filled: `add`
+    /// over the protocol needs a bind, and a bind needs an entry that is not there yet.
+    /// The whole file is written in one transaction, so a broken record leaves the store
+    /// untouched. '-' reads standard input.
+    #[arg(long = "import-ldif", value_name = "PATH", conflicts_with = "listen")]
+    pub import_ldif: Option<PathBuf>,
+
+    /// Import into a store that already holds entries
+    ///
+    /// Off by default, because a mistyped path that merges a dump into a live directory is
+    /// discovered by its effects. Turns the import into an upsert of what the file holds.
+    #[arg(long = "allow-existing-entry", requires = "import_ldif")]
+    pub allow_existing_entry: bool,
+
+    /// Check the configuration, the schema, the data files and the store, then exit
+    ///
+    /// What `slaptest` does: says whether this configuration would start, without binding a
+    /// port. The exit code is the answer, so a deployment script can branch on it.
+    #[arg(long = "check-config", conflicts_with_all = ["listen", "import_ldif"])]
+    pub check_config: bool,
 }
 
 impl From<Cli> for config::Args {
@@ -80,6 +103,9 @@ impl From<Cli> for config::Args {
             export_ldif: cli.export_ldif,
             export_yaml: cli.export_yaml,
             export_operational: cli.export_operational,
+            import_ldif: cli.import_ldif,
+            allow_existing_entry: cli.allow_existing_entry,
+            check_config: cli.check_config,
         }
     }
 }
