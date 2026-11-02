@@ -15,13 +15,15 @@ path = "src/main.rs"
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 humantime = "2.4.0"
+rasn = "0.30.0"
+rasn-ldap = "0.30.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_yaml_ng = "0.10.0"
 sha1 = "0.11.0"
 subtle = "2.6.1"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt", "macros"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "net", "time", "sync"] }
 uuid = { version = "1.29.0", features = ["v5"] }
 
 [dev-dependencies]
