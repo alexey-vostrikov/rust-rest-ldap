@@ -264,6 +264,69 @@ pub fn decode_sort(value: &[u8]) -> Result<SortRequest, ControlError> {
 }
 
 /// Decodes the VLV control value.
+/// Encodes a sort control (RFC 2891 §2.4).
+///
+/// The mirror of `decode_sort`, and the only reason both exist: a client that can write the
+/// control and a server that can read it are the two halves of the same agreement, and
+/// testing the round trip catches a length that is off by one before a client meets a real
+/// server.
+pub fn encode_sort(request: &SortRequest) -> Vec<u8> {
+    let mut keys = Vec::new();
+
+    for key in &request.keys {
+        let mut body = Vec::new();
+        // The attribute is a `longName`, an OCTET STRING inside the sequence.
+        body.push(OCTET_STRING_TAG);
+        body.extend(encode_length(key.attribute.len()));
+        body.extend_from_slice(key.attribute.as_bytes());
+
+        if let Some(rule) = &key.ordering_rule {
+            body.push(CONTEXT_0);
+            body.extend(encode_length(rule.len()));
+            body.extend_from_slice(rule.as_bytes());
+        }
+
+        if key.reverse {
+            // `reverseOrder` is a BOOLEAN, and only `true` is ever written: absent and
+            // `false` mean the same thing, and BER prefers the shorter form.
+            body.push(BOOLEAN_TAG);
+            body.push(1);
+            body.push(0xff);
+        }
+
+        keys.push(SEQUENCE_TAG);
+        keys.extend(encode_length(body.len()));
+        keys.extend_from_slice(&body);
+    }
+
+    let mut set = vec![SET_TAG];
+    set.extend(encode_length(keys.len()));
+    set.extend_from_slice(&keys);
+
+    let mut out = vec![SEQUENCE_TAG];
+    out.extend(encode_length(set.len()));
+    out.extend_from_slice(&set);
+
+    out
+}
+
+/// BER length octets: short form below 128, long form above.
+fn encode_length(length: usize) -> Vec<u8> {
+    if length < 0x80 {
+        return vec![length as u8];
+    }
+
+    let bytes: Vec<u8> = length
+        .to_be_bytes()
+        .into_iter()
+        .skip_while(|byte| *byte == 0)
+        .collect();
+
+    let mut out = vec![0x80 | bytes.len() as u8];
+    out.extend_from_slice(&bytes);
+    out
+}
+
 pub fn decode_vlv(value: &[u8]) -> Result<VirtualList, ControlError> {
     let mut reader = Reader::new(value);
     let body = reader.sequence()?;

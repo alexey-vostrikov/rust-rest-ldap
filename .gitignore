@@ -7,3 +7,4 @@
 # redb files seeded for live checks
 /build
 .#*
+ldapsearch

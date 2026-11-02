@@ -78,10 +78,18 @@ sudo install -m 0755 rust-rest-ldap /usr/local/bin/
 
 ```sh
 # Сертификат: цепочка и ключ в PEM.
+#
+# `basicConstraints=critical,CA:FALSE` обязателен. `openssl req -x509` без него делает
+# сертификат удостоверяющим центром, а клиенты со строгой проверкой (rustls, современные
+# браузеры) отказывают такому сертификату в роли серверного: "CA used as end entity".
 sudo openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout /etc/rust-rest-ldap/server.key \
   -out /etc/rust-rest-ldap/server.crt \
-  -subj "/CN=ldap.example.com" -addext "subjectAltName=DNS:ldap.example.com"
+  -subj "/CN=ldap.example.com" \
+  -addext "subjectAltName=DNS:ldap.example.com" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth"
 
 # Пароль первого администратора — файлом, не аргументом: аргументы видны в ps.
 sudo sh -c 'openssl rand -base64 24 > /etc/rust-rest-ldap/admin.pass'
@@ -146,6 +154,25 @@ passwords:
 целиком, без конкретного атрибута, и правило `attributes: [cn, mail]` на этот вопрос не
 отвечает — клиент получает `no such object`. Анонимному чтению нужно `attributes: ["*"]`
 (пароли при этом не выдаются: они помечены чувствительными).
+
+## Утилиты
+
+Собственный клиент — чтобы проверять сервер не только чужими бинарями.
+
+```
+./ldapsearch -H ldaps://ldap.example.com --cacert /etc/rust-rest-ldap/server.crt \
+  -D "cn=admin,ou=users,dc=example,dc=com" -w "$(sudo cat /etc/rust-rest-ldap/admin.pass)" \
+  -b "dc=example,dc=com" -LLL "(uid=alice)" cn mail
+```
+
+Флаги те же, что у OpenLDAP: `-H`/`-h`/`-p`, `-D`/`-w`/`-W`, `-b`/`-s`/`-a`, `-z`/`-l`,
+`-LLL`, `-o ldif-wrap=no`, `-Z`/`-ZZ` (StartTLS), `-E pr=N` (paged results), `-S attr[-]`
+(сортировка на сервере). `--cacert` — свой ЦС, `--insecure` — не проверять (шифрование без
+проверки личности сервера).
+
+**Код возврата — код результата LDAP**, как у OpenLDAP: `0` успех, `4` превышен предел
+размера, `32` нет такого объекта, `49` неверные учётные данные. Скрипт ветвится по числу, а
+не разбирает текст.
 
 ## Эксплуатация
 
