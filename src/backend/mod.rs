@@ -5,20 +5,51 @@
 //! Here the backends are part of the binary and are selected by name from the
 //! configuration; an unknown name is a startup error listing what exists.
 
-use crate::model::{Group, User};
+use crate::directory::Directory;
+use crate::model::{Entry, Group, User};
 use thiserror::Error;
 
 pub mod file;
 pub mod null;
+pub mod redb_store;
 
 pub use file::FileBackend;
 pub use null::NullBackend;
+pub use redb_store::RedbBackend;
 
 /// Directory payload as the backends hand it over.
+///
+/// Two shapes, because two kinds of backend exist: the JSON backends know about
+/// users and groups as separate lists, and the entry store keeps whole entries.
+/// Whichever is filled, the directory is built from it — the LDAP layer never sees
+/// the difference.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectoryData {
     pub users: Vec<User>,
     pub groups: Vec<Group>,
+    pub entries: Vec<Entry>,
+}
+
+impl DirectoryData {
+    /// Builds the directory this payload describes.
+    pub fn into_directory(
+        self,
+        base_dn: &str,
+        users_ou_name: &str,
+        groups_ou_name: &str,
+    ) -> Directory {
+        if self.entries.is_empty() {
+            Directory::new(
+                base_dn,
+                users_ou_name,
+                groups_ou_name,
+                self.users,
+                self.groups,
+            )
+        } else {
+            Directory::from_entries(base_dn, users_ou_name, groups_ou_name, self.entries)
+        }
+    }
 }
 
 /// A change the server asks the backend to persist.
@@ -27,8 +58,33 @@ pub struct DirectoryData {
 /// equality; the variants here make the same operation type-checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryChange {
-    User { old: Box<User>, new: Box<User> },
-    Group { old: Box<Group>, new: Box<Group> },
+    User {
+        old: Box<User>,
+        new: Box<User>,
+    },
+    Group {
+        old: Box<Group>,
+        new: Box<Group>,
+    },
+    /// Write the entry as it is, whatever its attributes.
+    Upsert {
+        entry: Entry,
+    },
+    Delete {
+        dn: String,
+    },
+}
+
+impl EntryChange {
+    /// Names the variant, for error messages that must say what was refused.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            EntryChange::User { .. } => "user change",
+            EntryChange::Group { .. } => "group change",
+            EntryChange::Upsert { .. } => "entry upsert",
+            EntryChange::Delete { .. } => "entry delete",
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -70,6 +126,8 @@ pub enum BackendError {
     EntryNotFound,
     #[error("updating data is not supported by this backend")]
     UpdateNotSupported,
+    #[error("redb error on '{path}': {reason}")]
+    Redb { path: String, reason: String },
 }
 
 /// Selected backend.
@@ -77,6 +135,7 @@ pub enum BackendError {
 pub enum Backend {
     File(FileBackend),
     Null(NullBackend),
+    Redb(RedbBackend),
 }
 
 impl Backend {
@@ -93,6 +152,12 @@ impl Backend {
                 Ok(Backend::File(FileBackend::from_config(config)?))
             }
             "null" => Ok(Backend::Null(NullBackend)),
+            "redb" => {
+                let config = config.ok_or_else(|| BackendError::MissingConfig {
+                    name: name.to_string(),
+                })?;
+                Ok(Backend::Redb(RedbBackend::from_config(config)?))
+            }
             _ => Err(BackendError::UnknownBackend {
                 name: name.to_string(),
                 known: KNOWN_BACKENDS.to_vec(),
@@ -104,6 +169,7 @@ impl Backend {
         match self {
             Backend::File(backend) => backend.load(),
             Backend::Null(backend) => backend.load(),
+            Backend::Redb(backend) => backend.directory_data(),
         }
     }
 
@@ -111,12 +177,30 @@ impl Backend {
         match self {
             Backend::File(backend) => backend.update(change),
             Backend::Null(backend) => backend.update(change),
+            Backend::Redb(backend) => backend.apply(std::slice::from_ref(change)),
+        }
+    }
+
+    /// Applies a change set atomically where the backend can.
+    ///
+    /// The entry store commits all changes or none; the JSON backends apply them one
+    /// by one, which is why they are not the right choice for data that matters.
+    pub async fn apply(&self, changes: &[EntryChange]) -> Result<(), BackendError> {
+        match self {
+            Backend::File(backend) => {
+                for change in changes {
+                    backend.update(change)?;
+                }
+                Ok(())
+            }
+            Backend::Null(backend) => backend.update(&changes[0]),
+            Backend::Redb(backend) => backend.apply(changes),
         }
     }
 }
 
 /// Backends compiled into the binary, in the order they are reported.
-pub const KNOWN_BACKENDS: [&str; 2] = ["file", "null"];
+pub const KNOWN_BACKENDS: [&str; 3] = ["file", "null", "redb"];
 
 #[cfg(test)]
 mod tests {
@@ -128,7 +212,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "unknown backend 'postgres', known backends: file, null"
+            "unknown backend 'postgres', known backends: file, null, redb"
         );
     }
 

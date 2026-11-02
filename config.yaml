@@ -11,6 +11,13 @@ backends:
   file:
     users_path: examples/file/users.json
     groups_path: examples/file/groups.json
+  # Durable store of whole entries: one transaction per change set, fsync on commit.
+  # Use it instead of `file` when the data matters: the JSON backends rewrite the
+  # whole file and keep users and groups in two files, so a crash can leave them out
+  # of step. Select it with `-b redb`.
+  redb:
+    path: ./build/directory.redb
+    durability: immediate   # immediate (default) or none for bulk loads
 
 respect_control_criticality: true
 
