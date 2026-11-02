@@ -11,6 +11,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::password::PasswordPolicy;
+use crate::password::policy::{PasswordConfig, PolicyError};
+
 pub const DEFAULT_BACKEND: &str = "rest";
 pub const DEFAULT_BASE_DN: &str = "dc=example,dc=com";
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:389";
@@ -56,6 +59,7 @@ pub struct Config {
     pub server_key: Option<PathBuf>,
     pub http_listen_addr: Option<String>,
     pub callback_auth_token: Option<String>,
+    pub passwords: PasswordPolicy,
 }
 
 #[derive(Debug, Error)]
@@ -80,6 +84,8 @@ pub enum ConfigError {
     },
     #[error("use_tls is enabled, but server_cert and server_key are not both set")]
     MissingTlsMaterial,
+    #[error(transparent)]
+    Password(#[from] PolicyError),
 }
 
 /// Subset of the configuration that lives in the YAML file.
@@ -101,6 +107,7 @@ struct FileConfig {
     server_key: Option<PathBuf>,
     http_listen_addr: Option<String>,
     callback_auth_token: Option<String>,
+    passwords: Option<PasswordConfig>,
 }
 
 fn default_respect_control_criticality() -> bool {
@@ -187,6 +194,7 @@ pub fn resolve(
         server_key: file.server_key,
         http_listen_addr: file.http_listen_addr.filter(|addr| !addr.trim().is_empty()),
         callback_auth_token: file.callback_auth_token,
+        passwords: PasswordPolicy::from_config(file.passwords.as_ref())?,
     };
 
     if config.use_tls && (config.server_cert.is_none() || config.server_key.is_none()) {
