@@ -2,3 +2,5 @@
 .metrics
 *.tar.gz
 !Cargo.lock
+# release binary copied out of the build container for live checks
+/rust-rest-ldap
