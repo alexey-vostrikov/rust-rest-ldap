@@ -134,6 +134,18 @@ pub fn extended_response(
     diagnostic: &str,
     response_name: Option<&str>,
 ) -> LdapMessage {
+    extended_response_with_value(message_id, code, diagnostic, response_name, None)
+}
+
+/// Extended response carrying a value: `whoami` returns the identity, Password Modify
+/// returns a generated password (RFC 4532, RFC 3062).
+pub fn extended_response_with_value(
+    message_id: MessageId,
+    code: ResultCode,
+    diagnostic: &str,
+    response_name: Option<&str>,
+    response_value: Option<&[u8]>,
+) -> LdapMessage {
     LdapMessage::new(
         message_id,
         ProtocolOp::ExtendedResp(ExtendedResponse {
@@ -142,7 +154,7 @@ pub fn extended_response(
             diagnostic_message: diagnostic.into(),
             referral: None,
             response_name: response_name.map(|name| LdapOid::from(name.as_bytes())),
-            response_value: None,
+            response_value: response_value.map(|value| value.to_vec().into()),
         }),
     )
 }
