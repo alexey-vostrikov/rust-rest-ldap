@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::acl::{AccessRuleConfig, Acl, AclError};
 use crate::danger::Danger;
 use crate::index::{IndexConfig, IndexError};
+use crate::integrity::IntegrityConfig;
 use crate::password::PasswordPolicy;
 use crate::password::policy::{PasswordConfig, PolicyError};
 use crate::schema::{Mode as SchemaMode, Schema, SchemaError};
@@ -75,6 +76,12 @@ pub struct Config {
     pub allow_unencrypted_bind: bool,
     /// Dangerous settings this configuration turned on, named for the startup banner.
     pub dangerous_settings: Vec<&'static str>,
+    /// Uniqueness and referential integrity of account attributes.
+    pub integrity: IntegrityConfig,
+    /// Language for operator diagnostics, and where it came from.
+    pub locale: (crate::i18n::Locale, crate::i18n::Source),
+    /// Translation file, when one is configured.
+    pub locale_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -117,6 +124,8 @@ pub enum ConfigError {
     },
     #[error("unknown schema mode: {0}")]
     SchemaMode(String),
+    #[error("unknown language '{value}'")]
+    Locale { value: String },
     #[error(
         "this configuration turns on {settings}, which weakens the server, but \
          AllowDangerousSettings is not set; add \
@@ -137,6 +146,13 @@ pub enum ConfigError {
 /// Subset of the configuration that lives in the YAML file.
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
+    #[serde(default)]
+    integrity: IntegrityConfig,
+    /// Language for operator-facing diagnostics: `ru`, `en`. Empty means "ask the
+    /// environment". Client-visible protocol text is always English.
+    locale: Option<String>,
+    /// Translation file for that language; `locale/<tag>.yaml` by default.
+    locale_file: Option<PathBuf>,
     /// Master acknowledgement: this configuration contains settings that weaken the
     /// server, and the operator knows it.
     ///
@@ -295,6 +311,24 @@ pub fn resolve(
         use_tls: file.use_tls,
         server_cert: file.server_cert,
         server_key: file.server_key,
+        integrity: file.integrity,
+        locale: {
+            // The configuration wins over the host: an operator who wrote `locale: ru`
+            // wants Russian even on an English machine.
+            match file.locale.as_deref().filter(|tag| !tag.trim().is_empty()) {
+                Some(tag) => {
+                    let locale =
+                        crate::i18n::Locale::parse(tag).ok_or_else(|| ConfigError::Locale {
+                            value: tag.to_string(),
+                        })?;
+                    (locale, crate::i18n::Source::Config)
+                }
+                // The same environment the rest of the configuration reads, so a test
+                // and a server resolve the language by the same rule.
+                None => crate::i18n::from_env(&env),
+            }
+        },
+        locale_file: file.locale_file,
         dangerous_settings: {
             let mut enabled: Vec<&'static str> = Vec::new();
             if file.bind.allow_unencrypted_bind.is_on() {

@@ -141,7 +141,7 @@ fn check_schema(
     match mode {
         SchemaMode::Warn => {
             for problem in &problems {
-                eprintln!("schema warning: {problem}");
+                eprintln!("{}", crate::i18n::t("warn.schema", &[("detail", problem)]));
             }
             Ok(())
         }
@@ -171,7 +171,10 @@ pub async fn reload_on_interval(
         tokio::select! {
             _ = ticker.tick() => match source.reload().await {
                 Ok(entries) => println!("reload: {entries} entries (generation {})", source.generation().await),
-                Err(err) => eprintln!("reload failed, keeping the current directory: {err}"),
+                Err(err) => eprintln!(
+                    "{}",
+                    crate::i18n::t("error.reload", &[("detail", &err.to_string())])
+                ),
             },
             _ = stop.changed() => {
                 if *stop.borrow() {
@@ -215,6 +218,9 @@ mod tests {
             acl: Default::default(),
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),
+            integrity: crate::integrity::IntegrityConfig::default(),
+            locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),
+            locale_file: None,
         };
         config.backends.insert(
             "file".to_string(),

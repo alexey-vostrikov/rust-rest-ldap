@@ -245,6 +245,21 @@ pub fn handle_add(
         return reject(response(code, &detail));
     }
 
+    // Two accounts called `alice` make `uid=alice,…` ambiguous: a bind picks the first
+    // match and the other account cannot be used at all. The check is over the users
+    // OU only, so a group may still be named after a person.
+    if let Err(duplicate) = crate::integrity::check_unique(
+        directory,
+        &entry,
+        &entry_dn,
+        &security.integrity.unique_attributes(),
+    ) {
+        return reject(response(
+            ResultCode::ConstraintViolation,
+            &duplicate.to_string(),
+        ));
+    }
+
     let actor = session
         .identity()
         .map(|identity| identity.dn.clone())
@@ -307,8 +322,24 @@ pub fn handle_delete(
         ));
     }
 
+    // A group that lists this user keeps a name that no longer resolves, and nothing
+    // says so: the membership looks like a person and is not one. The cleanup belongs
+    // here, in the same change set, so the delete and the cleanup cannot half-happen.
+    let mut changes = vec![EntryChange::Delete {
+        dn: entry_dn.clone(),
+    }];
+
+    if let Some(entry) = directory
+        .find(&entry_dn)
+        .filter(|_| security.integrity.referential_integrity)
+    {
+        for group in crate::integrity::changes_for_removed(directory, entry) {
+            changes.push(EntryChange::Upsert { entry: group });
+        }
+    }
+
     Outcome::Persist {
-        changes: vec![EntryChange::Delete { dn: entry_dn }],
+        changes,
         success: response(ResultCode::Success, ""),
     }
 }
@@ -446,6 +477,14 @@ pub fn handle_modify_dn(
             dn: descendant.dn().to_string(),
         });
         changes.push(EntryChange::Upsert { entry: moved });
+    }
+
+    // A group listing the old name would point at nobody; the membership follows the
+    // user, in the same change set as the rename itself.
+    if security.integrity.referential_integrity {
+        for group in crate::integrity::retarget_members(directory, entry, &renamed) {
+            changes.push(EntryChange::Upsert { entry: group });
+        }
     }
 
     changes.push(EntryChange::Upsert { entry: renamed });

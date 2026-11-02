@@ -1,0 +1,50 @@
+# Русская диагностика для оператора.
+#
+# Ключи совпадают с ENGLISH в src/i18n.rs. Чего здесь нет, то выводится по-английски:
+# половина перевода не должна мешать серверу стартовать.
+#
+# Тексты для клиента (diagnosticMessage в LDAP-ответах) здесь намеренно отсутствуют:
+# это часть протокола, скрипты на них смотрят, и они остаются английскими.
+
+# Старт
+start.banner: "rust-rest-ldap {version}: бэкенд '{backend}', база '{base}', пользователей {users}, групп {groups}"
+start.danger: "ОПАСНО: конфигурация включает {settings} — подтверждено через AllowDangerousSettings"
+start.passwords: "пароли: хранение {scheme}, разрешено слабых схем: {weak}; правил ACL {rules}; простой bind без шифрования {plaintext}"
+start.listening: "ldap: слушаю {addr}"
+start.language: "диагностика: язык '{locale}' (источник: {source})"
+start.shutting_down: "останавливаюсь"
+start.export_done: "выгружено записей: {entries} в {path}"
+
+# Ошибки для оператора
+error.config: "ошибка конфигурации: {detail}"
+error.backend: "ошибка бэкенда: {detail}"
+error.server: "ошибка сервера: {detail}"
+error.http: "ошибка HTTP-сервера: {detail}"
+error.signal: "не удалось установить обработчик SIGUSR1: {detail}"
+error.reload: "перезагрузка не удалась, оставляю текущий каталог: {detail}"
+error.write: "запись не удалась: {detail}"
+error.hash_upgrade: "не удалось сохранить обновлённый хеш пароля: {detail}"
+error.password_upgrade: "обновление хеша пароля для '{dn}' не удалось: {detail}"
+error.accept: "ошибка при приёме соединения: {detail}"
+error.tls_handshake: "клиент {peer}: TLS-рукопожатие не удалось: {detail}"
+error.starttls_handshake: "клиент {peer}: StartTLS-рукопожатие не удалось"
+error.malformed: "клиент {peer} прислал некорректное сообщение, соединение закрыто"
+error.client: "клиент {peer}: {detail}"
+error.shutdown_timeout: "плавная остановка не уложилась в {grace}, закрываю оставшиеся соединения"
+warn.schema: "предупреждение схемы: {detail}"
+
+# Диагностика конфигурации
+config.tls_material: "use_tls включён, но server_cert и server_key заданы не оба"
+config.schema_read: "не удаётся прочитать файл схемы '{path}': {detail}"
+config.schema: "ошибка загрузки схемы из '{path}': {detail}"
+config.schema_mode: "неизвестный режим схемы '{value}'; ожидается strict, warn или off"
+config.locale: "неизвестный язык '{value}'; файл переводов '{path}' отсутствует или не читается"
+config.plain_http: "задан http_listen_addr '{address}', но callback-слушатель работает по простому HTTP, и его токен идёт открытым текстом; добавьте рядом AllowPlainHttpRest: 'Yes I know this is bad idea', если это допустимо"
+config.dangerous: "конфигурация включает {settings}, что ослабляет сервер, но AllowDangerousSettings не задан; добавьте на верхнем уровне AllowDangerousSettings: 'Yes I know this is bad idea', если так и задумано"
+config.weak_ack: "заданы слабые схемы паролей ({requested}), но AllowWeakHashes не задан; если так и задумано, добавьте в раздел passwords AllowWeakHashes: 'Yes I know this is bad idea'"
+config.index: "ошибка в разделе 'indexes': {detail}"
+config.password: "ошибка в разделе 'passwords': {detail}"
+config.access: "ошибка в разделе 'access': {detail}"
+config.unknown_backend: "неизвестный бэкенд '{name}'; известны: {known}"
+config.interval: "некорректный интервал обновления '{value}': {detail}"
+config.parse: "не удаётся разобрать файл конфигурации '{path}': {detail}"

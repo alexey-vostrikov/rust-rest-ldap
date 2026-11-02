@@ -146,6 +146,25 @@ pub fn handle_modify(
     // clock is read once so the two timestamps of one write cannot disagree.
     let modified = stamp(&modified, session, &requester);
 
+    // Changing `cn` or `uid` can collide with another account; the entry itself is
+    // excluded, so a modify that keeps the value is not a duplicate of itself.
+    //
+    // `entry.dn()` and not `entry_dn`: a client may address an entry as
+    // `uid=alice,ou=users,…` while the entry is stored as `cn=alice,ou=users,…`, and
+    // excluding the alias would let the entry collide with itself.
+    if let Err(duplicate) = crate::integrity::check_unique(
+        directory,
+        &modified,
+        entry.dn(),
+        &security.integrity.unique_attributes(),
+    ) {
+        return Outcome::Reject(modify_response(
+            message_id,
+            ResultCode::ConstraintViolation,
+            &duplicate.to_string(),
+        ));
+    }
+
     // The entry as it would be stored must satisfy the schema it is published under.
     if let Err(violations) = check(&security.schema, security.schema_mode, &modified) {
         let detail = violations

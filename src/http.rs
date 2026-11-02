@@ -113,6 +113,9 @@ mod tests {
             acl: Default::default(),
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),
+            integrity: crate::integrity::IntegrityConfig::default(),
+            locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),
+            locale_file: None,
         };
         let backend_config = serde_json::json!({
             "users_path": users_path,

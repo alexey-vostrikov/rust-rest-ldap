@@ -28,6 +28,18 @@ schema:
   #files:
   #  - /etc/rust-rest-ldap/local.schema
 
+# Uniqueness and referential integrity.
+#   unique           - values of these attributes must not repeat among the users OU;
+#                      duplicates make `uid=alice,...` ambiguous, and a bind then picks
+#                      whichever entry comes first.
+#   allow_duplicates - turn the check off.
+#   referential_integrity - on delete or rename, update the groups that list the user in
+#                      memberUid, so no membership points at a name nobody answers to.
+integrity:
+  unique: [cn, uid]
+  allow_duplicates: false
+  referential_integrity: true
+
 # Search indexes, built when the directory is loaded and rebuilt on every reload.
 # `pres` answers (attribute=*), `eq` answers (attribute=value); both are supersets of
 # the answer, the filter still runs on every candidate. Per-attribute kinds replace
@@ -41,6 +53,13 @@ indexes:
     objectClass: [eq, pres]
     gidNumber: [eq]
     uidNumber: [eq]
+
+# Language of the diagnostics an OPERATOR reads: startup lines, configuration errors,
+# the journal. Client-visible protocol text stays English ASCII, because scripts match on
+# it. Fallback order: this key, then RUST_REST_LDAP_LOCALE, then LC_ALL, then LANG.
+# Translations live in locale/<tag>.yaml; English is built in, so `en` needs no file.
+#locale: ru
+#locale_file: locale/ru.yaml
 
 # DANGEROUS SETTINGS. A setting that weakens the server does not take `true`: it takes
 # the sentence below, word for word, and the master switch here must be on as well.
