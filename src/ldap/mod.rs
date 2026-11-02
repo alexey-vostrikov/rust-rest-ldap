@@ -12,6 +12,7 @@ pub mod responses;
 pub mod schema_entry;
 pub mod search;
 pub mod session;
+pub mod sort;
 pub mod starttls;
 pub mod write;
 

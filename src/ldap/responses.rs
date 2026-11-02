@@ -170,6 +170,18 @@ pub fn paged_results_control(page: &Page) -> Control {
     )
 }
 
+/// Builds a response control from its OID and already-encoded value.
+///
+/// Used by the controls whose value this server writes itself: sort and the virtual list
+/// view.
+pub fn control(oid: &str, criticality: bool, value: Option<&[u8]>) -> Control {
+    Control::new(
+        LdapOid::from(oid.as_bytes()),
+        criticality,
+        value.map(|value| OctetString::from(value.to_vec())),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
