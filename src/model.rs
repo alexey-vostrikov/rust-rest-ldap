@@ -26,6 +26,9 @@ pub struct Attribute {
     pub operational: bool,
     /// Values are compared exactly instead of case-insensitively (passwords).
     pub case_sensitive: bool,
+    /// Sensitive attributes are never returned by `*` or `+`: the client has to
+    /// name them, and the ACL then decides whether they may be read.
+    pub sensitive: bool,
 }
 
 impl Attribute {
@@ -36,6 +39,7 @@ impl Attribute {
             values,
             operational: false,
             case_sensitive: false,
+            sensitive: false,
         }
     }
 
@@ -51,6 +55,12 @@ impl Attribute {
 
     fn case_sensitive(mut self) -> Self {
         self.case_sensitive = true;
+        self
+    }
+
+    /// Marks the attribute so that `*` and `+` never include it.
+    fn sensitive(mut self) -> Self {
+        self.sensitive = true;
         self
     }
 }
@@ -97,27 +107,17 @@ impl Attributes {
         let entry_dn = || Attribute::single(ATTR_ENTRY_DN, dn).operational();
 
         if selection.is_empty() {
-            for attribute in &self.inner {
-                if !attribute.operational {
-                    push_unique(attribute.clone(), &mut out, &mut seen);
-                }
-            }
+            self.push_regular(&mut out, &mut seen);
             return out;
         }
 
         for requested in selection {
             match requested.to_lowercase().as_str() {
-                "*" => {
-                    for attribute in &self.inner {
-                        if !attribute.operational {
-                            push_unique(attribute.clone(), &mut out, &mut seen);
-                        }
-                    }
-                }
+                "*" => self.push_regular(&mut out, &mut seen),
                 "+" => {
                     push_unique(entry_dn(), &mut out, &mut seen);
                     for attribute in &self.inner {
-                        if attribute.operational {
+                        if attribute.operational && !attribute.sensitive {
                             push_unique(attribute.clone(), &mut out, &mut seen);
                         }
                     }
@@ -134,6 +134,15 @@ impl Attributes {
         }
 
         out
+    }
+
+    /// Regular (non-operational, non-sensitive) attributes, in insertion order.
+    fn push_regular(&self, out: &mut Vec<Attribute>, seen: &mut Vec<&'static str>) {
+        for attribute in &self.inner {
+            if !attribute.operational && !attribute.sensitive {
+                push_unique(attribute.clone(), out, seen);
+            }
+        }
     }
 }
 
@@ -262,8 +271,11 @@ impl User {
             attributes = attributes.push(Attribute::single("uid", uid));
         }
         if let Some(password) = &self.user_password {
-            attributes =
-                attributes.push(Attribute::single("userPassword", password).case_sensitive());
+            attributes = attributes.push(
+                Attribute::single("userPassword", password)
+                    .case_sensitive()
+                    .sensitive(),
+            );
         }
         if let Some(value) = &self.display_name {
             attributes = attributes.push(Attribute::single("displayName", value));
@@ -551,8 +563,31 @@ mod tests {
 
         assert_eq!(
             selected.len(),
-            attributes.values().len() - 2,
-            "operational ones are excluded"
+            attributes.values().len() - 3,
+            "operational and sensitive attributes are excluded"
+        );
+        assert!(
+            selected
+                .iter()
+                .all(|attribute| attribute.name != "userPassword"),
+            "a wildcard must never return the password hash"
+        );
+    }
+
+    #[test]
+    fn explicit_selection_can_return_the_password_for_the_acl_to_decide() {
+        let attributes = user().attributes();
+
+        let selected = attributes.select(
+            "cn=admin,ou=users,dc=example,dc=com",
+            &["userPassword".to_string()],
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "userPassword");
+        assert!(
+            selected[0].sensitive,
+            "the caller still needs to know the attribute is sensitive"
         );
     }
 

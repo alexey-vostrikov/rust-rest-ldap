@@ -11,7 +11,7 @@ pub mod session;
 use rasn_ldap::{LdapMessage, ProtocolOp, ResultCode};
 
 use crate::directory::Directory;
-use crate::password::PasswordPolicy;
+use crate::security::Security;
 use session::Session;
 
 /// What the connection loop does after one message.
@@ -33,8 +33,7 @@ pub enum Action {
 pub fn handle(
     session: &mut Session,
     directory: &Directory,
-    respect_critical_controls: bool,
-    passwords: &PasswordPolicy,
+    security: &Security,
     message: LdapMessage,
 ) -> Action {
     let message_id = message.message_id;
@@ -42,7 +41,7 @@ pub fn handle(
 
     match message.protocol_op {
         ProtocolOp::BindRequest(request) => Action::Reply(vec![bind::handle_bind(
-            session, directory, message_id, &request, passwords,
+            session, directory, message_id, &request, security,
         )]),
         ProtocolOp::UnbindRequest(_) => {
             session.reset();
@@ -55,7 +54,7 @@ pub fn handle(
             message_id,
             &request,
             controls.as_ref(),
-            respect_critical_controls,
+            security,
         )),
         ProtocolOp::CompareRequest(_) => Action::Reply(vec![responses::compare_response(
             message_id,
@@ -107,8 +106,8 @@ mod tests {
     const BASE: &str = "dc=example,dc=com";
     const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
 
-    fn policy() -> PasswordPolicy {
-        PasswordPolicy::strict()
+    fn security() -> Security {
+        Security::default()
     }
 
     fn directory() -> Directory {
@@ -167,8 +166,7 @@ mod tests {
         let action = handle(
             &mut session,
             &directory,
-            true,
-            &policy(),
+            &security(),
             bind_message(1, b"admin-secret"),
         );
 
@@ -183,16 +181,14 @@ mod tests {
         handle(
             &mut session,
             &directory,
-            true,
-            &policy(),
+            &security(),
             bind_message(1, b"admin-secret"),
         );
 
         let action = handle(
             &mut session,
             &directory,
-            true,
-            &policy(),
+            &security(),
             LdapMessage::new(2, ProtocolOp::UnbindRequest(UnbindRequest)),
         );
 
@@ -237,7 +233,7 @@ mod tests {
         );
 
         for message in [add, delete, modify_dn, compare] {
-            let action = handle(&mut session, &directory, true, &policy(), message);
+            let action = handle(&mut session, &directory, &security(), message);
             assert_eq!(codes(&action), vec![ResultCode::UnwillingToPerform]);
         }
     }
@@ -249,8 +245,7 @@ mod tests {
         handle(
             &mut session,
             &directory,
-            true,
-            &policy(),
+            &security(),
             bind_message(1, b"admin-secret"),
         );
 
@@ -268,7 +263,7 @@ mod tests {
             )),
         );
 
-        let action = handle(&mut session, &directory, true, &policy(), search);
+        let action = handle(&mut session, &directory, &security(), search);
 
         match action {
             Action::Reply(messages) => {
@@ -302,7 +297,7 @@ mod tests {
         );
 
         assert_eq!(
-            handle(&mut session, &directory, true, &policy(), response),
+            handle(&mut session, &directory, &security(), response),
             Action::Close
         );
     }

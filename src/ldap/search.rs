@@ -17,7 +17,8 @@ use super::paged::{self, PAGED_RESULTS_OID, Page};
 use super::responses::{self, search_done_with_controls, search_result_entry};
 use super::session::Session;
 use crate::directory::Directory;
-use crate::model::Attributes;
+use crate::model::{Attribute, Attributes};
+use crate::security::Security;
 
 /// Values of the root DSE that the server publishes.
 const ROOT_DSE_OBJECT_CLASS: [&str; 2] = ["top", "LDAProotDSE"];
@@ -32,7 +33,7 @@ pub fn handle_search(
     message_id: MessageId,
     request: &SearchRequest,
     controls: Option<&Controls>,
-    respect_critical: bool,
+    security: &Security,
 ) -> Vec<LdapMessage> {
     let base_object = request.base_object.0.to_string();
 
@@ -68,7 +69,7 @@ pub fn handle_search(
                     )];
                 }
             }
-        } else if control.criticality && respect_critical {
+        } else if control.criticality && security.respect_control_criticality {
             return vec![responses::search_done(
                 message_id,
                 ResultCode::UnavailableCriticalExtension,
@@ -80,10 +81,12 @@ pub fn handle_search(
         }
     }
 
-    // A regular user may only search their own entry, an anonymous session none.
-    if !session
-        .identity()
-        .is_some_and(|identity| identity.admin || identity.dn == crate::dn::normalize(&base_object))
+    // Access is decided by the rules, per entry and per attribute.
+    let requester = session.requester();
+    if !security
+        .acl
+        .rights(&requester, directory, &base_object, None)
+        .search
     {
         return vec![responses::search_done(
             message_id,
@@ -102,7 +105,11 @@ pub fn handle_search(
     let mut matched: Vec<(String, Attributes)> = Vec::new();
     for entry in directory.entries(&base_object, scope) {
         let entry_dn = directory.entry_dn(&entry);
-        if !session.may_access(&entry_dn) {
+        if !security
+            .acl
+            .rights(&requester, directory, &entry_dn, None)
+            .read
+        {
             continue;
         }
         match filter::matches(&entry.attributes(), &entry_dn, &request.filter) {
@@ -159,14 +166,20 @@ pub fn handle_search(
     let mut messages: Vec<LdapMessage> = matched[offset..page_end]
         .iter()
         .map(|(dn, attributes)| {
+            let visible: Vec<Attribute> = attributes
+                .select(dn, &selection)
+                .into_iter()
+                .filter(|attribute| {
+                    security
+                        .acl
+                        .rights(&requester, directory, dn, Some(attribute.name))
+                        .read
+                })
+                .collect();
             let selected = if request.types_only {
-                attributes
-                    .select(dn, &selection)
-                    .into_iter()
-                    .map(without_values)
-                    .collect::<Vec<_>>()
+                visible.into_iter().map(without_values).collect()
             } else {
-                attributes.select(dn, &selection)
+                visible
             };
             search_result_entry(message_id, dn, &selected)
         })
@@ -294,6 +307,7 @@ mod tests {
             cn: "admin".to_string(),
             uid: Some("admin".to_string()),
             mail: Some("admin@example.com".to_string()),
+            user_password: Some("{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=".to_string()),
             ..User::default()
         };
         let alice = User {
@@ -301,11 +315,13 @@ mod tests {
             cn: "alice".to_string(),
             uid: Some("alice".to_string()),
             mail: Some("alice@example.com".to_string()),
+            user_password: Some("{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=".to_string()),
             ..User::default()
         };
         let group = Group {
             object_class: vec!["top".to_string(), "posixGroup".to_string()],
             cn: "group_a".to_string(),
+            member_uid: vec!["alice".to_string()],
             ..Group::default()
         };
         Directory::new(BASE, "users", "groups", vec![admin, alice], vec![group])
@@ -356,12 +372,16 @@ mod tests {
         )
     }
 
+    fn security() -> Security {
+        Security::default()
+    }
+
     fn search(
         session: &Session,
         request: &SearchRequest,
         controls: Option<&Controls>,
     ) -> Vec<LdapMessage> {
-        handle_search(session, &directory(), 1, request, controls, true)
+        handle_search(session, &directory(), 1, request, controls, &security())
     }
 
     fn dns(messages: &[LdapMessage]) -> Vec<String> {
@@ -873,7 +893,14 @@ mod tests {
             None,
         )];
 
-        let messages = handle_search(&session, &directory(), 1, &request, Some(&controls), true);
+        let messages = handle_search(
+            &session,
+            &directory(),
+            1,
+            &request,
+            Some(&controls),
+            &security(),
+        );
 
         assert_eq!(
             result_code(&messages),
@@ -901,7 +928,18 @@ mod tests {
             None,
         )];
 
-        let messages = handle_search(&session, &directory(), 1, &request, Some(&controls), false);
+        let security = Security {
+            respect_control_criticality: false,
+            ..Security::default()
+        };
+        let messages = handle_search(
+            &session,
+            &directory(),
+            1,
+            &request,
+            Some(&controls),
+            &security,
+        );
 
         assert_eq!(result_code(&messages), ResultCode::Success);
         assert_eq!(dns(&messages).len(), 6);
@@ -923,7 +961,14 @@ mod tests {
             None,
         )];
 
-        let messages = handle_search(&session, &directory(), 1, &request, Some(&controls), true);
+        let messages = handle_search(
+            &session,
+            &directory(),
+            1,
+            &request,
+            Some(&controls),
+            &security(),
+        );
 
         assert_eq!(result_code(&messages), ResultCode::Success);
     }
@@ -943,6 +988,155 @@ mod tests {
 
         assert!(dns(&messages).is_empty());
         assert_eq!(result_code(&messages), ResultCode::Success);
+    }
+
+    #[test]
+    fn wildcard_never_returns_the_password_hash() {
+        let session = admin_session();
+        let request = request(
+            ALICE_DN,
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &["*"],
+        );
+
+        let names = attribute_names(&search(&session, &request, None));
+
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("userPassword")),
+            "wildcard leaked the password hash: {names:?}"
+        );
+    }
+
+    #[test]
+    fn admin_gets_the_password_hash_when_naming_it_explicitly() {
+        let session = admin_session();
+        let request = request(
+            ALICE_DN,
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &["userPassword"],
+        );
+
+        assert_eq!(
+            attribute_names(&search(&session, &request, None)),
+            vec!["userPassword"]
+        );
+    }
+
+    #[test]
+    fn owner_naming_the_password_gets_nothing_because_the_default_rules_deny_it() {
+        let session = user_session();
+        let request = request(
+            ALICE_DN,
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &["userPassword"],
+        );
+
+        let messages = search(&session, &request, None);
+
+        assert_eq!(
+            dns(&messages),
+            vec![ALICE_DN],
+            "the entry itself is readable"
+        );
+        let attributes = match &messages[0].protocol_op {
+            ProtocolOp::SearchResEntry(entry) => entry.attributes.len(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(attributes, 0, "but the password attribute is dropped");
+    }
+
+    #[test]
+    fn acl_rule_can_open_the_password_to_its_owner() {
+        use crate::acl::{Acl, Rights, Rule, Subject};
+
+        let security = Security {
+            acl: Acl::new(vec![
+                Rule {
+                    subject: Subject::SelfEntry,
+                    base: None,
+                    attributes: vec!["userPassword".to_string()],
+                    rights: Rights {
+                        read: true,
+                        ..Rights::none()
+                    },
+                },
+                Rule {
+                    subject: Subject::SelfEntry,
+                    base: None,
+                    attributes: vec!["*".to_string()],
+                    rights: Rights::self_service(),
+                },
+            ]),
+            ..Security::default()
+        };
+        let session = user_session();
+        let request = request(
+            ALICE_DN,
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &["userPassword"],
+        );
+
+        let messages = handle_search(&session, &directory(), 1, &request, None, &security);
+
+        assert_eq!(attribute_names(&messages), vec!["userPassword"]);
+    }
+
+    #[test]
+    fn group_rule_grants_read_on_another_entry() {
+        use crate::acl::{AccessRuleConfig, Acl, Rights, Rule, Subject};
+
+        let security = Security {
+            acl: Acl::new(vec![
+                // Attribute-scoped rules do not make an entry visible on their
+                // own: an entry-wide rule has to allow seeing it at all.
+                Rule {
+                    subject: Subject::Group("group_a".to_string()),
+                    base: None,
+                    attributes: vec![],
+                    rights: Rights {
+                        read: true,
+                        search: true,
+                        ..Rights::none()
+                    },
+                },
+                Rule {
+                    subject: Subject::SelfEntry,
+                    base: None,
+                    attributes: vec!["*".to_string()],
+                    rights: Rights {
+                        read: true,
+                        search: true,
+                        ..Rights::none()
+                    },
+                },
+            ]),
+            ..Security::default()
+        };
+        let session = user_session();
+        let request = request(
+            ADMIN_DN,
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &["mail", "cn"],
+        );
+
+        let messages = handle_search(&session, &directory(), 1, &request, None, &security);
+
+        assert_eq!(dns(&messages), vec![ADMIN_DN]);
+        assert_eq!(attribute_names(&messages), vec!["mail", "cn"]);
+        // Unused import guard: the config type is exercised in acl tests.
+        let _ = std::mem::size_of::<AccessRuleConfig>();
     }
 
     #[test]

@@ -199,12 +199,14 @@ mod tests {
                 values: vec!["admin".to_string()],
                 operational: false,
                 case_sensitive: false,
+                sensitive: false,
             },
             Attribute {
                 name: "memberOf",
                 values: vec!["group_a".to_string(), "group_b".to_string()],
                 operational: false,
                 case_sensitive: false,
+                sensitive: false,
             },
         ];
 

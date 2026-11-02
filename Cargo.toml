@@ -7,6 +7,8 @@ description = "LDAP server with REST API & file backends"
 license = "MIT"
 readme = "README.md"
 
+default-run = "rust-rest-ldap"
+
 [[bin]]
 name = "rust-rest-ldap"
 path = "src/main.rs"

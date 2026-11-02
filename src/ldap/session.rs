@@ -4,6 +4,7 @@
 //! client (`SetAddData`/`GetAddData`) and asserted the type on every read. Here
 //! the state is a plain struct owned by the connection task.
 
+use crate::acl::Requester;
 use crate::dn;
 
 /// Who the connection is bound as.
@@ -24,10 +25,11 @@ impl Identity {
     }
 }
 
-/// Connection state: the identity and, later, paged search progress.
+/// Connection state: the identity and whether the transport is encrypted.
 #[derive(Debug, Default)]
 pub struct Session {
     identity: Option<Identity>,
+    encrypted: bool,
 }
 
 impl Session {
@@ -37,6 +39,26 @@ impl Session {
 
     pub fn identity(&self) -> Option<&Identity> {
         self.identity.as_ref()
+    }
+
+    /// Records whether the transport is encrypted (LDAPS or after StartTLS).
+    pub fn set_encrypted(&mut self, encrypted: bool) {
+        self.encrypted = encrypted;
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    /// The session as an ACL subject.
+    pub fn requester(&self) -> Requester {
+        match &self.identity {
+            Some(identity) => Requester {
+                dn: Some(identity.dn.clone()),
+                admin: identity.admin,
+            },
+            None => Requester::anonymous(),
+        }
     }
 
     pub fn set_identity(&mut self, identity: Identity) {
@@ -108,6 +130,28 @@ mod tests {
         assert!(session.may_access(USER_DN));
         assert!(session.may_access("CN=Admin, ou=Users, DC=Example, DC=com"));
         assert!(!session.may_access("cn=alice,ou=users,dc=example,dc=com"));
+    }
+
+    #[test]
+    fn encryption_state_is_tracked_per_session() {
+        let mut session = Session::new();
+        assert!(!session.is_encrypted());
+
+        session.set_encrypted(true);
+
+        assert!(session.is_encrypted());
+    }
+
+    #[test]
+    fn requester_carries_the_bound_identity() {
+        let mut session = Session::new();
+        assert_eq!(session.requester(), Requester::anonymous());
+
+        session.set_identity(Identity::new(USER_DN, true));
+
+        let requester = session.requester();
+        assert_eq!(requester.dn.as_deref(), Some(USER_DN));
+        assert!(requester.admin);
     }
 
     #[test]

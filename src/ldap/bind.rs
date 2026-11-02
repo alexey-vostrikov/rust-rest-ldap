@@ -4,9 +4,11 @@ use rasn_ldap::{AuthenticationChoice, BindRequest, MessageId, ResultCode};
 
 use super::responses::bind_response;
 use super::session::{Identity, Session};
+use crate::acl::Requester;
 use crate::directory::{Directory, Entry};
 use crate::dn;
-use crate::password::{PasswordPolicy, verify};
+use crate::password::verify;
+use crate::security::Security;
 
 /// Handles a bind request and updates the session identity.
 ///
@@ -17,7 +19,7 @@ pub fn handle_bind(
     directory: &Directory,
     message_id: MessageId,
     request: &BindRequest,
-    passwords: &PasswordPolicy,
+    security: &Security,
 ) -> rasn_ldap::LdapMessage {
     session.reset();
 
@@ -57,6 +59,16 @@ pub fn handle_bind(
         );
     }
 
+    // A password sent in the clear is refused before the entry is looked up, so
+    // the answer does not reveal whether the account exists.
+    if !session.is_encrypted() && !security.allow_plaintext_simple_bind {
+        return bind_response(
+            message_id,
+            ResultCode::StrongerAuthRequired,
+            "simple bind requires transport encryption (LDAPS or StartTLS)",
+        );
+    }
+
     if !dn::is_valid(&bind_dn) {
         return bind_response(
             message_id,
@@ -87,7 +99,21 @@ pub fn handle_bind(
         }
     };
 
-    match verify(&password, stored_hash, passwords) {
+    let rights = security.acl.rights(
+        &Requester::new(&bind_dn, user.ldap_admin),
+        directory,
+        &bind_dn,
+        None,
+    );
+    if !rights.auth {
+        return bind_response(
+            message_id,
+            ResultCode::InsufficientAccessRights,
+            "access rules do not allow this entry to bind",
+        );
+    }
+
+    match verify(&password, stored_hash, &security.passwords) {
         Ok(true) => {
             session.set_identity(Identity::new(&bind_dn, user.ldap_admin));
             bind_response(message_id, ResultCode::Success, "")
@@ -107,8 +133,8 @@ mod tests {
     use crate::model::{Group, User};
     use crate::password::{StoreScheme, hash as hash_password};
 
-    fn policy() -> PasswordPolicy {
-        PasswordPolicy::strict()
+    fn security() -> Security {
+        Security::default()
     }
 
     fn hash(value: &str) -> String {
@@ -183,7 +209,7 @@ mod tests {
             &directory,
             1,
             &request(3, ADMIN_DN, b"admin-secret"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::Success);
@@ -203,7 +229,7 @@ mod tests {
             &directory,
             2,
             &request(3, ALICE_DN, b"alice-secret"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::Success);
@@ -222,7 +248,7 @@ mod tests {
             &directory,
             3,
             &request(3, ADMIN_DN, b"not-the-password"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::InvalidCredentials);
@@ -240,7 +266,7 @@ mod tests {
             &directory,
             4,
             &request(3, "cn=nobody,ou=users,dc=example,dc=com", b"x"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::NoSuchObject);
@@ -260,14 +286,14 @@ mod tests {
             &directory,
             5,
             &request(3, "cn=group_a,ou=groups,dc=example,dc=com", b"x"),
-            &policy(),
+            &security(),
         );
         let domain = handle_bind(
             &mut session,
             &directory,
             6,
             &request(3, BASE, b"x"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&group), ResultCode::NoSuchObject);
@@ -284,7 +310,7 @@ mod tests {
             &directory,
             7,
             &request(3, "mail=admin@example.com,dc=example,dc=com", b"x"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::InvalidDnSyntax);
@@ -303,7 +329,7 @@ mod tests {
             )),
         );
 
-        let response = handle_bind(&mut session, &directory, 8, &sasl, &policy());
+        let response = handle_bind(&mut session, &directory, 8, &sasl, &security());
 
         assert_eq!(code(&response), ResultCode::AuthMethodNotSupported);
         assert!(diagnostic(&response).contains("GSSAPI"));
@@ -319,7 +345,7 @@ mod tests {
             &directory,
             9,
             &request(2, ADMIN_DN, b"admin-secret"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::ProtocolError);
@@ -339,7 +365,7 @@ mod tests {
             &directory,
             10,
             &request(3, "", b""),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::Success);
@@ -356,7 +382,7 @@ mod tests {
             &directory,
             11,
             &request(3, "", b"secret"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::UnwillingToPerform);
@@ -376,7 +402,7 @@ mod tests {
             &directory,
             12,
             &request(3, "cn=nopassword,ou=users,dc=example,dc=com", b"x"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::InvalidCredentials);
@@ -392,7 +418,7 @@ mod tests {
             &directory,
             13,
             &request(3, ADMIN_DN, b"admin-secret"),
-            &policy(),
+            &security(),
         );
         assert!(session.identity().is_some());
 
@@ -401,7 +427,7 @@ mod tests {
             &directory,
             14,
             &request(3, ADMIN_DN, b"wrong"),
-            &policy(),
+            &security(),
         );
 
         assert!(session.identity().is_none());
@@ -417,13 +443,114 @@ mod tests {
             &directory,
             15,
             &request(3, "uid=alice,ou=users,dc=example,dc=com", b"alice-secret"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::Success);
         assert_eq!(
             session.identity().expect("identity").dn,
             "uid=alice,ou=users,dc=example,dc=com"
+        );
+    }
+
+    #[test]
+    fn plaintext_simple_bind_is_refused_when_configured() {
+        let directory = directory();
+        let mut session = Session::new();
+        let security = Security {
+            allow_plaintext_simple_bind: false,
+            ..Security::default()
+        };
+
+        let response = handle_bind(
+            &mut session,
+            &directory,
+            20,
+            &request(3, ADMIN_DN, b"admin-secret"),
+            &security,
+        );
+
+        assert_eq!(code(&response), ResultCode::StrongerAuthRequired);
+        assert_eq!(
+            diagnostic(&response),
+            "simple bind requires transport encryption (LDAPS or StartTLS)"
+        );
+        assert!(session.identity().is_none());
+    }
+
+    #[test]
+    fn encrypted_simple_bind_is_allowed_when_plaintext_is_refused() {
+        let directory = directory();
+        let mut session = Session::new();
+        session.set_encrypted(true);
+        let security = Security {
+            allow_plaintext_simple_bind: false,
+            ..Security::default()
+        };
+
+        let response = handle_bind(
+            &mut session,
+            &directory,
+            21,
+            &request(3, ADMIN_DN, b"admin-secret"),
+            &security,
+        );
+
+        assert_eq!(code(&response), ResultCode::Success);
+        assert!(session.identity().is_some());
+    }
+
+    #[test]
+    fn anonymous_bind_over_plaintext_is_still_allowed() {
+        let directory = directory();
+        let mut session = Session::new();
+        let security = Security {
+            allow_plaintext_simple_bind: false,
+            ..Security::default()
+        };
+
+        let response = handle_bind(
+            &mut session,
+            &directory,
+            22,
+            &request(3, "", b""),
+            &security,
+        );
+
+        assert_eq!(code(&response), ResultCode::Success);
+    }
+
+    #[test]
+    fn access_rules_can_refuse_bind_on_an_entry() {
+        use crate::acl::{Acl, Rights, Rule, Subject};
+
+        let directory = directory();
+        let mut session = Session::new();
+        let security = Security {
+            acl: Acl::new(vec![Rule {
+                subject: Subject::Users,
+                base: None,
+                attributes: vec![],
+                rights: Rights {
+                    read: true,
+                    ..Rights::none()
+                },
+            }]),
+            ..Security::default()
+        };
+
+        let response = handle_bind(
+            &mut session,
+            &directory,
+            23,
+            &request(3, ADMIN_DN, b"admin-secret"),
+            &security,
+        );
+
+        assert_eq!(code(&response), ResultCode::InsufficientAccessRights);
+        assert_eq!(
+            diagnostic(&response),
+            "access rules do not allow this entry to bind"
         );
     }
 
@@ -437,7 +564,7 @@ mod tests {
             &directory,
             16,
             &request(3, "CN=Admin, OU=Users, DC=Example, DC=Com", b"admin-secret"),
-            &policy(),
+            &security(),
         );
 
         assert_eq!(code(&response), ResultCode::Success);

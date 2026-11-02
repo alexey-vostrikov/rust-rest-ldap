@@ -166,6 +166,30 @@ impl Directory {
             .collect()
     }
 
+    /// True when the entry `user_dn` is a member of the group with `cn`.
+    ///
+    /// Groups hold `memberUid`, which carries the user's `uid` (gorestldap
+    /// semantics) or, in older data, the `cn`; both are accepted.
+    pub fn is_member(&self, group_cn: &str, user_dn: &str) -> bool {
+        let Some(Entry::User(user)) = self.find(user_dn) else {
+            return false;
+        };
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.cn.eq_ignore_ascii_case(group_cn));
+        let Some(group) = group else {
+            return false;
+        };
+
+        let uid = user.uid.as_deref().unwrap_or(&user.cn).to_lowercase();
+        let cn = user.cn.to_lowercase();
+        group.member_uid.iter().any(|member| {
+            let member = member.to_lowercase();
+            member == uid || member == cn
+        })
+    }
+
     /// Finds the entry addressed by `entry` (already normalized or not).
     ///
     /// Users can be addressed by `cn` or `uid`, groups by `cn`, organizational
