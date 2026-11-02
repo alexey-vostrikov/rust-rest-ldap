@@ -306,8 +306,9 @@ mod tests {
             &users,
             serde_json::json!([{
                 "ldapAdmin": true,
-                "objectClass": ["top", "inetOrgPerson"],
+                "objectClass": ["top", "person", "inetOrgPerson"],
                 "cn": "admin",
+                "sn": "Admin",
                 "uid": "admin",
                 "userPassword": password,
             }])
@@ -316,7 +317,7 @@ mod tests {
         .expect("users");
         std::fs::write(
             &groups,
-            r#"[{"objectClass":["top","posixGroup"],"cn":"group_a"}]"#,
+            r#"[{"objectClass":["top","posixGroup"],"cn":"group_a","gidNumber":2000}]"#,
         )
         .expect("groups");
         let backend_config = serde_json::json!({
@@ -350,6 +351,8 @@ mod tests {
             http_listen_addr: None,
             callback_auth_token: None,
             passwords: Default::default(),
+            schema: crate::schema::Schema::core(),
+            schema_mode: crate::schema::Mode::Strict,
             acl: Default::default(),
             allow_plaintext_simple_bind: true,
         }

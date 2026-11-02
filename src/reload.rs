@@ -12,6 +12,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 use crate::backend::{Backend, BackendError};
 use crate::config::Config;
 use crate::directory::Directory;
+use crate::schema::{Mode as SchemaMode, Schema};
 
 /// Holds the current directory snapshot and knows how to rebuild it.
 pub struct Source {
@@ -21,6 +22,8 @@ pub struct Source {
     groups_ou_name: String,
     current: RwLock<Arc<Directory>>,
     generation: RwLock<u64>,
+    schema: Schema,
+    schema_mode: SchemaMode,
 }
 
 impl Source {
@@ -38,6 +41,8 @@ impl Source {
             &config.groups_ou_name,
         ));
 
+        check_schema(&directory, &config.schema, config.schema_mode)?;
+
         let source = Arc::new(Self {
             backend: Arc::new(backend),
             base_dn: config.base_dn.clone(),
@@ -45,6 +50,8 @@ impl Source {
             groups_ou_name: config.groups_ou_name.clone(),
             current: RwLock::new(Arc::clone(&directory)),
             generation: RwLock::new(0),
+            schema: config.schema.clone(),
+            schema_mode: config.schema_mode,
         });
 
         Ok((source, directory))
@@ -72,10 +79,58 @@ impl Source {
             .entries(&self.base_dn, crate::directory::Scope::Subtree)
             .len();
 
+        check_schema(&directory, &self.schema, self.schema_mode)?;
+
         *self.current.write().await = Arc::new(directory);
         *self.generation.write().await += 1;
 
         Ok(entries)
+    }
+}
+
+/// Validates every entry according to the configured mode.
+///
+/// `strict` refuses the load, so a directory that does not match its schema never
+/// comes up looking healthy; `warn` reports and proceeds, which is what a migration
+/// from foreign data needs; `off` skips checking and keeps the schema published.
+fn check_schema(
+    directory: &Directory,
+    schema: &crate::schema::Schema,
+    mode: SchemaMode,
+) -> Result<(), BackendError> {
+    if mode == SchemaMode::Off {
+        return Ok(());
+    }
+
+    let mut problems = Vec::new();
+    for entry in directory.all() {
+        if let Err(violations) = schema.check(entry) {
+            for violation in violations {
+                problems.push(format!(
+                    "{}: {:?}: {}",
+                    entry.dn(),
+                    violation.code,
+                    violation.detail
+                ));
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+
+    match mode {
+        SchemaMode::Warn => {
+            for problem in &problems {
+                eprintln!("schema warning: {problem}");
+            }
+            Ok(())
+        }
+        _ => Err(BackendError::SchemaViolations {
+            count: problems.len(),
+            first: problems.into_iter().take(10).collect(),
+        }),
     }
 }
 
@@ -136,6 +191,8 @@ mod tests {
             http_listen_addr: None,
             callback_auth_token: None,
             passwords: Default::default(),
+            schema: crate::schema::Schema::core(),
+            schema_mode: crate::schema::Mode::Strict,
             acl: Default::default(),
             allow_plaintext_simple_bind: true,
         };

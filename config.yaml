@@ -19,6 +19,15 @@ backends:
     path: ./build/directory.redb
     durability: immediate   # immediate (default) or none for bulk loads
 
+# Schema checking. strict refuses data that does not match the schema (the server
+# then fails at startup with the first violations listed); warn reports and proceeds,
+# which is what migrating foreign data needs; off skips checking and keeps the schema
+# published. Extra definitions are read after the built-in core, in RFC 4512 syntax.
+schema:
+  mode: strict
+  #files:
+  #  - /etc/rust-rest-ldap/local.schema
+
 respect_control_criticality: true
 
 # Password hashes: weak schemes are refused unless listed one by one here.
