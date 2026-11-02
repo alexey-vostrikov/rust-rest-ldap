@@ -251,8 +251,6 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Group, User};
-    use crate::password::{StoreScheme, hash as hash_password};
     use rasn_ldap::{
         AuthenticationChoice, BindRequest, LdapDn, LdapMessage, ProtocolOp, ResultCode,
         UnbindRequest,
