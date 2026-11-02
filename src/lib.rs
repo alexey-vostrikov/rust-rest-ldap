@@ -4,6 +4,7 @@
 //! a backend (file or REST) on an interval or on demand, and answers LDAP
 //! requests (bind, search, compare, modify) over BER.
 
+pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod directory;
