@@ -84,6 +84,34 @@ impl Source {
         self.reload().await
     }
 
+    /// Rebuilds the indexes over the snapshot already in memory.
+    ///
+    /// What this cannot do, and does not claim to: repair a stale index. Every write and
+    /// every reload rebuilds the index from the store, so the index is never older than the
+    /// data it describes. What it is for is the two questions an operator actually asks -
+    /// how long a rebuild takes at the current size, and how much memory the configured set
+    /// holds - and for applying a change of heart about which attributes deserve one without
+    /// re-reading the store.
+    pub async fn reindex(&self) -> Result<Reindexed, BackendError> {
+        let current = self.directory().await;
+
+        let started = std::time::Instant::now();
+        let rebuilt = (*current).clone().with_indexes(&self.indexes)?;
+        let elapsed = started.elapsed();
+
+        let index = rebuilt.index();
+        let reindexed = Reindexed {
+            entries: rebuilt.all().len(),
+            attributes: index.built_attributes().count(),
+            bytes: index.size_bytes(),
+            elapsed,
+        };
+
+        *self.current.write().await = Arc::new(rebuilt);
+
+        Ok(reindexed)
+    }
+
     /// Reloads from the backend and swaps the snapshot.
     ///
     /// On error the previous snapshot stays in place: a backend hiccup must not
@@ -104,6 +132,18 @@ impl Source {
 
         Ok(entries)
     }
+}
+
+/// What a rebuild of the indexes did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reindexed {
+    /// Entries the indexes were built over.
+    pub entries: usize,
+    /// Attributes that ended up with at least one index.
+    pub attributes: usize,
+    /// Memory the bitmaps hold, as the index reports it.
+    pub bytes: usize,
+    pub elapsed: std::time::Duration,
 }
 
 /// Validates every entry according to the configured mode.
@@ -321,6 +361,70 @@ mod tests {
         );
         assert_eq!(source.directory().await.users().len(), 1);
         assert_eq!(source.generation().await, 0);
+    }
+
+    #[tokio::test]
+    async fn reindex_rebuilds_over_the_snapshot_without_reloading_the_store() {
+        // The distinction matters: `reload` re-reads the backend and bumps the generation,
+        // `reindex` touches only what is already in memory.
+        let dir = tempdir().expect("tempdir");
+        let users = write(
+            dir.path(),
+            "users.json",
+            r#"[{"cn":"admin","objectClass":["top","inetOrgPerson"],"sn":"Admin","mail":"root@example.com"}]"#,
+        );
+        let groups = write(dir.path(), "groups.json", "[]");
+        let mut config = config(
+            users.to_str().expect("path"),
+            groups.to_str().expect("path"),
+        );
+        config.indexes = crate::index::IndexConfig {
+            default: vec!["pres".to_string()],
+            attributes: Default::default(),
+        };
+
+        let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");
+        let (source, _) = Source::load(&config, backend).await.expect("load");
+
+        let before = source.generation().await;
+        let done = source.reindex().await.expect("reindex");
+
+        assert_eq!(done.entries, source.directory().await.all().len());
+        assert_eq!(
+            source.generation().await,
+            before,
+            "a rebuild of the index is not a reload of the data"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_reports_the_memory_the_index_holds() {
+        let dir = tempdir().expect("tempdir");
+        let users = write(
+            dir.path(),
+            "users.json",
+            r#"[{"cn":"admin","objectClass":["top","inetOrgPerson"],"sn":"Admin","mail":"root@example.com"}]"#,
+        );
+        let groups = write(dir.path(), "groups.json", "[]");
+        let mut config = config(
+            users.to_str().expect("path"),
+            groups.to_str().expect("path"),
+        );
+        config.indexes = crate::index::IndexConfig {
+            default: vec!["pres".to_string()],
+            attributes: Default::default(),
+        };
+
+        let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");
+        let (source, _) = Source::load(&config, backend).await.expect("load");
+
+        let done = source.reindex().await.expect("reindex");
+
+        assert!(done.attributes > 0, "the fixture configures an index");
+        assert!(
+            done.bytes > 0,
+            "an index that occupies no memory is not an index: {done:?}"
+        );
     }
 
     #[tokio::test]

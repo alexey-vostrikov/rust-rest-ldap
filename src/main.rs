@@ -15,6 +15,8 @@ async fn main() {
     let import_ldif = args.import_ldif.clone();
     let allow_existing_entry = args.allow_existing_entry;
     let check_config = args.check_config;
+    let check_index = args.check_index;
+    let reindex = args.reindex;
 
     // The language has to be known before the configuration parses, so that a typo in a
     // Russian config is reported in Russian: the environment answers first, and the raw
@@ -43,6 +45,115 @@ async fn main() {
         Ok(backend) => backend,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
     };
+    // Verifying the indexes is an offline read: it builds nothing the server would not have
+    // built and writes nothing. The exit code is the answer.
+    if check_index {
+        let data = match backend.load().await {
+            Ok(data) => data,
+            Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
+        };
+        let directory = data.into_directory(
+            &config.base_dn,
+            &config.users_ou_name,
+            &config.groups_ou_name,
+        );
+        let directory = match directory.with_indexes(&config.indexes) {
+            Ok(directory) => directory,
+            Err(err) => fatal(&i18n::t("error.index", &[("detail", &err.to_string())])),
+        };
+
+        let report = rust_rest_ldap::index_check::check(directory.all(), directory.index());
+
+        for mismatch in report.missing.iter().chain(report.wrong.iter()) {
+            eprintln!(
+                "{}",
+                i18n::t(
+                    "check.index_mismatch",
+                    &[
+                        ("query", &mismatch.query),
+                        ("lost", &mismatch.lost.join(", ")),
+                        ("extra", &mismatch.extra.join(", ")),
+                    ],
+                )
+            );
+        }
+
+        for item in &report.loose {
+            eprintln!(
+                "{}",
+                i18n::t(
+                    "check.index_loose",
+                    &[
+                        ("attribute", &item.attribute),
+                        ("extra", &item.extra.to_string()),
+                    ],
+                )
+            );
+        }
+
+        // The summary says which of the two things happened rather than reporting counts
+        // under a heading that calls a broken index sound.
+        let key = if report.is_sound() {
+            "check.index_sound"
+        } else {
+            "check.index_broken"
+        };
+
+        println!(
+            "{}",
+            i18n::t(
+                key,
+                &[
+                    ("checked", &report.checked.to_string()),
+                    ("skipped", &report.not_indexed.to_string()),
+                    ("missing", &report.missing.len().to_string()),
+                    ("wrong", &report.wrong.len().to_string()),
+                ],
+            )
+        );
+
+        if !report.is_sound() {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if reindex {
+        let data = match backend.load().await {
+            Ok(data) => data,
+            Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
+        };
+        let directory = data.into_directory(
+            &config.base_dn,
+            &config.users_ou_name,
+            &config.groups_ou_name,
+        );
+
+        let started = std::time::Instant::now();
+        let directory = match directory.with_indexes(&config.indexes) {
+            Ok(directory) => directory,
+            Err(err) => fatal(&i18n::t("error.index", &[("detail", &err.to_string())])),
+        };
+        let elapsed = started.elapsed();
+
+        println!(
+            "{}",
+            i18n::t(
+                "check.reindex_done",
+                &[
+                    ("entries", &directory.all().len().to_string()),
+                    (
+                        "attributes",
+                        &directory.index().built_attributes().count().to_string()
+                    ),
+                    ("bytes", &directory.index().size_bytes().to_string()),
+                    ("millis", &elapsed.as_millis().to_string()),
+                ],
+            )
+        );
+        return;
+    }
+
     // A check-only run reports whether this configuration would start, the way `slaptest`
     // does, and never binds a port. The backend open above already proved the store is
     // readable; what is left is the data itself.

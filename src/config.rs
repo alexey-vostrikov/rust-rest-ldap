@@ -46,6 +46,10 @@ pub struct Args {
     pub allow_existing_entry: bool,
     /// Present when the run only checks that the configuration would start.
     pub check_config: bool,
+    /// Present when the run verifies the indexes against the data.
+    pub check_index: bool,
+    /// Present when the run rebuilds the indexes and reports the cost.
+    pub reindex: bool,
     pub backend: Option<String>,
     pub base_dn: Option<String>,
     pub listen_addr: Option<String>,

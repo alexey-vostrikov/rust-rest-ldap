@@ -22,6 +22,7 @@ pub mod http;
 pub mod i18n;
 pub mod import;
 pub mod index;
+pub mod index_check;
 pub mod integrity;
 pub mod ldap;
 pub mod ldif;

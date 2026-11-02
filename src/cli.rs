@@ -82,6 +82,23 @@ pub struct Cli {
     #[arg(long = "allow-existing-entry", requires = "import_ldif")]
     pub allow_existing_entry: bool,
 
+    /// Verify the search indexes against the data and exit
+    ///
+    /// Compares what each index answers with what a scan finds. A false negative - an entry
+    /// the index would leave out - is the failure this exists to catch: the search comes
+    /// back short and nothing about a short answer says it was wrong. The exit code is 1
+    /// when the index would lose an entry.
+    #[arg(long = "check-index", conflicts_with_all = ["listen", "import_ldif"])]
+    pub check_index: bool,
+
+    /// Rebuild the indexes and report what it cost, then exit
+    ///
+    /// Entries, attributes, bytes and milliseconds. The measurement is the point: it is what
+    /// decides whether an attribute deserves a trigram index at the size this directory
+    /// actually is.
+    #[arg(long = "reindex", conflicts_with_all = ["listen", "import_ldif"])]
+    pub reindex: bool,
+
     /// Check the configuration, the schema, the data files and the store, then exit
     ///
     /// What `slaptest` does: says whether this configuration would start, without binding a
@@ -106,6 +123,8 @@ impl From<Cli> for config::Args {
             import_ldif: cli.import_ldif,
             allow_existing_entry: cli.allow_existing_entry,
             check_config: cli.check_config,
+            check_index: cli.check_index,
+            reindex: cli.reindex,
         }
     }
 }
