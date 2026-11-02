@@ -3,6 +3,7 @@
 pub mod bind;
 pub mod codec;
 pub mod filter;
+pub mod modify;
 pub mod paged;
 pub mod responses;
 pub mod search;
@@ -11,6 +12,7 @@ pub mod starttls;
 
 use rasn_ldap::{LdapMessage, ProtocolOp, ResultCode};
 
+use crate::backend::EntryChange;
 use crate::directory::Directory;
 use crate::security::Security;
 use session::Session;
@@ -24,8 +26,44 @@ pub enum Action {
     Silent,
     /// Answer with a success response, then switch the connection to TLS.
     StartTls(rasn_ldap::MessageId),
+    /// Persist these changes, then send `success`; on a backend error send `failure`.
+    ///
+    /// The reply is only sent after the write, so a client never sees `success` for a
+    /// change that did not reach the store.
+    Persist {
+        changes: Vec<EntryChange>,
+        success: LdapMessage,
+        message_id: rasn_ldap::MessageId,
+        /// Which response carries the failure; the diagnostic has to include the
+        /// backend's error text, which is only known when the write failed.
+        failure: FailureResponse,
+    },
     /// Close the connection (unbind, protocol violation).
     Close,
+}
+
+/// Response to send when a write does not reach the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureResponse {
+    Modify,
+    Add,
+    Del,
+}
+
+impl FailureResponse {
+    /// Builds the failure message of the right shape.
+    pub fn message(
+        &self,
+        message_id: rasn_ldap::MessageId,
+        code: ResultCode,
+        diagnostic: &str,
+    ) -> LdapMessage {
+        match self {
+            FailureResponse::Modify => responses::modify_response(message_id, code, diagnostic),
+            FailureResponse::Add => responses::add_response(message_id, code, diagnostic),
+            FailureResponse::Del => responses::del_response(message_id, code, diagnostic),
+        }
+    }
 }
 
 /// Dispatches one message.
@@ -64,11 +102,17 @@ pub fn handle(
             ResultCode::UnwillingToPerform,
             "compare is not implemented yet",
         )]),
-        ProtocolOp::ModifyRequest(_) => Action::Reply(vec![responses::modify_response(
-            message_id,
-            ResultCode::UnwillingToPerform,
-            "modify is not implemented yet",
-        )]),
+        ProtocolOp::ModifyRequest(request) => {
+            match modify::handle_modify(session, directory, message_id, &request, security) {
+                modify::Outcome::Reject(message) => Action::Reply(vec![message]),
+                modify::Outcome::Persist { entry, success } => Action::Persist {
+                    changes: vec![EntryChange::Upsert { entry }],
+                    success,
+                    message_id,
+                    failure: FailureResponse::Modify,
+                },
+            }
+        }
         ProtocolOp::AddRequest(_) => Action::Reply(vec![responses::add_response(
             message_id,
             ResultCode::UnwillingToPerform,

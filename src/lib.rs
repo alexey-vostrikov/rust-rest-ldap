@@ -20,6 +20,7 @@ pub mod index;
 pub mod ldap;
 pub mod mapping;
 pub mod model;
+pub mod mutate;
 pub mod password;
 pub mod reload;
 pub mod schema;

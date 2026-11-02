@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use rasn::types::OctetString;
 use rasn_ldap::{
-    AttributeDescription, AttributeValueAssertion, Filter, LdapMessage, ProtocolOp, SearchRequest,
+    AttributeDescription, AttributeValueAssertion, Filter, ProtocolOp, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
 use rust_rest_ldap::directory::Directory;
@@ -34,10 +34,7 @@ fn entries(count: usize) -> Vec<Entry> {
             .push(Attribute::single("sn", &format!("Surname{index:05}")))
             .push(Attribute::single("uid", &name))
             .push(Attribute::single("mail", &format!("{name}@example.com")));
-        entries.push(Entry::new(
-            format!("cn={name},ou=users,{BASE}"),
-            attributes,
-        ));
+        entries.push(Entry::new(format!("cn={name},ou=users,{BASE}"), attributes));
     }
     entries
 }
@@ -74,10 +71,7 @@ fn count(directory: &Directory, filter: Filter) -> usize {
         vec![rasn_ldap::LdapString::from("dn")],
     );
     let mut session = Session::new();
-    session.set_identity(Identity::new(
-        "cn=admin,ou=users,dc=example,dc=com",
-        true,
-    ));
+    session.set_identity(Identity::new("cn=admin,ou=users,dc=example,dc=com", true));
 
     handle_search(&session, directory, 1, &request, None, &Security::default())
         .iter()
@@ -113,9 +107,11 @@ fn the_index_pays_for_itself_on_a_large_directory() {
         "entries: {ENTRIES}, index build: {build_time:?}, index size: {} KiB",
         indexed.index().size_bytes() / 1024
     );
-    println!("filter (cn=user{:05}): scan {plain_time:?}, indexed {indexed_time:?}, x{:.0}",
+    println!(
+        "filter (cn=user{:05}): scan {plain_time:?}, indexed {indexed_time:?}, x{:.0}",
         ENTRIES - 1,
-        plain_time.as_secs_f64() / indexed_time.as_secs_f64().max(f64::EPSILON));
+        plain_time.as_secs_f64() / indexed_time.as_secs_f64().max(f64::EPSILON)
+    );
 
     assert_eq!(plain_matches, 1);
     assert_eq!(indexed_matches, 1);

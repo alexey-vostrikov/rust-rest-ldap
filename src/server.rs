@@ -14,7 +14,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use crate::directory::Directory;
 use crate::ldap::session::Session;
 use crate::ldap::{Action, codec};
 use crate::reload::Source;
@@ -100,7 +99,7 @@ impl Stream {
 pub async fn serve_connection(
     mut stream: Stream,
     acceptor: Option<TlsAcceptor>,
-    directory: Arc<Directory>,
+    source: Arc<Source>,
     security: Arc<Security>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Hangup, codec::CodecError> {
@@ -140,10 +139,35 @@ pub async fn serve_connection(
             Err(_) => return Ok(Hangup::Malformed),
         };
 
+        // One snapshot per message: a reload or another client's write is visible
+        // immediately, while a single operation still sees one consistent directory.
+        let directory = source.directory().await;
+
         match crate::ldap::handle(&mut session, &directory, &security, message) {
             Action::Reply(messages) => {
                 for message in messages {
                     codec::write_message(&mut stream, &message).await?;
+                }
+            }
+            Action::Persist {
+                changes,
+                success,
+                message_id,
+                failure,
+            } => {
+                // The reply follows the write, so `success` is never sent for a change
+                // that did not reach the store.
+                match source.apply(&changes).await {
+                    Ok(_) => codec::write_message(&mut stream, &success).await?,
+                    Err(err) => {
+                        eprintln!("write failed: {err}");
+                        let response = failure.message(
+                            message_id,
+                            rasn_ldap::ResultCode::UnwillingToPerform,
+                            &format!("error updating backend data: {err}"),
+                        );
+                        codec::write_message(&mut stream, &response).await?;
+                    }
                 }
             }
             Action::Silent => {}
@@ -247,10 +271,9 @@ pub async fn serve(
                         _ => Stream::Plain(tcp),
                     };
 
-                    // A fresh snapshot per connection: a reload mid-session swaps the
-                    // Arc and the running session keeps the version it started with.
-                    let directory = source.directory().await;
-                    match serve_connection(stream, acceptor, directory, security, stop).await {
+                    match serve_connection(stream, acceptor, Arc::clone(&source), security, stop)
+                        .await
+                    {
                         Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) | Ok(Hangup::Shutdown) => {}
                         Ok(Hangup::Malformed) => {
                             eprintln!("client {peer} sent a malformed message, connection closed");

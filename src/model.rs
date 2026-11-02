@@ -154,6 +154,36 @@ impl Attributes {
             .find(|attribute| attribute.is_visible() && attribute.name.eq_ignore_ascii_case(name))
     }
 
+    /// Puts `attribute` in place of the one with the same description, keeping its
+    /// position; appends when the entry does not have it yet.
+    ///
+    /// Works on the raw list, internal attributes included: this is the server's own
+    /// mutation path, not a client-visible view.
+    #[must_use]
+    pub fn replace(mut self, attribute: Attribute) -> Self {
+        if attribute.values.is_empty() {
+            return self.without(&attribute.name);
+        }
+
+        match self
+            .inner
+            .iter()
+            .position(|existing| existing.name.eq_ignore_ascii_case(&attribute.name))
+        {
+            Some(position) => self.inner[position] = attribute,
+            None => self.inner.push(attribute),
+        }
+        self
+    }
+
+    /// Removes every attribute with this description.
+    #[must_use]
+    pub fn without(mut self, name: &str) -> Self {
+        self.inner
+            .retain(|attribute| !attribute.name.eq_ignore_ascii_case(name));
+        self
+    }
+
     /// Lookup that also sees internal attributes; for the server's own code.
     pub fn internal(&self, name: &str) -> Option<&Attribute> {
         self.inner
