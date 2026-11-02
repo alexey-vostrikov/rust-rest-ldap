@@ -1,0 +1,135 @@
+# A production configuration, as a starting point rather than a default.
+#
+# Copy to /etc/rust-rest-ldap/config.yaml, then:
+#   install -m 0640 -o root -g rust-rest-ldap config.example.yaml \
+#           /etc/rust-rest-ldap/config.yaml
+#
+# Every setting below that is commented out is a choice you make, not a gap you fill later.
+
+# The naming context. Everything the server serves lives under it.
+base_dn: dc=example,dc=com
+users_ou_name: users
+groups_ou_name: groups
+
+# TLS on the LDAP port. Both files are PEM: the certificate chain, and the private key in
+# PKCS#8 (`openssl genpkey`) or PKCS#1 (`openssl rsa`).
+#
+# With TLS on, the listener speaks LDAPS from the first byte; StartTLS works on top of a
+# plaintext connection as well, so older clients have a path. A configuration with
+# `use_tls: true` and no certificate is a startup error, not a silent fallback to plaintext.
+use_tls: true
+server_cert: /etc/rust-rest-ldap/server.crt
+server_key: /etc/rust-rest-ldap/server.key
+listen_addr: 0.0.0.0:636
+
+# Entries, and never a JSON file: the store is one transaction, so a change set covering a
+# user and the group that lists it cannot be applied halfway.
+backend: redb
+backends:
+  redb:
+    path: /var/lib/rust-rest-ldap/directory.redb
+    # `immediate` flushes on every transaction. `eventual` is faster and loses the last
+    # acknowledged writes if the machine dies; a directory is not the place for that.
+    durability: immediate
+
+# The first administrator, created on startup if, and only if, the store is empty.
+#
+# Remove this section once you have bound as that administrator at least once. Left in
+# place it does nothing and says so in the log, but a password on disk that nothing reads
+# is a password that goes stale in a drawer.
+bootstrap:
+  dn: cn=admin,ou=users,dc=example,dc=com
+  password_env: RUST_REST_LDAP_ADMIN_PASSWORD
+
+# Passwords. Argon2id by default; `pbkdf2-sha512` for clients whose tooling needs it.
+passwords:
+  store_scheme: argon2id
+  # A hash written by an older server is upgraded on the next successful bind, which is
+  # the only moment the password is known. Turn off only if something else writes the hashes.
+  upgrade_on_bind: true
+
+# Schema checking. `strict` refuses a write that breaks the definitions, `warn` logs and
+# accepts it, `off` skips the check. Strict is the default because a directory that accepts
+# anything is a directory whose data nobody can query.
+schema:
+  mode: strict
+  #files:
+  #  - /etc/rust-rest-ldap/local.schema
+
+# Uniqueness and referential integrity: one `uid`, one `cn` per unit, and no group listing
+# a user that does not exist.
+integrity:
+  unique: [cn, uid]
+  allow_duplicates: false
+  referential_integrity: true
+
+# Indexes. Without them a filter scans every entry; with them the server narrows the
+# candidates first. `pres` answers (attribute=*), `eq` answers (attribute=value); both are
+# supersets, and the filter still runs on every candidate. Per-attribute kinds replace
+# `default` for that attribute.
+indexes:
+  default: [pres]
+  attributes:
+    objectClass: [eq, pres]
+    uid: [eq]
+    cn: [eq, pres]
+    sn: [eq]
+    mail: [eq]
+    memberUid: [eq]
+
+# Access control. Rules are checked in order and the first match decides; without a match
+# the request is refused, so the list has to end with an allow for the people who need it.
+#
+# `subject` is one of `admin`, `users`, `anonymous`, `self`, `dn=<distinguished name>` or
+# `group=<group name>`. `attributes` narrows a rule to some attributes; `base` to a subtree.
+access:
+  - subject: admin
+    attributes: ["*"]
+    rights: [read, search, compare, write, auth]
+  - subject: users
+    attributes: ["*"]
+    rights: [read, search, compare]
+  # A user may change their own password and nothing else.
+  - subject: self
+    attributes: [userPassword]
+    rights: [write]
+  # Anonymous readers. `attributes` has to be `*` or absent for this rule to cover the
+  # search itself: a subtree search asks about the entry as a whole (no attribute in
+  # particular), and a rule that names four attributes does not answer that question, so
+  # the search is refused and the client sees "no such object". Passwords are not exposed
+  # by `*`: they are marked sensitive and only an administrator is served them.
+  - subject: anonymous
+    attributes: ["*"]
+    rights: [read, search]
+
+# Reload: the file backends are re-read on this interval, on SIGUSR1, and on
+# `HEAD /callback` with the token below. With the redb backend there is nothing to re-read,
+# but the interval still drives the entry cache refresh.
+update_interval: 300s
+
+# The callback listener. Its token is a bearer secret; the listener speaks plain HTTP, so
+# putting it on anything but a loopback or a service network needs AllowPlainHttpRest.
+#http_listen_addr: 127.0.0.1:8080
+#callback_auth_token: <long random string>
+
+# The change journal: one JSON line per write with the DN, the actor, the client and the
+# result. A deleted entry takes its own modifiersName with it, so "who deleted this" is
+# answerable only if it was written down when it happened.
+observability:
+  journal: /var/lib/rust-rest-ldap/changes.jsonl
+  journal_stdout: false
+
+# Operator diagnostics in Russian; the text on the wire stays English.
+#locale: ru
+
+# Dangerous settings. Each one is a sentence rather than a boolean, so a configuration
+# copied from a hardening guide cannot switch it on by accident. Listed here only so that
+# the names are known - none of them is on.
+#
+#AllowDangerousSettings: "Yes I know this is bad idea"
+#bind:
+#  AllowUnencryptedBind: "Yes I know this is bad idea"
+#AllowPlainHttpRest: "Yes I know this is bad idea"
+#passwords:
+#  AllowWeakHashes: "Yes I know this is bad idea"
+#  AllowedWeakHashes: ssha, crypt-md5
