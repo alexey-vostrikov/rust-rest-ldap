@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rust_rest_ldap::backend::Backend;
-use rust_rest_ldap::directory::Directory;
 use rust_rest_ldap::{cli, config, security::Security};
 
 #[tokio::main]
@@ -23,18 +22,10 @@ async fn main() {
         Ok(backend) => backend,
         Err(err) => fatal(&err.to_string()),
     };
-    let data = match backend.load().await {
-        Ok(data) => data,
+    let (source, directory) = match rust_rest_ldap::reload::Source::load(&config, backend).await {
+        Ok(loaded) => loaded,
         Err(err) => fatal(&err.to_string()),
     };
-
-    let directory = Directory::new(
-        &config.base_dn,
-        &config.users_ou_name,
-        &config.groups_ou_name,
-        data.users,
-        data.groups,
-    );
     let security = Security::from_config(&config);
 
     println!(
@@ -85,11 +76,42 @@ async fn main() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    let reloading = tokio::spawn(rust_rest_ldap::reload::reload_on_interval(
+        Arc::clone(&source),
+        config.update_interval,
+        shutdown_rx.clone(),
+    ));
+
+    // SIGUSR1 is the "reload now" switch gorestldap documented for systemd.
+    spawn_usr1_reloader(Arc::clone(&source));
+
+    let http_task = match &config.http_listen_addr {
+        Some(addr) => {
+            let state = Arc::new(rust_rest_ldap::http::HttpState {
+                source: Arc::clone(&source),
+                callback_token: config.callback_auth_token.clone(),
+            });
+            let router = rust_rest_ldap::http::router(state);
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    println!("http: listening on {addr}");
+                    Some(tokio::spawn(async move {
+                        if let Err(err) = axum::serve(listener, router).await {
+                            eprintln!("http server error: {err}");
+                        }
+                    }))
+                }
+                Err(err) => fatal(&format!("error listening on '{addr}': {err}")),
+            }
+        }
+        None => None,
+    };
+
     let serving = tokio::spawn(rust_rest_ldap::server::serve(
         listener,
         acceptor,
         config.use_tls,
-        Arc::new(directory),
+        Arc::clone(&source),
         Arc::new(security),
         shutdown_rx,
     ));
@@ -101,6 +123,38 @@ async fn main() {
         Ok(Ok(())) => {}
         Ok(Err(err)) => eprintln!("server error: {err}"),
         Err(err) => eprintln!("server task failed: {err}"),
+    }
+    reloading.abort();
+    if let Some(task) = http_task {
+        task.abort();
+    }
+}
+
+fn spawn_usr1_reloader(source: Arc<rust_rest_ldap::reload::Source>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut usr1 = match signal(SignalKind::user_defined1()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                eprintln!("cannot install SIGUSR1 handler: {err}");
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            while usr1.recv().await.is_some() {
+                match source.reload().await {
+                    Ok(entries) => {
+                        println!("reload (SIGUSR1): {entries} entries");
+                    }
+                    Err(err) => eprintln!("reload failed, keeping the current directory: {err}"),
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
     }
 }
 
