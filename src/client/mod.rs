@@ -236,6 +236,46 @@ impl Client {
         self.exchange(op, expected).await
     }
 
+    /// The same, with controls attached to the request.
+    ///
+    /// Controls are per request, not per connection: a paged search and an ordinary one can
+    /// share a connection, and the page size of one must not touch the other.
+    pub async fn request_with(
+        &self,
+        op: ProtocolOp,
+        controls: Vec<rasn_ldap::Control>,
+        expected: &'static str,
+    ) -> Result<Vec<LdapMessage>, Error> {
+        let id = self.inner.bookkeeping.lock().await.next_id();
+
+        let mut message = LdapMessage::new(id, op);
+        if !controls.is_empty() {
+            message.controls = Some(controls.into_iter().collect());
+        }
+
+        let bytes = codec::encode(&message)?;
+        self.send(&bytes).await?;
+        self.collect(id, expected).await
+    }
+
+    /// A search with controls, which is how a paged or sorted search is asked for.
+    pub async fn search_with(
+        &self,
+        request: rasn_ldap::SearchRequest,
+        controls: Vec<rasn_ldap::Control>,
+    ) -> Result<(Vec<LdapMessage>, Outcome), Error> {
+        let responses = self
+            .request_with(
+                ProtocolOp::SearchRequest(request),
+                controls,
+                "search result done",
+            )
+            .await?;
+
+        let result = result_of(&responses, "search result done")?;
+        Ok((responses, result))
+    }
+
     /// Upgrades the connection with StartTLS (RFC 4511 §4.14).
     pub async fn starttls(&self) -> Result<(), Error> {
         let request = ExtendedRequest {
@@ -312,19 +352,19 @@ impl Client {
     ) -> Result<Vec<LdapMessage>, Error> {
         let id = self.inner.bookkeeping.lock().await.next_id();
         let bytes = codec::encode(&LdapMessage::new(id, op))?;
-
-        {
-            let mut writer = self.inner.writer.lock().await;
-            let half = writer.as_mut().ok_or(Error::Closed)?;
-            half.write_all(&bytes)
-                .await
-                .map_err(|err| Error::Io(err.to_string()))?;
-            half.flush()
-                .await
-                .map_err(|err| Error::Io(err.to_string()))?;
-        }
-
+        self.send(&bytes).await?;
         self.collect(id, expected).await
+    }
+
+    /// Writes one framed message.
+    async fn send(&self, bytes: &[u8]) -> Result<(), Error> {
+        let mut writer = self.inner.writer.lock().await;
+        let half = writer.as_mut().ok_or(Error::Closed)?;
+
+        half.write_all(bytes)
+            .await
+            .map_err(|err| Error::Io(err.to_string()))?;
+        half.flush().await.map_err(|err| Error::Io(err.to_string()))
     }
 
     /// Reads messages until the one that finishes the answer to `id`.
@@ -529,6 +569,50 @@ fn result_of(messages: &[LdapMessage], expected: &'static str) -> Result<Outcome
 /// The last message of an answer, which is the one being judged.
 fn answer_last(answer: &[LdapMessage]) -> &LdapMessage {
     answer.last().expect("an answer that was just pushed to")
+}
+
+/// The entry a search result message carries.
+///
+/// The protocol hands back a list of attribute descriptions and octet strings; everything
+/// above this layer wants an `Entry`. Converting here keeps the utilities from each writing
+/// their own version of the same six lines.
+pub fn entry_of(message: &LdapMessage) -> Option<crate::model::Entry> {
+    let ProtocolOp::SearchResEntry(entry) = &message.protocol_op else {
+        return None;
+    };
+
+    let mut attributes = crate::model::Attributes::new();
+
+    for attribute in entry.attributes.iter() {
+        let values: Vec<String> = attribute
+            .vals
+            .iter()
+            .map(|value| String::from_utf8_lossy(value.as_ref()).to_string())
+            .collect();
+
+        if values.is_empty() {
+            continue;
+        }
+
+        attributes = attributes.push(crate::model::Attribute::new(
+            attribute.r#type.as_str(),
+            values,
+        ));
+    }
+
+    Some(crate::model::Entry::new(
+        entry.object_name.as_str(),
+        attributes,
+    ))
+}
+
+/// The controls an answer carried, if any.
+pub fn controls_of(message: &LdapMessage) -> Vec<rasn_ldap::Control> {
+    message
+        .controls
+        .as_ref()
+        .map(|controls| controls.to_vec())
+        .unwrap_or_default()
 }
 
 /// Whether this message is a part of an answer rather than the end of it.

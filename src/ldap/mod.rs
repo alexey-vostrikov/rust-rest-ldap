@@ -6,6 +6,7 @@ pub mod codec;
 pub mod compare;
 pub mod extop;
 pub mod filter;
+pub mod filter_parse;
 pub mod modify;
 pub mod paged;
 pub mod responses;

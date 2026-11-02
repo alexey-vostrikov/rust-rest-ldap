@@ -148,6 +148,21 @@ pub fn handle_search(
         )];
     }
 
+    // A base that does not exist is `noSuchObject`, not an empty success (RFC 4511
+    // §4.5.1.1: "if the object does not exist, the server returns noSuchObject"). An empty
+    // result and a wrong base look identical to a script, and the second is a typo the
+    // operator needs to hear about.
+    //
+    // The naming context itself, the units and every entry are all in `directory`; only a
+    // base outside the tree is missing from it.
+    if directory.find(&base_object).is_none() {
+        return vec![responses::search_done(
+            message_id,
+            ResultCode::NoSuchObject,
+            &format!("no such object: {base_object}"),
+        )];
+    }
+
     let scope = scope_of(request);
     let selection: Vec<String> = request
         .attributes
@@ -1129,7 +1144,11 @@ mod tests {
     }
 
     #[test]
-    fn search_on_unknown_base_returns_nothing() {
+    fn search_on_unknown_base_is_no_such_object() {
+        // Not an empty success: RFC 4511 §4.5.1.1 requires `noSuchObject` when the base does
+        // not exist, and an empty result is indistinguishable from a wrong base to every
+        // script that reads it. This test used to assert `Success`, which is what the server
+        // did before `ldapsearch` against a real directory with a typo showed an empty answer.
         let session = admin_session();
         let request = request(
             "dc=nowhere,dc=com",
@@ -1142,7 +1161,37 @@ mod tests {
         let messages = search(&session, &request, None);
 
         assert!(dns(&messages).is_empty());
-        assert_eq!(result_code(&messages), ResultCode::Success);
+        assert_eq!(result_code(&messages), ResultCode::NoSuchObject);
+    }
+
+    #[test]
+    fn every_base_that_exists_still_answers() {
+        // The check must not turn a legitimate base into a refusal: the naming context, both
+        // units and an ordinary entry all exist and all answer.
+        let session = admin_session();
+
+        for base in [
+            BASE,
+            "ou=users,dc=example,dc=com",
+            "ou=groups,dc=example,dc=com",
+            ALICE_DN,
+        ] {
+            let request = request(
+                base,
+                SearchRequestScope::BaseObject,
+                present("objectClass"),
+                0,
+                &[],
+            );
+            let messages = search(&session, &request, None);
+
+            assert_eq!(
+                result_code(&messages),
+                ResultCode::Success,
+                "base {base} must answer"
+            );
+            assert_eq!(dns(&messages), vec![base.to_string()]);
+        }
     }
 
     #[test]
