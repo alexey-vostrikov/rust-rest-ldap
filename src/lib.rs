@@ -9,5 +9,6 @@ pub mod cli;
 pub mod config;
 pub mod directory;
 pub mod dn;
+pub mod ldap;
 pub mod model;
 pub mod ssha;
