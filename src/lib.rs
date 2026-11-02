@@ -21,6 +21,7 @@ pub mod ldap;
 pub mod mapping;
 pub mod model;
 pub mod mutate;
+pub mod operational;
 pub mod password;
 pub mod reload;
 pub mod schema;
