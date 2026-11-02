@@ -31,6 +31,8 @@ pub enum Hangup {
     Malformed,
     /// The client asked for StartTLS and the handshake did not complete.
     TlsHandshakeFailed,
+    /// The server is stopping: the connection was closed between operations.
+    Shutdown,
 }
 
 /// A connection stream: plain, or encrypted after a StartTLS upgrade.
@@ -100,12 +102,25 @@ pub async fn serve_connection(
     acceptor: Option<TlsAcceptor>,
     directory: Arc<Directory>,
     security: Arc<Security>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Hangup, codec::CodecError> {
     let mut session = Session::new();
     session.set_encrypted(stream.is_encrypted());
 
     loop {
-        let bytes = match codec::read_message(&mut stream).await {
+        // The stop signal is only watched while waiting for the NEXT message: an
+        // operation already being answered is finished before the connection is
+        // closed, which is what "graceful" has to mean for a client mid-search.
+        let bytes = match tokio::select! {
+            read = codec::read_message(&mut stream) => read,
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+                    return Ok(Hangup::Shutdown);
+                }
+                continue;
+            }
+        } {
             Ok(bytes) => bytes,
             Err(codec::CodecError::Frame(codec::FrameError::Truncated)) => {
                 return Ok(Hangup::PeerClosed);
@@ -194,7 +209,13 @@ pub async fn serve(
     source: Arc<Source>,
     security: Arc<Security>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    grace: std::time::Duration,
 ) -> Result<(), std::io::Error> {
+    // Every connection task holds one clone of this sender; the receiver reports
+    // "all gone" once the last one finishes, which is the condition to wait for
+    // after the listener closes.
+    let (finished_tx, mut finished_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -212,6 +233,8 @@ pub async fn serve(
                 let source = Arc::clone(&source);
                 let security = Arc::clone(&security);
                 let acceptor = acceptor.clone();
+                let stop = shutdown.clone();
+                let finished = finished_tx.clone();
                 tokio::spawn(async move {
                     let stream = match (&acceptor, ldaps) {
                         (Some(acceptor), true) => match acceptor.accept(tcp).await {
@@ -227,8 +250,8 @@ pub async fn serve(
                     // A fresh snapshot per connection: a reload mid-session swaps the
                     // Arc and the running session keeps the version it started with.
                     let directory = source.directory().await;
-                    match serve_connection(stream, acceptor, directory, security).await {
-                        Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) => {}
+                    match serve_connection(stream, acceptor, directory, security, stop).await {
+                        Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) | Ok(Hangup::Shutdown) => {}
                         Ok(Hangup::Malformed) => {
                             eprintln!("client {peer} sent a malformed message, connection closed");
                         }
@@ -237,15 +260,27 @@ pub async fn serve(
                         }
                         Err(err) => eprintln!("client {peer}: {err}"),
                     }
+                    drop(finished);
                 });
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    return Ok(());
+                    break;
                 }
             }
         }
     }
+
+    // The listener no longer accepts. Open connections are told to finish their
+    // current operation and close; waiting is bounded so a stuck client cannot
+    // hold the process.
+    drop(finished_tx);
+    let drained = async { while finished_rx.recv().await.is_some() {} };
+    if tokio::time::timeout(grace, drained).await.is_err() {
+        eprintln!("graceful shutdown timed out after {grace:?}, closing remaining connections");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -354,7 +389,8 @@ mod tests {
     struct Running {
         client: Option<TcpStream>,
         addr: std::net::SocketAddr,
-        task: tokio::task::JoinHandle<()>,
+        task: Option<tokio::task::JoinHandle<()>>,
+        shutdown: tokio::sync::watch::Sender<bool>,
     }
 
     impl Running {
@@ -368,25 +404,50 @@ mod tests {
         }
     }
 
+    impl Running {
+        /// Waits for the listener task to return, giving up after a timeout.
+        async fn join(&mut self) -> bool {
+            let Some(task) = self.task.take() else {
+                return true;
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .map(|joined| joined.is_ok())
+                .unwrap_or(false)
+        }
+    }
+
     impl Drop for Running {
         fn drop(&mut self) {
-            self.task.abort();
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
         }
     }
 
     async fn start(acceptor: Option<TlsAcceptor>, ldaps: bool, security: Arc<Security>) -> Running {
+        start_with_grace(acceptor, ldaps, security, std::time::Duration::from_secs(5)).await
+    }
+
+    async fn start_with_grace(
+        acceptor: Option<TlsAcceptor>,
+        ldaps: bool,
+        security: Arc<Security>,
+        grace: std::time::Duration,
+    ) -> Running {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let (shutdown, rx) = tokio::sync::watch::channel(false);
         let source = test_source().await;
         let task = tokio::spawn(async move {
-            let _ = serve(listener, acceptor, ldaps, source, security, rx).await;
+            let _ = serve(listener, acceptor, ldaps, source, security, rx, grace).await;
         });
         let client = TcpStream::connect(addr).await.expect("connect");
         Running {
             client: Some(client),
             addr,
-            task,
+            task: Some(task),
+            shutdown,
         }
     }
 
@@ -604,6 +665,75 @@ mod tests {
         assert_eq!(
             result_code(&read(running.client()).await),
             ResultCode::StrongerAuthRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_an_idle_connection_between_operations() {
+        let mut running = start(None, false, default_security()).await;
+        write(running.client(), &bind_message(1, b"admin-secret")).await;
+        let _ = read(running.client()).await;
+
+        running.shutdown.send(true).expect("shutdown");
+
+        // The connection is closed cleanly: a read returns EOF, not a reset.
+        let mut buffer = [0u8; 16];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(running.client(), &mut buffer),
+        )
+        .await
+        .expect("connection closes without hanging")
+        .expect("read does not fail");
+        assert_eq!(read, 0, "server must half-close the stream");
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_accepting_new_connections() {
+        let mut running = start(None, false, default_security()).await;
+        let addr = running.addr;
+        running.shutdown.send(true).expect("shutdown");
+
+        // The task ends; the listener socket is closed with it.
+        assert!(
+            running.join().await,
+            "serve must return after the stop signal"
+        );
+
+        let result = TcpStream::connect(addr).await;
+        if let Ok(mut stream) = result {
+            // Accepting may have raced with the close; either the connection is
+            // refused or it is closed immediately without an answer.
+            let mut buffer = [0u8; 16];
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::io::AsyncReadExt::read(&mut stream, &mut buffer),
+            )
+            .await
+            .expect("closed connection must not hang");
+            assert!(
+                matches!(read, Ok(0) | Err(_)),
+                "unexpected read result: {read:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_connection_to_finish_and_times_out_when_it_does_not() {
+        let mut running = start_with_grace(
+            None,
+            false,
+            default_security(),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        // The client stays connected and does nothing: the grace period expires.
+        running.shutdown.send(true).expect("shutdown");
+
+        assert!(
+            running.join().await,
+            "serve must return once the grace period expires"
         );
     }
 
