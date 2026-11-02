@@ -2,6 +2,7 @@
 
 use crate::acl::Acl;
 use crate::config::Config;
+use crate::integrity::IntegrityConfig;
 use crate::password::PasswordPolicy;
 use crate::schema::{Mode as SchemaMode, Schema};
 
@@ -23,6 +24,8 @@ pub struct Security {
     pub ldaps: bool,
     /// A certificate and key are configured, so StartTLS can be offered.
     pub starttls: bool,
+    /// Uniqueness and referential integrity of account attributes.
+    pub integrity: IntegrityConfig,
     /// The published schema: writes are checked against it in `strict` mode.
     pub schema: Schema,
     /// How strictly the schema is enforced on writes.
@@ -40,6 +43,7 @@ impl Default for Security {
             allow_unencrypted_bind: false,
             ldaps: false,
             starttls: false,
+            integrity: IntegrityConfig::default(),
             schema: Schema::core(),
             schema_mode: SchemaMode::Strict,
         }
@@ -57,6 +61,7 @@ impl Security {
             // Both, because the same certificate serves LDAPS and StartTLS and
             // config load already refuses use_tls without material.
             starttls: config.server_cert.is_some() && config.server_key.is_some(),
+            integrity: config.integrity.clone(),
             schema: config.schema.clone(),
             schema_mode: config.schema_mode,
         }

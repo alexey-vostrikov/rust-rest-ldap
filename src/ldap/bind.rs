@@ -197,7 +197,13 @@ fn authenticate(
                     Err(err) => {
                         // A hash the server cannot compute is a configuration problem,
                         // not a reason to refuse a bind that already succeeded.
-                        eprintln!("password upgrade failed for '{bind_dn}': {err}");
+                        eprintln!(
+                            "{}",
+                            crate::i18n::t(
+                                "error.password_upgrade",
+                                &[("dn", &bind_dn), ("detail", &err.to_string())]
+                            )
+                        );
                     }
                 }
             }

@@ -160,7 +160,10 @@ pub async fn serve_connection(
                 match source.apply(&changes).await {
                     Ok(_) => codec::write_message(&mut stream, &success).await?,
                     Err(err) => {
-                        eprintln!("write failed: {err}");
+                        eprintln!(
+                            "{}",
+                            crate::i18n::t("error.write", &[("detail", &err.to_string())])
+                        );
                         let response = failure.message(
                             message_id,
                             rasn_ldap::ResultCode::UnwillingToPerform,
@@ -177,7 +180,10 @@ pub async fn serve_connection(
                 // The reply is already out and it is correct; a failure here is an
                 // operational problem to log, not an error to report to this client.
                 if let Err(err) = source.apply(&changes).await {
-                    eprintln!("could not persist the password hash upgrade: {err}");
+                    eprintln!(
+                        "{}",
+                        crate::i18n::t("error.hash_upgrade", &[("detail", &err.to_string())])
+                    );
                 }
             }
             Action::Silent => {}
@@ -258,7 +264,10 @@ pub async fn serve(
                     Err(err) => {
                         // A failed accept (reset while accepting, out of file
                         // descriptors) must not kill the listener.
-                        eprintln!("error accepting connection: {err}");
+                        eprintln!(
+                        "{}",
+                        crate::i18n::t("error.accept", &[("detail", &err.to_string())])
+                    );
                         continue;
                     }
                 };
@@ -274,7 +283,13 @@ pub async fn serve(
                         (Some(acceptor), true) => match acceptor.accept(tcp).await {
                             Ok(tls) => Stream::Tls(Box::new(tls)),
                             Err(err) => {
-                                eprintln!("client {peer}: TLS handshake failed: {err}");
+                                eprintln!(
+                                    "{}",
+                                    crate::i18n::t(
+                                        "error.tls_handshake",
+                                        &[("peer", &peer.to_string()), ("detail", &err.to_string())]
+                                    )
+                                );
                                 return;
                             }
                         },
@@ -286,12 +301,27 @@ pub async fn serve(
                     {
                         Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) | Ok(Hangup::Shutdown) => {}
                         Ok(Hangup::Malformed) => {
-                            eprintln!("client {peer} sent a malformed message, connection closed");
+                            eprintln!(
+                                "{}",
+                                crate::i18n::t("error.malformed", &[("peer", &peer.to_string())])
+                            );
                         }
                         Ok(Hangup::TlsHandshakeFailed) => {
-                            eprintln!("client {peer}: StartTLS handshake failed");
+                            eprintln!(
+                                "{}",
+                                crate::i18n::t(
+                                    "error.starttls_handshake",
+                                    &[("peer", &peer.to_string())]
+                                )
+                            );
                         }
-                        Err(err) => eprintln!("client {peer}: {err}"),
+                        Err(err) => eprintln!(
+                            "{}",
+                            crate::i18n::t(
+                                "error.client",
+                                &[("peer", &peer.to_string()), ("detail", &err.to_string())]
+                            )
+                        ),
                     }
                     drop(finished);
                 });
@@ -310,7 +340,13 @@ pub async fn serve(
     drop(finished_tx);
     let drained = async { while finished_rx.recv().await.is_some() {} };
     if tokio::time::timeout(grace, drained).await.is_err() {
-        eprintln!("graceful shutdown timed out after {grace:?}, closing remaining connections");
+        eprintln!(
+            "{}",
+            crate::i18n::t(
+                "error.shutdown_timeout",
+                &[("grace", &format!("{grace:?}"))]
+            )
+        );
     }
 
     Ok(())
@@ -390,6 +426,9 @@ mod tests {
             acl: Default::default(),
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),
+            integrity: crate::integrity::IntegrityConfig::default(),
+            locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),
+            locale_file: None,
         }
     }
 

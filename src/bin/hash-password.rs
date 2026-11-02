@@ -31,7 +31,10 @@ fn main() {
             match std::io::stdin().read_line(&mut buffer) {
                 Ok(_) => buffer.trim_end_matches(['\n', '\r']).to_string(),
                 Err(err) => {
-                    eprintln!("error reading password from stdin: {err}");
+                    eprintln!(
+                        "{}",
+                        rust_rest_ldap::i18n::t("error.write", &[("detail", &err.to_string())])
+                    );
                     std::process::exit(1);
                 }
             }
