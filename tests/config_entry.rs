@@ -47,6 +47,87 @@ fn security(document: Option<&str>) -> Security {
     }
 }
 
+/// A configuration store with `text` as its only generation, and a `Security` carrying it.
+fn stored(text: &str) -> (tempfile::TempDir, Security) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.d");
+    let store = rust_rest_ldap::config_store::Store::open(&path);
+    store.commit(text, "test", "initial").expect("commit");
+
+    let document = Document::new(text, format!("store:{}", path.display())).with_store(Some(path));
+
+    (
+        dir,
+        Security {
+            config_document: Some(document),
+            ..Security::default()
+        },
+    )
+}
+
+/// The document the store holds now.
+fn in_store(security: &Security) -> String {
+    let document = security.config_document.as_ref().expect("document");
+    let store = rust_rest_ldap::config_store::Store::open(
+        document.store.clone().expect("the store the test created"),
+    );
+    store.read_current().expect("read").expect("generation")
+}
+
+fn history(security: &Security) -> usize {
+    let document = security.config_document.as_ref().expect("document");
+    rust_rest_ldap::config_store::Store::open(document.store.clone().expect("store"))
+        .history()
+        .expect("history")
+        .len()
+}
+
+fn modify(dn: &str, attribute: &str, values: &[&str]) -> ModifyRequest {
+    ModifyRequest {
+        object: LdapDn::from(dn),
+        changes: vec![ModifyRequestChanges {
+            operation: ChangeOperation::Replace,
+            modification: PartialAttribute::new(
+                AttributeDescription::from(attribute),
+                rasn::types::SetOf::from_vec(
+                    values
+                        .iter()
+                        .map(|value| OctetString::from(value.as_bytes().to_vec()))
+                        .collect(),
+                ),
+            ),
+        }],
+    }
+}
+
+/// The result code and diagnostic of a write aimed at `cn=config`.
+fn write(
+    session: &mut Session,
+    request: ModifyRequest,
+    security: &Security,
+) -> (ResultCode, String) {
+    let directory = directory();
+    let action = handle(
+        session,
+        &directory,
+        security,
+        LdapMessage::new(9, ProtocolOp::ModifyRequest(request)),
+    );
+
+    let messages = match action {
+        Action::Reply(messages) => messages,
+        other => panic!("unexpected action: {other:?}"),
+    };
+
+    match &messages[0].protocol_op {
+        ProtocolOp::ModifyResponse(response) => (
+            response.0.result_code,
+            response.0.diagnostic_message.0.to_string(),
+        ),
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
 fn admin() -> Session {
     let mut session = Session::new();
     session.set_identity(Identity::new(ADMIN_DN, true));
@@ -324,30 +405,21 @@ fn a_server_started_from_flags_alone_says_it_has_no_document() {
 }
 
 #[test]
-fn a_write_to_the_subtree_is_refused_with_a_reason() {
-    // Otherwise the request reaches the directory, finds nothing and answers `noSuchObject`,
-    // which reads as "your DN is wrong" - and an operator then hunts for a typo that is not
-    // there.
+fn a_write_without_a_store_is_refused_and_the_reason_says_what_to_do() {
+    // The document came from a file, so there is no generation to commit as. Refused rather
+    // than editing a file the operator owns - and the refusal names the way to make it work.
     let security = security(Some(DOCUMENT));
     let directory = directory();
     let mut session = admin();
-
-    let modify = ModifyRequest {
-        object: LdapDn::from("cn=config"),
-        changes: vec![ModifyRequestChanges {
-            operation: ChangeOperation::Replace,
-            modification: PartialAttribute::new(
-                AttributeDescription::from("restldap-backend"),
-                rasn::types::SetOf::from_vec(vec![OctetString::from(b"file".to_vec())]),
-            ),
-        }],
-    };
 
     let action = handle(
         &mut session,
         &directory,
         &security,
-        LdapMessage::new(3, ProtocolOp::ModifyRequest(modify)),
+        LdapMessage::new(
+            3,
+            ProtocolOp::ModifyRequest(modify("cn=config", "restldap-backend", &["file"])),
+        ),
     );
 
     let messages = match action {
@@ -364,7 +436,7 @@ fn a_write_to_the_subtree_is_refused_with_a_reason() {
                     .0
                     .diagnostic_message
                     .0
-                    .contains("cn=config is read-only"),
+                    .contains("pointing at a configuration store directory"),
                 "{}",
                 response.0.diagnostic_message.0
             );
@@ -422,5 +494,196 @@ fn an_ordinary_search_of_the_naming_context_is_untouched() {
         !dns(&answer).iter().any(|dn| dn.contains("cn=config")),
         "{:?}",
         dns(&answer)
+    );
+}
+
+#[test]
+fn an_administrator_changes_a_setting_and_it_becomes_a_generation() {
+    let (_dir, security) = stored(DOCUMENT);
+    assert_eq!(history(&security), 1);
+
+    let (code, diagnostic) = write(
+        &mut admin(),
+        modify("cn=config", "restldap-backend", &["file"]),
+        &security,
+    );
+
+    assert_eq!(code, ResultCode::Success, "{diagnostic}");
+    assert!(
+        diagnostic.contains("committed as generation 2"),
+        "the answer names the generation: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("until it is restarted"),
+        "and says the running server is unchanged: {diagnostic}"
+    );
+
+    assert_eq!(history(&security), 2);
+    let text = in_store(&security);
+    assert!(text.contains("backend: file"), "{text}");
+
+    // The committed document is a configuration: it loads, and with the new value.
+    let reloaded = rust_rest_ldap::config::resolve(
+        rust_rest_ldap::config::Args::default(),
+        Some(&text),
+        |_| None,
+    )
+    .expect("the committed document must load");
+    assert_eq!(reloaded.backend, "file");
+}
+
+#[test]
+fn the_committed_document_is_what_a_client_reads_back() {
+    // The property that makes the write believable: read after write, over the protocol.
+    let (_dir, security) = stored(DOCUMENT);
+
+    write(
+        &mut admin(),
+        modify("cn=config", "restldap-listen-addr", &["0.0.0.0:389"]),
+        &security,
+    );
+
+    // The subtree a client reads is generated from the document the server started with, so
+    // until the restart the answer is the old value - and the answer says so, which is why the
+    // generation number is in the diagnostic. What is checked here is the store, not the
+    // running snapshot.
+    assert!(in_store(&security).contains("listen_addr: 0.0.0.0:389"));
+}
+
+#[test]
+fn two_changes_through_the_protocol_build_on_each_other() {
+    let (_dir, security) = stored(DOCUMENT);
+
+    write(
+        &mut admin(),
+        modify("cn=config", "restldap-backend", &["file"]),
+        &security,
+    );
+    let (code, diagnostic) = write(
+        &mut admin(),
+        modify(
+            "cn=backends,cn=config",
+            "restldap-listen-addr",
+            &["0.0.0.0:389"],
+        ),
+        &security,
+    );
+
+    assert_eq!(
+        code,
+        ResultCode::NoSuchAttribute,
+        "the base holds that key: {diagnostic}"
+    );
+    assert!(diagnostic.contains("restldap-listen-addr"), "{diagnostic}");
+
+    let (code, diagnostic) = write(
+        &mut admin(),
+        modify("cn=config", "restldap-listen-addr", &["0.0.0.0:389"]),
+        &security,
+    );
+    assert_eq!(code, ResultCode::Success, "{diagnostic}");
+
+    let text = in_store(&security);
+    assert!(
+        text.contains("backend: file") && text.contains("listen_addr: 0.0.0.0:389"),
+        "both changes are in one document: {text}"
+    );
+    assert_eq!(history(&security), 3, "two changes, two generations");
+}
+
+#[test]
+fn nobody_without_the_admin_flag_writes_it() {
+    let (_dir, security) = stored(DOCUMENT);
+
+    let (code, diagnostic) = write(
+        &mut user(),
+        modify("cn=config", "restldap-backend", &["file"]),
+        &security,
+    );
+
+    assert_eq!(code, ResultCode::InsufficientAccessRights);
+    assert!(
+        diagnostic.contains("only an administrator changes it"),
+        "{diagnostic}"
+    );
+    assert_eq!(history(&security), 1, "nothing was committed");
+}
+
+#[test]
+fn a_file_backed_configuration_refuses_the_change_and_says_what_to_do() {
+    let security = security(Some(DOCUMENT));
+
+    let (code, diagnostic) = write(
+        &mut admin(),
+        modify("cn=config", "restldap-backend", &["file"]),
+        &security,
+    );
+
+    assert_eq!(code, ResultCode::UnwillingToPerform);
+    assert!(
+        diagnostic.contains("pointing at a configuration store directory"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn adding_and_deleting_a_section_says_it_is_not_supported_yet() {
+    // Refused rather than guessed: the document key a new entry would be called is not
+    // recoverable from the attribute name.
+    let (_dir, security) = stored(DOCUMENT);
+
+    let add = rasn_ldap::AddRequest {
+        entry: LdapDn::from("cn=3,cn=access,cn=config"),
+        attributes: Vec::new(),
+    };
+    let action = handle(
+        &mut admin(),
+        &directory(),
+        &security,
+        LdapMessage::new(10, ProtocolOp::AddRequest(add)),
+    );
+
+    let messages = match action {
+        Action::Reply(messages) => messages,
+        other => panic!("unexpected action: {other:?}"),
+    };
+    match &messages[0].protocol_op {
+        ProtocolOp::AddResponse(response) => {
+            assert_eq!(response.0.result_code, ResultCode::UnwillingToPerform);
+            assert!(
+                response
+                    .0
+                    .diagnostic_message
+                    .0
+                    .contains("not supported yet"),
+                "{}",
+                response.0.diagnostic_message.0
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    assert_eq!(history(&security), 1, "nothing was committed");
+}
+
+#[test]
+fn the_generation_a_change_creates_names_who_made_it_and_what_changed() {
+    let (_dir, security) = stored(DOCUMENT);
+    write(
+        &mut admin(),
+        modify("cn=config", "restldap-backend", &["file"]),
+        &security,
+    );
+
+    let document = security.config_document.as_ref().expect("document");
+    let store = rust_rest_ldap::config_store::Store::open(document.store.clone().expect("store"));
+    let history = store.history().expect("history");
+    let last = history.last().expect("a generation");
+
+    assert_eq!(last.author, ADMIN_DN);
+    assert!(
+        last.note.contains("backend"),
+        "the note names the key: {}",
+        last.note
     );
 }

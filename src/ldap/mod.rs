@@ -98,6 +98,54 @@ pub struct PersistAction {
     pub journal: Option<crate::metrics::Note>,
 }
 
+/// Handles a write aimed at `cn=config`.
+///
+/// Only `modify` changes a document: adding and deleting a section would have to decide what
+/// the new document key is called, and the attribute name cannot say (see the rules in
+/// [`config_entry::change`]). Those operations are refused with the reason, not with a guess.
+fn config_change(
+    session: &Session,
+    security: &Security,
+    message_id: rasn_ldap::MessageId,
+    response: FailureResponse,
+    op: &ProtocolOp,
+) -> Action {
+    let Some(document) = security.config_document.as_ref() else {
+        return Action::Reply(vec![response.message(
+            message_id,
+            ResultCode::UnwillingToPerform,
+            "this server was configured by flags and defaults alone, so it has no document to \
+             change",
+        )]);
+    };
+
+    let ProtocolOp::ModifyRequest(request) = op else {
+        return Action::Reply(vec![response.message(
+            message_id,
+            ResultCode::UnwillingToPerform,
+            "adding and deleting entries in cn=config is not supported yet: change a value with \
+             modify, and add or remove a section by editing the document",
+        )]);
+    };
+
+    match config_entry::change(document, session, request) {
+        Ok(committed) => Action::Reply(vec![response.message(
+            message_id,
+            ResultCode::Success,
+            &format!(
+                "committed as generation {}; the running server keeps the settings it started \
+                 with until it is restarted",
+                committed.generation
+            ),
+        )]),
+        Err(refusal) => Action::Reply(vec![response.message(
+            message_id,
+            refusal.code,
+            &refusal.detail,
+        )]),
+    }
+}
+
 /// The entry a write operation addresses, and the response shape it expects.
 ///
 /// Used for the one decision taken before dispatch: whether the request aims at `cn=config`,
@@ -165,23 +213,20 @@ pub fn handle(
     let message_id = message.message_id;
     let controls = message.controls.clone();
 
-    // The configuration subtree is generated from the configuration document and takes no
-    // writes yet. Without this the request would reach the directory, find nothing and answer
-    // `noSuchObject` - which reads as "your DN is wrong" when the truth is "this subtree is
-    // not the directory's to change".
-    // The configuration subtree is generated from the configuration document and takes no
-    // writes yet. Without this the request would reach the directory, find nothing and answer
-    // `noSuchObject` - which reads as "your DN is wrong" when the truth is "this subtree is
-    // not the directory's to change".
+    // `cn=config` is not the directory: the subtree is generated from the configuration
+    // document, so a change there is a new generation of that document, not an entry in the
+    // store. Handled before dispatch so the request never reaches the directory, where it would
+    // find nothing and answer `noSuchObject` - which reads as "your DN is wrong".
     if let Some((response, _)) =
         config_write_target(&message.protocol_op).filter(|(_, dn)| config_entry::is_config_dn(dn))
     {
-        return Action::Reply(vec![response.message(
+        return config_change(
+            session,
+            security,
             message_id,
-            ResultCode::UnwillingToPerform,
-            "cn=config is read-only: the subtree is generated from the configuration \
-             document, so changing a setting means changing that document",
-        )]);
+            response,
+            &message.protocol_op,
+        );
     }
 
     match message.protocol_op {
