@@ -235,7 +235,11 @@ fn code_of(code: ViolationCode) -> ResultCode {
     }
 }
 
-fn result_code(error: &MutateError) -> ResultCode {
+/// The result code the protocol answers a refused change with.
+///
+/// Public because the `cn=config` write path applies the same change semantics through the
+/// same [`crate::mutate`] and must answer with the same codes.
+pub fn result_code(error: &MutateError) -> ResultCode {
     match error {
         MutateError::NoSuchAttribute(_) => ResultCode::NoSuchAttribute,
         MutateError::AttributeOrValueExists { .. } => ResultCode::AttributeOrValueExists,

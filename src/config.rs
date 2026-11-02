@@ -84,6 +84,12 @@ pub struct Document {
     pub text: String,
     /// Where it was read from, for the operator: `file:/etc/...` or `store:/etc/config.d`.
     pub origin: String,
+    /// The generation store this document came from, when it came from one.
+    ///
+    /// A write through `cn=config` is a commit of a new generation, so it needs somewhere to
+    /// commit to. Both facts travel together: a document read from a plain file has no store,
+    /// and the write path then refuses rather than editing a file the operator owns.
+    pub store: Option<PathBuf>,
 }
 
 impl Document {
@@ -91,7 +97,14 @@ impl Document {
         Self {
             text: text.into(),
             origin: origin.into(),
+            store: None,
         }
+    }
+
+    /// The same document, knowing which store it came from.
+    pub fn with_store(mut self, store: Option<PathBuf>) -> Self {
+        self.store = store;
+        self
     }
 }
 
@@ -363,7 +376,7 @@ fn default_respect_control_criticality() -> bool {
 pub fn load(args: Args) -> Result<Config, ConfigError> {
     let explicit = args.config.clone();
     let from_env = std::env::var_os(ENV_CONFIG_PATH).map(PathBuf::from);
-    let (text, origin) = match explicit.or(from_env).as_deref() {
+    let (text, origin, store) = match explicit.or(from_env).as_deref() {
         // A directory is a generation store: the configuration in force is the generation its
         // pointer names. A file is a configuration. The two cannot be confused, so no new key
         // is needed to say which - and pointing at the wrong one gets a message, not a parse
@@ -384,6 +397,7 @@ pub fn load(args: Args) -> Result<Config, ConfigError> {
                     (
                         Some(text),
                         format!("store:{} generation {number}", path.display()),
+                        Some(path.to_path_buf()),
                     )
                 }
                 Ok(None) => {
@@ -399,10 +413,14 @@ pub fn load(args: Args) -> Result<Config, ConfigError> {
                 }
             }
         }
-        Some(path) => (Some(read_file(path)?), format!("file:{}", path.display())),
+        Some(path) => (
+            Some(read_file(path)?),
+            format!("file:{}", path.display()),
+            None,
+        ),
         // Flags and defaults only: there is no document, and `cn=config` says so rather than
         // publishing an empty subtree that looks the same as a server with no settings.
-        None => (None, String::new()),
+        None => (None, String::new(), None),
     };
 
     let mut config = resolve(args, text.as_deref(), |name| std::env::var(name).ok())?;
@@ -411,6 +429,7 @@ pub fn load(args: Args) -> Result<Config, ConfigError> {
     // it came from.
     if let Some(document) = config.document.as_mut() {
         document.origin = origin;
+        document.store = store;
     }
 
     Ok(config)
