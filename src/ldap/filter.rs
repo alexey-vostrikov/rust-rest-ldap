@@ -17,7 +17,8 @@ use crate::index::Query;
 use crate::model::{Attribute, Attributes};
 
 /// Attribute description that matches on the entry's DN instead of its values.
-pub const ATTR_ENTRY_DN: &str = "entryDN";
+/// Lowercased description the filter already folds to.
+const ENTRY_DN: &str = "entrydn";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FilterError {
@@ -38,7 +39,7 @@ pub fn to_query(filter: &Filter) -> Query {
         Filter::EqualityMatch(assertion) => {
             let name = assertion.attribute_desc.0.to_lowercase();
             // `entryDN` is computed from the DN and never stored as an attribute.
-            if name == "entrydn" {
+            if name == ENTRY_DN {
                 return Query::Unindexed;
             }
             Query::Equality {
@@ -78,7 +79,7 @@ pub fn matches(
             let name = assertion.attribute_desc.0.to_lowercase();
             let value = String::from_utf8_lossy(assertion.assertion_value.as_ref()).into_owned();
 
-            if name == "entrydn" {
+            if name == ENTRY_DN {
                 return Ok(dn::normalize(&value) == dn::normalize(entry_dn));
             }
 
@@ -89,14 +90,14 @@ pub fn matches(
         }
         Filter::Present(name) => {
             let name = name.0.to_lowercase();
-            if name == "entrydn" {
+            if name == ENTRY_DN {
                 return Ok(true);
             }
             Ok(attributes.get(&name).is_some())
         }
         Filter::Substrings(substrings) => {
             let name = substrings.r#type.0.to_lowercase();
-            if name == "entrydn" {
+            if name == ENTRY_DN {
                 return Ok(substring_matches(
                     &dn::normalize(entry_dn),
                     false,

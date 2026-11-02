@@ -2,6 +2,7 @@
 
 pub mod bind;
 pub mod codec;
+pub mod compare;
 pub mod filter;
 pub mod modify;
 pub mod paged;
@@ -97,10 +98,8 @@ pub fn handle(
             controls.as_ref(),
             security,
         )),
-        ProtocolOp::CompareRequest(_) => Action::Reply(vec![responses::compare_response(
-            message_id,
-            ResultCode::UnwillingToPerform,
-            "compare is not implemented yet",
+        ProtocolOp::CompareRequest(request) => Action::Reply(vec![compare::handle_compare(
+            session, directory, message_id, &request, security,
         )]),
         ProtocolOp::ModifyRequest(request) => {
             match modify::handle_modify(session, directory, message_id, &request, security) {
@@ -287,10 +286,17 @@ mod tests {
             }),
         );
 
-        for message in [add, delete, modify_dn, compare] {
+        for message in [add, delete, modify_dn] {
             let action = handle(&mut session, &directory, &security(), message);
             assert_eq!(codes(&action), vec![ResultCode::UnwillingToPerform]);
         }
+
+        // Compare is implemented now, so it answers about the entry instead of
+        // refusing the operation: a DN nobody has is `noSuchObject`, not
+        // `unwillingToPerform`. Compare refuses only `entryDN`, which the test in
+        // tests/compare.rs pins.
+        let action = handle(&mut session, &directory, &security(), compare);
+        assert_eq!(codes(&action), vec![ResultCode::NoSuchObject]);
     }
 
     #[test]
