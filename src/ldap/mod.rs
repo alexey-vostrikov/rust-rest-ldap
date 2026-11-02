@@ -11,6 +11,7 @@ pub mod responses;
 pub mod search;
 pub mod session;
 pub mod starttls;
+pub mod write;
 
 use rasn_ldap::{LdapMessage, ProtocolOp, ResultCode};
 
@@ -50,6 +51,7 @@ pub enum FailureResponse {
     Modify,
     Add,
     Del,
+    ModDn,
 }
 
 impl FailureResponse {
@@ -64,6 +66,7 @@ impl FailureResponse {
             FailureResponse::Modify => responses::modify_response(message_id, code, diagnostic),
             FailureResponse::Add => responses::add_response(message_id, code, diagnostic),
             FailureResponse::Del => responses::del_response(message_id, code, diagnostic),
+            FailureResponse::ModDn => responses::modify_dn_response(message_id, code, diagnostic),
         }
     }
 }
@@ -120,21 +123,39 @@ pub fn handle(
                 },
             }
         }
-        ProtocolOp::AddRequest(_) => Action::Reply(vec![responses::add_response(
-            message_id,
-            ResultCode::UnwillingToPerform,
-            "add is not supported",
-        )]),
-        ProtocolOp::DelRequest(_) => Action::Reply(vec![responses::del_response(
-            message_id,
-            ResultCode::UnwillingToPerform,
-            "delete is not supported",
-        )]),
-        ProtocolOp::ModDnRequest(_) => Action::Reply(vec![responses::modify_dn_response(
-            message_id,
-            ResultCode::UnwillingToPerform,
-            "modify dn is not supported",
-        )]),
+        ProtocolOp::AddRequest(request) => {
+            match write::handle_add(session, directory, message_id, &request, security) {
+                write::Outcome::Reject(message) => Action::Reply(vec![message]),
+                write::Outcome::Persist { changes, success } => Action::Persist {
+                    changes,
+                    success,
+                    message_id,
+                    failure: FailureResponse::Add,
+                },
+            }
+        }
+        ProtocolOp::DelRequest(request) => {
+            match write::handle_delete(session, directory, message_id, &request, security) {
+                write::Outcome::Reject(message) => Action::Reply(vec![message]),
+                write::Outcome::Persist { changes, success } => Action::Persist {
+                    changes,
+                    success,
+                    message_id,
+                    failure: FailureResponse::Del,
+                },
+            }
+        }
+        ProtocolOp::ModDnRequest(request) => {
+            match write::handle_modify_dn(session, directory, message_id, &request, security) {
+                write::Outcome::Reject(message) => Action::Reply(vec![message]),
+                write::Outcome::Persist { changes, success } => Action::Persist {
+                    changes,
+                    success,
+                    message_id,
+                    failure: FailureResponse::ModDn,
+                },
+            }
+        }
         ProtocolOp::ExtendedReq(request) => {
             if starttls::is_starttls(request.request_name.as_ref()) {
                 // The connection loop owns the acceptor, so availability is decided
@@ -259,52 +280,87 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_operations_answer_with_their_own_envelope() {
+    fn write_operations_answer_in_their_own_envelope() {
+        // Every operation now has a handler, so the property worth pinning is the
+        // envelope: a client tells the answer apart by the response type, and a wrong
+        // type is as bad as a wrong code.
         let directory = directory();
         let mut session = Session::new();
 
-        let add = LdapMessage::new(
-            4,
-            ProtocolOp::AddRequest(AddRequest {
-                entry: LdapDn::from("cn=x,dc=example,dc=com"),
-                attributes: vec![],
-            }),
-        );
-        let delete = LdapMessage::new(
-            5,
-            ProtocolOp::DelRequest(DelRequest(LdapDn::from("cn=x,dc=example,dc=com"))),
-        );
-        let modify_dn = LdapMessage::new(
-            6,
-            ProtocolOp::ModDnRequest(ModifyDnRequest {
-                entry: LdapDn::from("cn=x,dc=example,dc=com"),
-                new_rdn: LdapDn::from("cn=y"),
-                delete_old_rdn: true,
-                new_superior: None,
-            }),
-        );
-        let compare = LdapMessage::new(
-            7,
-            ProtocolOp::CompareRequest(CompareRequest {
-                entry: LdapDn::from("cn=x,dc=example,dc=com"),
-                ava: AttributeValueAssertion::new(
-                    AttributeDescription::from("cn"),
-                    rasn::types::OctetString::from_static(b"x"),
+        // (request, expected code, the work of recognising the response envelope)
+        type Case = (LdapMessage, ResultCode, fn(&ProtocolOp) -> bool);
+        let cases: Vec<Case> = vec![
+            (
+                LdapMessage::new(
+                    4,
+                    ProtocolOp::AddRequest(AddRequest {
+                        entry: LdapDn::from("cn=x,ou=users,dc=example,dc=com"),
+                        attributes: vec![],
+                    }),
                 ),
-            }),
-        );
+                // The parent exists, but an anonymous session may not write.
+                ResultCode::InsufficientAccessRights,
+                |op| matches!(op, ProtocolOp::AddResponse(_)),
+            ),
+            (
+                LdapMessage::new(
+                    5,
+                    ProtocolOp::DelRequest(DelRequest(LdapDn::from(
+                        "cn=missing,ou=users,dc=example,dc=com",
+                    ))),
+                ),
+                ResultCode::NoSuchObject,
+                |op| matches!(op, ProtocolOp::DelResponse(_)),
+            ),
+            (
+                LdapMessage::new(
+                    6,
+                    ProtocolOp::ModDnRequest(ModifyDnRequest {
+                        entry: LdapDn::from("cn=missing,ou=users,dc=example,dc=com"),
+                        new_rdn: LdapDn::from("cn=y"),
+                        delete_old_rdn: true,
+                        new_superior: None,
+                    }),
+                ),
+                ResultCode::NoSuchObject,
+                |op| matches!(op, ProtocolOp::ModDnResponse(_)),
+            ),
+            (
+                LdapMessage::new(
+                    7,
+                    ProtocolOp::CompareRequest(CompareRequest {
+                        entry: LdapDn::from("cn=missing,dc=example,dc=com"),
+                        ava: AttributeValueAssertion::new(
+                            AttributeDescription::from("cn"),
+                            rasn::types::OctetString::from_static(b"x"),
+                        ),
+                    }),
+                ),
+                ResultCode::NoSuchObject,
+                |op| matches!(op, ProtocolOp::CompareResponse(_)),
+            ),
+        ];
 
-        for message in [add, delete, modify_dn] {
+        for (message, expected, envelope) in cases {
             let action = handle(&mut session, &directory, &security(), message);
-            assert_eq!(codes(&action), vec![ResultCode::UnwillingToPerform]);
-        }
+            let messages = match action {
+                Action::Reply(messages) => messages,
+                other => panic!("expected a reply, got {other:?}"),
+            };
 
-        // Compare is implemented now, so it answers about the entry instead of
-        // refusing the operation: a DN nobody has is `noSuchObject`, not
-        // `unwillingToPerform`. Compare refuses only `entryDN`, which the test in
-        // tests/compare.rs pins.
-        let action = handle(&mut session, &directory, &security(), compare);
-        assert_eq!(codes(&action), vec![ResultCode::NoSuchObject]);
+            let last = messages.last().expect("a response");
+            assert!(
+                envelope(&last.protocol_op),
+                "wrong response type: {:?}",
+                last.protocol_op
+            );
+            assert_eq!(
+                codes(&Action::Reply(messages)),
+                vec![expected],
+                "unexpected code for {:?}",
+                expected
+            );
+        }
     }
 
     #[test]

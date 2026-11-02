@@ -6,3 +6,4 @@
 /rust-rest-ldap
 # redb files seeded for live checks
 /build
+.#*
