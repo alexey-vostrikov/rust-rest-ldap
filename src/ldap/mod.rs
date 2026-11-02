@@ -4,6 +4,7 @@ pub mod assertion;
 pub mod bind;
 pub mod codec;
 pub mod compare;
+pub mod extop;
 pub mod filter;
 pub mod modify;
 pub mod paged;
@@ -63,6 +64,7 @@ pub enum FailureResponse {
     Add,
     Del,
     ModDn,
+    Extended,
 }
 
 impl FailureResponse {
@@ -78,6 +80,12 @@ impl FailureResponse {
             FailureResponse::Add => responses::add_response(message_id, code, diagnostic),
             FailureResponse::Del => responses::del_response(message_id, code, diagnostic),
             FailureResponse::ModDn => responses::modify_dn_response(message_id, code, diagnostic),
+            FailureResponse::Extended => responses::extended_response(
+                message_id,
+                code,
+                diagnostic,
+                Some(extop::PASSWORD_MODIFY_OID),
+            ),
         }
     }
 }
@@ -180,14 +188,41 @@ pub fn handle(
             if starttls::is_starttls(request.request_name.as_ref()) {
                 // The connection loop owns the acceptor, so availability is decided
                 // there: the dispatcher only recognises the operation.
-                Action::StartTls(message_id)
-            } else {
-                Action::Reply(vec![responses::extended_response(
+                return Action::StartTls(message_id);
+            }
+
+            match extop::operation(request.request_name.as_ref()) {
+                extop::Operation::WhoAmI => {
+                    Action::Reply(extop::handle_whoami(session, message_id))
+                }
+                extop::Operation::PasswordModify => {
+                    let value = request
+                        .request_value
+                        .as_ref()
+                        .map(|value| value.as_ref().to_vec());
+
+                    match extop::handle_password_modify(
+                        session,
+                        directory,
+                        message_id,
+                        value.as_deref(),
+                        security,
+                    ) {
+                        extop::Outcome::Reply(message) => Action::Reply(vec![message]),
+                        extop::Outcome::Persist { entry, success } => Action::Persist {
+                            changes: vec![EntryChange::Upsert { entry }],
+                            success,
+                            message_id,
+                            failure: FailureResponse::Extended,
+                        },
+                    }
+                }
+                extop::Operation::Unknown => Action::Reply(vec![responses::extended_response(
                     message_id,
                     ResultCode::UnwillingToPerform,
                     "unsupported extended operation",
                     None,
-                )])
+                )]),
             }
         }
         // A client must not send responses to the server.
