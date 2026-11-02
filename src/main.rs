@@ -114,6 +114,8 @@ async fn main() {
         Arc::clone(&source),
         Arc::new(security),
         shutdown_rx,
+        // Clients get this long to finish the operation they are in the middle of.
+        std::time::Duration::from_secs(10),
     ));
 
     wait_for_signal().await;
