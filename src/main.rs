@@ -69,12 +69,18 @@ async fn main() {
         directory.users().len(),
         directory.groups().len()
     );
+    if !config.dangerous_settings.is_empty() {
+        println!(
+            "DANGER: this configuration turns on {} - acknowledged with AllowDangerousSettings",
+            config.dangerous_settings.join(", ")
+        );
+    }
     println!(
         "passwords: store {}, {} weak scheme(s) allowed; acl rules {}; plaintext simple bind {}",
         security.passwords.store_scheme().name(),
         security.passwords.allowed_weak().count(),
         security.acl.rules().len(),
-        security.allow_plaintext_simple_bind
+        security.allow_unencrypted_bind
     );
 
     let listener = match tokio::net::TcpListener::bind(&config.listen_addr).await {

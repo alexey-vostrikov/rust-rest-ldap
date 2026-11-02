@@ -263,6 +263,9 @@ mod tests {
     /// Policy that re-enables the named weak schemes.
     fn permissive(schemes: &[&str]) -> PasswordPolicy {
         PasswordPolicy::from_config(Some(&PasswordConfig {
+            allow_weak_hashes: Some(crate::password::policy::WEAK_ACKNOWLEDGEMENT.to_string()),
+            allowed_weak_hashes: None,
+            upgrade_on_bind: None,
             allow_weak: schemes.iter().map(|name| name.to_string()).collect(),
             store_scheme: None,
         }))

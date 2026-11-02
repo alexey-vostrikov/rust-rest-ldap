@@ -7,19 +7,72 @@ use super::session::{Identity, Session};
 use crate::acl::Requester;
 use crate::directory::Directory;
 use crate::dn;
+use crate::model::Entry;
 use crate::password::verify;
 use crate::security::Security;
 
+/// Result of a bind: the response, and an entry to store when the password hash
+/// needs upgrading.
+///
+/// The upgrade is kept separate from the response because the two are not one decision:
+/// by the time the new hash exists the bind has already succeeded, so failing to store
+/// it must not turn a correct `success` into an error.
+pub struct Outcome {
+    pub message: rasn_ldap::LdapMessage,
+    pub upgrade: Option<crate::model::Entry>,
+}
+
 /// Handles a bind request and updates the session identity.
 ///
-/// The identity is cleared first: per RFC 4513 a failed bind leaves the
-/// connection anonymous, and gorestldap kept the previous ACL in that case.
+/// Kept as the simple entry point for callers that do not care about the hash upgrade;
+/// the dispatcher uses [`handle_bind_outcome`].
 pub fn handle_bind(
     session: &mut Session,
     directory: &Directory,
     message_id: MessageId,
     request: &BindRequest,
     security: &Security,
+) -> rasn_ldap::LdapMessage {
+    handle_bind_outcome(session, directory, message_id, request, security).message
+}
+
+/// Handles a bind request, and reports an entry to store when the stored hash is not in
+/// the configured scheme.
+///
+/// The identity is cleared first: per RFC 4513 a failed bind leaves the
+/// connection anonymous, and gorestldap kept the previous ACL in that case.
+pub fn handle_bind_outcome(
+    session: &mut Session,
+    directory: &Directory,
+    message_id: MessageId,
+    request: &BindRequest,
+    security: &Security,
+) -> Outcome {
+    let mut upgrade = None;
+    let message = authenticate(
+        session,
+        directory,
+        message_id,
+        request,
+        security,
+        &mut upgrade,
+    );
+
+    Outcome { message, upgrade }
+}
+
+/// Does the work and reports the upgrade through `upgrade`.
+///
+/// The out-parameter keeps every refusal a single `return` of a response, which is what
+/// makes the failure paths below readable; a returned tuple would need wrapping at each
+/// one of them.
+fn authenticate(
+    session: &mut Session,
+    directory: &Directory,
+    message_id: MessageId,
+    request: &BindRequest,
+    security: &Security,
+    upgrade: &mut Option<crate::model::Entry>,
 ) -> rasn_ldap::LdapMessage {
     session.reset();
 
@@ -61,7 +114,7 @@ pub fn handle_bind(
 
     // A password sent in the clear is refused before the entry is looked up, so
     // the answer does not reveal whether the account exists.
-    if !session.is_encrypted() && !security.allow_plaintext_simple_bind {
+    if !session.is_encrypted() && !security.allow_unencrypted_bind {
         return bind_response(
             message_id,
             ResultCode::StrongerAuthRequired,
@@ -132,6 +185,23 @@ pub fn handle_bind(
     match verify(&password, &stored_hash, &security.passwords) {
         Ok(true) => {
             session.set_identity(Identity::new(&bind_dn, is_admin));
+
+            // The password is in hand for the only time: if the stored hash is not in
+            // the configured scheme, write the new one now. `needs_rehash` returns
+            // false when the operator turned the upgrade off.
+            if security.passwords.needs_rehash(&stored_hash) {
+                match crate::password::store::hash(&password, security.passwords.store_scheme()) {
+                    Ok(upgraded) => {
+                        *upgrade = Some(replace_password(entry, &upgraded));
+                    }
+                    Err(err) => {
+                        // A hash the server cannot compute is a configuration problem,
+                        // not a reason to refuse a bind that already succeeded.
+                        eprintln!("password upgrade failed for '{bind_dn}': {err}");
+                    }
+                }
+            }
+
             bind_response(message_id, ResultCode::Success, "")
         }
         Ok(false) => bind_response(message_id, ResultCode::InvalidCredentials, "wrong password"),
@@ -143,14 +213,30 @@ pub fn handle_bind(
     }
 }
 
+/// The entry with `userPassword` replaced, keeping the flags the attribute had.
+fn replace_password(entry: &Entry, hash: &str) -> Entry {
+    let mut attribute = crate::model::Attribute::single("userPassword", hash);
+    if let Some(existing) = entry.attributes().get("userPassword") {
+        attribute.flags = existing.flags;
+    }
+
+    Entry::new(entry.dn(), entry.attributes().clone().replace(attribute))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Group, User};
     use crate::password::{StoreScheme, hash as hash_password};
 
+    /// Policy for these tests: they exercise authentication, not transport, and
+    /// `handle_bind` has no socket to encrypt. The unencrypted bind is switched on
+    /// here and nowhere else in the suite, which is the point of the setting.
     fn security() -> Security {
-        Security::default()
+        Security {
+            allow_unencrypted_bind: true,
+            ..Security::default()
+        }
     }
 
     fn hash(value: &str) -> String {
@@ -474,7 +560,7 @@ mod tests {
         let directory = directory();
         let mut session = Session::new();
         let security = Security {
-            allow_plaintext_simple_bind: false,
+            allow_unencrypted_bind: false,
             ..Security::default()
         };
 
@@ -500,7 +586,7 @@ mod tests {
         let mut session = Session::new();
         session.set_encrypted(true);
         let security = Security {
-            allow_plaintext_simple_bind: false,
+            allow_unencrypted_bind: false,
             ..Security::default()
         };
 
@@ -521,7 +607,7 @@ mod tests {
         let directory = directory();
         let mut session = Session::new();
         let security = Security {
-            allow_plaintext_simple_bind: false,
+            allow_unencrypted_bind: false,
             ..Security::default()
         };
 
@@ -552,6 +638,7 @@ mod tests {
                     ..Rights::none()
                 },
             }]),
+            allow_unencrypted_bind: true,
             ..Security::default()
         };
 

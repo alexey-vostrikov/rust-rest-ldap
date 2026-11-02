@@ -111,7 +111,8 @@ mod tests {
             schema_mode: crate::schema::Mode::Strict,
             indexes: crate::index::IndexConfig::default(),
             acl: Default::default(),
-            allow_plaintext_simple_bind: true,
+            allow_unencrypted_bind: true,
+            dangerous_settings: Vec::new(),
         };
         let backend_config = serde_json::json!({
             "users_path": users_path,

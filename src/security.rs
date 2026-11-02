@@ -18,7 +18,7 @@ pub struct Security {
     /// Access rules.
     pub acl: Acl,
     /// Simple bind over an unencrypted connection is refused when false.
-    pub allow_plaintext_simple_bind: bool,
+    pub allow_unencrypted_bind: bool,
     /// The listener speaks TLS from the first byte (LDAPS).
     pub ldaps: bool,
     /// A certificate and key are configured, so StartTLS can be offered.
@@ -35,7 +35,9 @@ impl Default for Security {
             respect_control_criticality: true,
             passwords: PasswordPolicy::strict(),
             acl: Acl::default(),
-            allow_plaintext_simple_bind: true,
+            // Off, like the configuration default: a test or a caller that wants a
+            // plaintext bind has to say so, which is the same rule an operator follows.
+            allow_unencrypted_bind: false,
             ldaps: false,
             starttls: false,
             schema: Schema::core(),
@@ -50,7 +52,7 @@ impl Security {
             respect_control_criticality: config.respect_control_criticality,
             passwords: config.passwords.clone(),
             acl: config.acl.clone(),
-            allow_plaintext_simple_bind: config.allow_plaintext_simple_bind,
+            allow_unencrypted_bind: config.allow_unencrypted_bind,
             ldaps: config.use_tls,
             // Both, because the same certificate serves LDAPS and StartTLS and
             // config load already refuses use_tls without material.
@@ -81,8 +83,9 @@ mod tests {
 
         assert!(security.respect_control_criticality);
         assert!(
-            security.allow_plaintext_simple_bind,
-            "a plain lab server must start without TLS material"
+            !security.allow_unencrypted_bind,
+            "the safe default refuses a password in the clear; a lab turns it on in \
+             words, and the server still starts without TLS material either way"
         );
         assert_eq!(security.passwords, PasswordPolicy::strict());
         assert_eq!(security.acl, Acl::default());
@@ -91,24 +94,29 @@ mod tests {
     #[test]
     fn config_values_reach_the_bundle() {
         let config = config_from(
-            "
+            r#"
 respect_control_criticality: false
+AllowDangerousSettings: "Yes I know this is bad idea"
 bind:
-  allow_plaintext_simple: false
+  AllowUnencryptedBind: "Yes I know this is bad idea"
 passwords:
-  allow_weak: [ssha]
+  AllowWeakHashes: "Yes I know this is bad idea"
+  AllowedWeakHashes: "ssha"
   store_scheme: pbkdf2-sha512
 access:
   - subject: users
     attributes: [cn]
     rights: [read]
-",
+"#,
         );
 
         let security = Security::from_config(&config);
 
         assert!(!security.respect_control_criticality);
-        assert!(!security.allow_plaintext_simple_bind);
+        assert!(
+            security.allow_unencrypted_bind,
+            "the configuration said the sentence, so the unsafe bind is on"
+        );
         assert!(security.passwords.may_verify(crate::password::Scheme::Ssha));
         assert_eq!(
             security.passwords.store_scheme(),
