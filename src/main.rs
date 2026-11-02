@@ -9,6 +9,8 @@ use rust_rest_ldap::{cli, config, security::Security};
 #[tokio::main]
 async fn main() {
     let args: config::Args = cli::Cli::parse().into();
+    let export = args.export_ldif.clone();
+    let export_operational = args.export_operational;
 
     let config = match config::load(args) {
         Ok(config) => config,
@@ -22,6 +24,37 @@ async fn main() {
         Ok(backend) => backend,
         Err(err) => fatal(&err.to_string()),
     };
+    // An export is a one-shot read of the backend, not a server: it must not bind a
+    // port, and it must not rewrite data on its way out.
+    if let Some(path) = export {
+        let data = match backend.load().await {
+            Ok(data) => data,
+            Err(err) => fatal(&err.to_string()),
+        };
+        let directory = data.into_directory(
+            &config.base_dn,
+            &config.users_ou_name,
+            &config.groups_ou_name,
+        );
+
+        let text = rust_rest_ldap::ldif::export(
+            directory.all(),
+            rust_rest_ldap::ldif::Options {
+                operational: export_operational,
+                ..Default::default()
+            },
+        );
+
+        if path.as_os_str() == "-" {
+            print!("{text}");
+        } else if let Err(err) = std::fs::write(&path, text) {
+            fatal(&format!("error writing '{}': {err}", path.display()));
+        } else {
+            eprintln!("exported {} entries to {}", directory.len(), path.display());
+        }
+        return;
+    }
+
     let (source, directory) = match rust_rest_ldap::reload::Source::load(&config, backend).await {
         Ok(loaded) => loaded,
         Err(err) => fatal(&err.to_string()),

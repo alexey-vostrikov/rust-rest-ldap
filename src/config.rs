@@ -34,6 +34,9 @@ pub const ENV_UPDATE_INTERVAL: &str = "UPDATE_INTERVAL";
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Args {
     pub config: Option<PathBuf>,
+    /// Present when the run is an LDIF export rather than a server.
+    pub export_ldif: Option<PathBuf>,
+    pub export_operational: bool,
     pub backend: Option<String>,
     pub base_dn: Option<String>,
     pub listen_addr: Option<String>,
