@@ -1,8 +1,5 @@
-mod cli;
-mod config;
-mod dn;
-
 use clap::Parser;
+use rust_rest_ldap::{cli, config};
 
 fn main() {
     let args: config::Args = cli::Cli::parse().into();
