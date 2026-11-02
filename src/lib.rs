@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod directory;
 pub mod dn;
 pub mod model;
 pub mod ssha;
