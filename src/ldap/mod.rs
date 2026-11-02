@@ -4,6 +4,7 @@ pub mod assertion;
 pub mod bind;
 pub mod codec;
 pub mod compare;
+pub mod config_entry;
 pub mod extop;
 pub mod filter;
 pub mod filter_parse;
@@ -97,6 +98,26 @@ pub struct PersistAction {
     pub journal: Option<crate::metrics::Note>,
 }
 
+/// The entry a write operation addresses, and the response shape it expects.
+///
+/// Used for the one decision taken before dispatch: whether the request aims at `cn=config`,
+/// which is not part of the directory.
+fn config_write_target(op: &ProtocolOp) -> Option<(FailureResponse, String)> {
+    match op {
+        ProtocolOp::ModifyRequest(request) => {
+            Some((FailureResponse::Modify, request.object.0.to_string()))
+        }
+        ProtocolOp::AddRequest(request) => {
+            Some((FailureResponse::Add, request.entry.0.to_string()))
+        }
+        ProtocolOp::DelRequest(request) => Some((FailureResponse::Del, request.0.to_string())),
+        ProtocolOp::ModDnRequest(request) => {
+            Some((FailureResponse::ModDn, request.entry.0.to_string()))
+        }
+        _ => None,
+    }
+}
+
 /// Response to send when a write does not reach the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureResponse {
@@ -143,6 +164,25 @@ pub fn handle(
 ) -> Action {
     let message_id = message.message_id;
     let controls = message.controls.clone();
+
+    // The configuration subtree is generated from the configuration document and takes no
+    // writes yet. Without this the request would reach the directory, find nothing and answer
+    // `noSuchObject` - which reads as "your DN is wrong" when the truth is "this subtree is
+    // not the directory's to change".
+    // The configuration subtree is generated from the configuration document and takes no
+    // writes yet. Without this the request would reach the directory, find nothing and answer
+    // `noSuchObject` - which reads as "your DN is wrong" when the truth is "this subtree is
+    // not the directory's to change".
+    if let Some((response, _)) =
+        config_write_target(&message.protocol_op).filter(|(_, dn)| config_entry::is_config_dn(dn))
+    {
+        return Action::Reply(vec![response.message(
+            message_id,
+            ResultCode::UnwillingToPerform,
+            "cn=config is read-only: the subtree is generated from the configuration \
+             document, so changing a setting means changing that document",
+        )]);
+    }
 
     match message.protocol_op {
         ProtocolOp::BindRequest(request) => {

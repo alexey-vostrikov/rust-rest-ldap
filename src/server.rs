@@ -641,6 +641,7 @@ mod tests {
             bootstrap: None,
             locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),
             locale_file: None,
+            document: None,
         }
     }
 
