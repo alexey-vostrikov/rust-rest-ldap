@@ -82,6 +82,8 @@ pub struct Config {
     pub integrity: IntegrityConfig,
     /// Where the change journal goes, if anywhere.
     pub observability: ObservabilityConfig,
+    /// The first administrator of an empty store, if the operator configured one.
+    pub bootstrap: Option<BootstrapConfig>,
     /// Language for operator diagnostics, and where it came from.
     pub locale: (crate::i18n::Locale, crate::i18n::Source),
     /// Translation file, when one is configured.
@@ -145,6 +147,16 @@ pub enum ConfigError {
     PlainHttpNotAcknowledged { address: String },
     #[error("error in the 'indexes' section: {0}")]
     Index(#[from] IndexError),
+    #[error(
+        "the 'bootstrap' section names no password: set password_file or password_env, \
+         or remove the section"
+    )]
+    BootstrapPasswordMissing,
+    #[error(
+        "the 'bootstrap' section names both password_file and password_env; pick one, so \
+         that where the first administrator's password comes from has one answer"
+    )]
+    BootstrapPasswordAmbiguous,
 }
 
 /// Subset of the configuration that lives in the YAML file.
@@ -200,6 +212,7 @@ struct FileConfig {
     access: Option<Vec<AccessRuleConfig>>,
     #[serde(default)]
     bind: BindConfig,
+    bootstrap: Option<BootstrapConfig>,
     #[serde(default)]
     schema: SchemaConfig,
     #[serde(default)]
@@ -228,6 +241,26 @@ pub struct ObservabilityConfig {
     /// Write the journal to standard output instead of a file, for a container that
     /// collects it.
     pub journal_stdout: bool,
+}
+
+/// `bootstrap:` section of the configuration file.
+///
+/// The first administrator, for a store no client can write to yet. It carries where the
+/// password comes from, not the password: a `Config` is printed at startup and derived
+/// `Debug`, and a secret that lives in it would end up in a log line the operator never
+/// looks at.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct BootstrapConfig {
+    /// The DN to create; `cn=admin,ou=<users unit>,<base DN>` when absent.
+    pub dn: Option<String>,
+    /// A file holding the password, read once at startup.
+    ///
+    /// The file is not the command line: arguments are visible in `ps` to every user on
+    /// the machine, and a password there is a password given away.
+    pub password_file: Option<PathBuf>,
+    /// An environment variable holding the password, for a container secret.
+    pub password_env: Option<String>,
 }
 
 /// `bind:` section of the configuration file.
@@ -409,6 +442,23 @@ pub fn resolve(
         },
         acl: crate::acl::from_config(file.access.as_deref())?,
         allow_unencrypted_bind: file.bind.allow_unencrypted_bind.is_on(),
+        bootstrap: match file.bootstrap {
+            None => None,
+            Some(section) => {
+                // Exactly one source of the password. Neither is a section that does
+                // nothing; both is a section whose answer depends on which line the
+                // reader believes, and the two can disagree.
+                match (&section.password_file, &section.password_env) {
+                    (None, None) => return Err(ConfigError::BootstrapPasswordMissing),
+                    (Some(_), Some(_)) => return Err(ConfigError::BootstrapPasswordAmbiguous),
+                    (Some(_), None) => Some(section),
+                    (None, Some(name)) if name.trim().is_empty() => {
+                        return Err(ConfigError::BootstrapPasswordMissing);
+                    }
+                    (None, Some(_)) => Some(section),
+                }
+            }
+        },
     };
 
     if config.use_tls && (config.server_cert.is_none() || config.server_key.is_none()) {
@@ -547,6 +597,81 @@ backends:
         let cfg = resolve(Args::default(), None, env).expect("env config");
 
         assert_eq!(cfg.backend, "rest");
+    }
+
+    #[test]
+    fn a_bootstrap_section_without_a_password_source_is_refused() {
+        // A section that does nothing looks like it did something: the operator believes
+        // the administrator exists and finds out at the first bind that it does not.
+        let text = "
+bootstrap:
+  dn: cn=admin,ou=users,dc=example,dc=com
+";
+
+        let err = resolve(Args::default(), Some(text), no_env).expect_err("must reject");
+        assert!(
+            matches!(err, ConfigError::BootstrapPasswordMissing),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_section_with_two_password_sources_is_refused() {
+        // Two sources that disagree have no answer, and the one the reader believes is
+        // whichever line they happened to look at first.
+        let text = "
+bootstrap:
+  password_file: /etc/rrl/password.txt
+  password_env: RRL_BOOTSTRAP_PASSWORD
+";
+
+        let err = resolve(Args::default(), Some(text), no_env).expect_err("must reject");
+        assert!(
+            matches!(err, ConfigError::BootstrapPasswordAmbiguous),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_variable_name_is_not_a_password_source() {
+        let text = "
+bootstrap:
+  password_env: '   '
+";
+
+        let err = resolve(Args::default(), Some(text), no_env).expect_err("must reject");
+        assert!(
+            matches!(err, ConfigError::BootstrapPasswordMissing),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_section_with_one_source_resolves() {
+        let text = "
+bootstrap:
+  dn: cn=root,ou=users,dc=example,dc=com
+  password_env: RRL_BOOTSTRAP_PASSWORD
+";
+
+        let cfg = resolve(Args::default(), Some(text), no_env).expect("config");
+        let section = cfg.bootstrap.expect("the section must survive resolution");
+
+        assert_eq!(
+            section.dn.as_deref(),
+            Some("cn=root,ou=users,dc=example,dc=com")
+        );
+        assert_eq!(
+            section.password_env.as_deref(),
+            Some("RRL_BOOTSTRAP_PASSWORD")
+        );
+        assert!(section.password_file.is_none());
+    }
+
+    #[test]
+    fn no_bootstrap_section_means_no_bootstrap() {
+        let cfg = resolve(Args::default(), None, no_env).expect("defaults");
+        assert!(cfg.bootstrap.is_none());
     }
 
     #[test]

@@ -143,6 +143,24 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Whether a change written to this backend is still there after a restart.
+    ///
+    /// The JSON backends read a file that the server does not own: a write either goes to
+    /// a file the next reload overwrites, or fails halfway through a set. Anything that
+    /// has to leave a trace - seeding, for one - needs a backend that says yes here.
+    pub fn keeps_writes(&self) -> bool {
+        matches!(self, Backend::Redb(_))
+    }
+
+    /// The name this backend is configured under.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Backend::File(_) => "file",
+            Backend::Null(_) => "null",
+            Backend::Redb(_) => "redb",
+        }
+    }
+
     /// Builds the backend named in the configuration.
     pub fn from_config(
         name: &str,
