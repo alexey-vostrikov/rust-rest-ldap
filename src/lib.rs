@@ -17,6 +17,7 @@ pub mod directory;
 pub mod dn;
 pub mod http;
 pub mod ldap;
+pub mod mapping;
 pub mod model;
 pub mod password;
 pub mod reload;

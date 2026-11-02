@@ -104,7 +104,7 @@ pub fn handle_search(
 
     let mut matched: Vec<(String, Attributes)> = Vec::new();
     for entry in directory.entries(&base_object, scope) {
-        let entry_dn = directory.entry_dn(&entry);
+        let entry_dn = entry.dn().to_string();
         if !security
             .acl
             .rights(&requester, directory, &entry_dn, None)
@@ -112,7 +112,7 @@ pub fn handle_search(
         {
             continue;
         }
-        match filter::matches(&entry.attributes(), &entry_dn, &request.filter) {
+        match filter::matches(entry.attributes(), &entry_dn, &request.filter) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(err) => {
@@ -123,7 +123,7 @@ pub fn handle_search(
                 )];
             }
         }
-        matched.push((entry_dn, entry.attributes()));
+        matched.push((entry_dn, entry.attributes().clone()));
     }
 
     // Client size limit: applied to the entries that matched, per RFC 4511.
@@ -172,7 +172,7 @@ pub fn handle_search(
                 .filter(|attribute| {
                     security
                         .acl
-                        .rights(&requester, directory, dn, Some(attribute.name))
+                        .rights(&requester, directory, dn, Some(attribute.name.as_str()))
                         .read
                 })
                 .collect();

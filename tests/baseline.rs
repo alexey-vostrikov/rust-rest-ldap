@@ -60,8 +60,8 @@ fn timed_search(directory: &Directory, base: &str, scope: Scope, probe: &Filter)
     let started = Instant::now();
     let mut matched = 0;
     for entry in directory.entries(base, scope) {
-        let dn = directory.entry_dn(&entry);
-        if filter::matches(&entry.attributes(), &dn, probe).expect("supported filter") {
+        let dn = entry.dn();
+        if filter::matches(entry.attributes(), dn, probe).expect("supported filter") {
             matched += 1;
         }
     }
@@ -109,9 +109,7 @@ fn baseline_search_costs() {
         assert_eq!(presence_hits, size + 3, "domain, both ous and every user");
         assert_eq!(substring_hits, size, "every cn starts with user");
 
-        println!(
-            "{size:>7} {eq:>12.3} {pres:>12.3} {sub:>12.3} {walk:>12.3}"
-        );
+        println!("{size:>7} {eq:>12.3} {pres:>12.3} {sub:>12.3} {walk:>12.3}");
     }
 }
 
@@ -132,14 +130,21 @@ fn baseline_memory_per_entry() {
         user_password: Some("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_string()),
         ..User::default()
     };
-    let attributes = user.attributes();
+    let attributes =
+        rust_rest_ldap::mapping::gorestldap::user_entry(&user, "dc=example,dc=com", "users")
+            .attributes()
+            .clone();
 
     let values: usize = attributes
         .values()
         .iter()
         .map(|attribute| {
             attribute.name.len()
-                + attribute.values.iter().map(|value| value.len() + 24).sum::<usize>()
+                + attribute
+                    .values
+                    .iter()
+                    .map(|value| value.len() + 24)
+                    .sum::<usize>()
         })
         .sum();
 
@@ -147,5 +152,8 @@ fn baseline_memory_per_entry() {
     println!("attributes: {}", attributes.values().len());
     println!("values+names bytes (approx): {values}");
     println!("struct bytes: {}", std::mem::size_of::<User>());
-    println!("arc per entry overhead: {}", std::mem::size_of::<String>() * 2);
+    println!(
+        "arc per entry overhead: {}",
+        std::mem::size_of::<String>() * 2
+    );
 }

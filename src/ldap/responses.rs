@@ -42,7 +42,7 @@ pub fn search_result_entry(
         .iter()
         .map(|attribute| {
             PartialAttribute::new(
-                AttributeDescription::from(attribute.name),
+                AttributeDescription::from(attribute.name.clone()),
                 SetOf::from_vec(
                     attribute
                         .values
@@ -194,20 +194,11 @@ mod tests {
     #[test]
     fn search_entry_carries_every_attribute_value() {
         let attributes = vec![
-            Attribute {
-                name: "cn",
-                values: vec!["admin".to_string()],
-                operational: false,
-                case_sensitive: false,
-                sensitive: false,
-            },
-            Attribute {
-                name: "memberOf",
-                values: vec!["group_a".to_string(), "group_b".to_string()],
-                operational: false,
-                case_sensitive: false,
-                sensitive: false,
-            },
+            Attribute::new("cn", vec!["admin".to_string()]),
+            Attribute::new(
+                "memberOf",
+                vec!["group_a".to_string(), "group_b".to_string()],
+            ),
         ];
 
         let message = search_result_entry(3, "cn=admin,ou=users,dc=example,dc=com", &attributes);

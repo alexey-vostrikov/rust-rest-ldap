@@ -47,9 +47,12 @@ bind:
 users_ou_name: users
 groups_ou_name: groups
 
+# TLS: set both files to enable StartTLS, and use_tls to accept LDAPS on this
+# listener from the first byte. A configured path that cannot be read is a startup
+# error, so leaving these commented out means "no TLS" and nothing else.
 use_tls: false
-server_cert: server.crt
-server_key: server.key
+#server_cert: server.crt
+#server_key: server.key
 
 http_listen_addr: localhost:8080
 
