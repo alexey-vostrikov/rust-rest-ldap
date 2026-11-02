@@ -148,6 +148,55 @@ impl AttributeType {
     pub fn primary_name(&self) -> &str {
         self.names.first().map(String::as_str).unwrap_or(&self.oid)
     }
+
+    /// The definition in RFC 4512 syntax, as `attributeTypes` publishes it.
+    ///
+    /// Written back from the parsed form rather than stored verbatim: a client reading
+    /// this gets exactly what the server enforces, which is the point of publishing it.
+    /// The order of the keywords follows the ABNF, so the output can be re-parsed by
+    /// this server and by OpenLDAP.
+    pub fn definition(&self) -> String {
+        let mut parts = vec![format!("( {}", self.oid)];
+
+        if !self.names.is_empty() {
+            if self.names.len() == 1 {
+                parts.push(format!("NAME '{}'", self.names[0]));
+            } else {
+                let names: Vec<String> =
+                    self.names.iter().map(|name| format!("'{name}'")).collect();
+                parts.push(format!("NAME ( {} )", names.join(" ")));
+            }
+        }
+        if let Some(sup) = &self.sup {
+            parts.push(format!("SUP {sup}"));
+        }
+        if let Some(equality) = &self.equality {
+            parts.push(format!("EQUALITY {equality}"));
+        }
+        if let Some(ordering) = &self.ordering {
+            parts.push(format!("ORDERING {ordering}"));
+        }
+        if let Some(substr) = &self.substr {
+            parts.push(format!("SUBSTR {substr}"));
+        }
+        if let Some(oid) = &self.syntax_oid {
+            parts.push(format!("SYNTAX {oid}"));
+        }
+        if self.single_value {
+            parts.push("SINGLE-VALUE".to_string());
+        }
+        if self.operational {
+            // `USAGE` is how a definition says "operational"; the specific usage is not
+            // kept, and `directoryOperation` is what every one of ours is.
+            parts.push("USAGE directoryOperation".to_string());
+        }
+        if self.no_user_modification {
+            parts.push("NO-USER-MODIFICATION".to_string());
+        }
+        parts.push(")".to_string());
+
+        parts.join(" ")
+    }
 }
 
 /// Kind of an object class.
@@ -172,6 +221,54 @@ pub struct ObjectClass {
 impl ObjectClass {
     pub fn primary_name(&self) -> &str {
         self.names.first().map(String::as_str).unwrap_or(&self.oid)
+    }
+
+    /// The definition in RFC 4512 syntax, as `objectClasses` publishes it.
+    pub fn definition(&self) -> String {
+        let mut parts = vec![format!("( {}", self.oid)];
+
+        if !self.names.is_empty() {
+            if self.names.len() == 1 {
+                parts.push(format!("NAME '{}'", self.names[0]));
+            } else {
+                let names: Vec<String> =
+                    self.names.iter().map(|name| format!("'{name}'")).collect();
+                parts.push(format!("NAME ( {} )", names.join(" ")));
+            }
+        }
+        if !self.sup.is_empty() {
+            if self.sup.len() == 1 {
+                parts.push(format!("SUP {}", self.sup[0]));
+            } else {
+                parts.push(format!("SUP ( {} )", self.sup.join(" $ ")));
+            }
+        }
+        parts.push(
+            match self.kind {
+                ClassKind::Abstract => "ABSTRACT",
+                ClassKind::Structural => "STRUCTURAL",
+                ClassKind::Auxiliary => "AUXILIARY",
+            }
+            .to_string(),
+        );
+
+        if !self.must.is_empty() {
+            if self.must.len() == 1 {
+                parts.push(format!("MUST {}", self.must[0]));
+            } else {
+                parts.push(format!("MUST ( {} )", self.must.join(" $ ")));
+            }
+        }
+        if !self.may.is_empty() {
+            if self.may.len() == 1 {
+                parts.push(format!("MAY {}", self.may[0]));
+            } else {
+                parts.push(format!("MAY ( {} )", self.may.join(" $ ")));
+            }
+        }
+        parts.push(")".to_string());
+
+        parts.join(" ")
     }
 }
 
@@ -266,6 +363,37 @@ impl Schema {
             self.classes.insert(key, class.clone());
         }
         Ok(())
+    }
+
+    /// Every attribute type, once, in a stable order.
+    ///
+    /// The map holds one entry per name and per OID, so the same definition appears
+    /// several times; publishing it several times would confuse any client that counts.
+    pub fn attribute_types(&self) -> Vec<&AttributeType> {
+        let mut seen = BTreeSet::new();
+        let mut types: Vec<&AttributeType> = Vec::new();
+
+        for attribute in self.attributes.values() {
+            if seen.insert(attribute.oid.clone()) {
+                types.push(attribute);
+            }
+        }
+        types.sort_by(|left, right| left.oid.cmp(&right.oid));
+        types
+    }
+
+    /// Every object class, once, in a stable order.
+    pub fn object_classes(&self) -> Vec<&ObjectClass> {
+        let mut seen = BTreeSet::new();
+        let mut classes: Vec<&ObjectClass> = Vec::new();
+
+        for class in self.classes.values() {
+            if seen.insert(class.oid.clone()) {
+                classes.push(class);
+            }
+        }
+        classes.sort_by(|left, right| left.oid.cmp(&right.oid));
+        classes
     }
 
     pub fn attribute(&self, name: &str) -> Option<&AttributeType> {
@@ -932,8 +1060,10 @@ attributetype ( 2.5.4.31 NAME 'member' SUP distinguishedName )
 # contract, so the syntax here is text rather than distinguishedName.
 attributetype ( 1.2.840.113556.1.2.102 NAME 'memberOf' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
 attributetype ( 2.5.4.45 NAME ( 'x500UniqueIdentifier' ) SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
-attributetype ( 1.3.6.1.1.16.4 NAME 'entryUUID' EQUALITY uuidMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE NO-USER-MODIFICATION )
-attributetype ( 1.3.6.1.1.16.1 NAME 'entryCSN' SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE NO-USER-MODIFICATION )
+attributetype ( 1.3.6.1.1.16.4 NAME 'entryUUID' EQUALITY uuidMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )
+# entryCSN and entryUUID are operational in OpenLDAP as well; without USAGE the
+# published definition would disagree with what the server does to the attribute.
+attributetype ( 1.3.6.1.1.16.1 NAME 'entryCSN' SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )
 attributetype ( 2.5.18.1 NAME 'createTimestamp' EQUALITY generalizedTimeMatch ORDERING generalizedTimeOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.24 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )
 attributetype ( 2.5.18.2 NAME 'modifyTimestamp' EQUALITY generalizedTimeMatch ORDERING generalizedTimeOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.24 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )
 attributetype ( 2.5.18.3 NAME 'creatorsName' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )

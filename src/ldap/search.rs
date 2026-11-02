@@ -43,6 +43,12 @@ pub fn handle_search(
         return search_root_dse(message_id, request, directory.base_dn());
     }
 
+    // The subschema subentry does not live under the naming context; a client addresses
+    // it by its own name (RFC 4512 §4.2).
+    if super::schema_entry::is_schema_dn(&base_object) {
+        return super::schema_entry::search(message_id, request, &security.schema, &base_object);
+    }
+
     let mut page = Page::default();
     let mut has_paged_control = false;
     for control in controls.into_iter().flatten() {
@@ -243,7 +249,7 @@ fn parse_cookie(cookie: &[u8]) -> Result<usize, String> {
         })
 }
 
-fn scope_of(request: &SearchRequest) -> crate::directory::Scope {
+pub fn scope_of(request: &SearchRequest) -> crate::directory::Scope {
     use crate::directory::Scope;
     use rasn_ldap::SearchRequestScope;
 
@@ -280,7 +286,13 @@ fn search_root_dse(
             "supportedControl",
             PAGED_RESULTS_OID,
         ))
-        .push(crate::model::Attribute::single("namingContexts", base_dn));
+        .push(crate::model::Attribute::single("namingContexts", base_dn))
+        // Where a client goes to read the schema; RFC 4512 requires the root DSE to
+        // name it, otherwise the entry is unreachable by discovery.
+        .push(crate::model::Attribute::single(
+            "subschemaSubentry",
+            super::schema_entry::PRIMARY_DN,
+        ));
 
     let selection: Vec<String> = request
         .attributes
@@ -451,7 +463,10 @@ mod tests {
                 "vendorVersion",
                 "supportedLDAPVersion",
                 "supportedControl",
-                "namingContexts"
+                "namingContexts",
+                // RFC 4512 requires the root DSE to name the subschema subentry, or a
+                // client cannot discover that this server publishes a schema at all.
+                "subschemaSubentry",
             ]
         );
         assert_eq!(result_code(&messages), ResultCode::Success);
