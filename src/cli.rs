@@ -48,11 +48,22 @@ pub struct Cli {
     #[arg(long = "export-ldif", value_name = "PATH", conflicts_with = "listen")]
     pub export_ldif: Option<PathBuf>,
 
+    /// Write the directory as YAML to PATH and exit ('-' for stdout)
+    ///
+    /// The same entries as `--export-ldif`, in a shape meant to be read and diffed: one
+    /// value per line, Cyrillic as text rather than base64. LDIF is still the format to
+    /// hand to ldapadd; this one is for people and for review.
+    #[arg(long = "export-yaml", value_name = "PATH", conflicts_with_all = ["export_ldif", "listen"])]
+    pub export_yaml: Option<PathBuf>,
+
     /// Include operational attributes (entryUUID, timestamps, entryCSN) in the export
     ///
     /// Off by default: on import the target directory issues its own, and two servers
     /// would then disagree about which value wins.
-    #[arg(long = "export-operational", requires = "export_ldif")]
+    // Meaningful only together with an export; checked in `main`, where the message can
+    // say that in the operator's language. clap's own conflict rules cannot express
+    // "requires one of two flags" in a readable way.
+    #[arg(long = "export-operational")]
     pub export_operational: bool,
 }
 
@@ -67,6 +78,7 @@ impl From<Cli> for config::Args {
             log_path: cli.log,
             debug: cli.debug,
             export_ldif: cli.export_ldif,
+            export_yaml: cli.export_yaml,
             export_operational: cli.export_operational,
         }
     }

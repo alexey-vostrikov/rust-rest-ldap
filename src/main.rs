@@ -10,6 +10,7 @@ use rust_rest_ldap::{cli, config, i18n, security::Security};
 async fn main() {
     let args: config::Args = cli::Cli::parse().into();
     let export = args.export_ldif.clone();
+    let export_yaml = args.export_yaml.clone();
     let export_operational = args.export_operational;
 
     // The language has to be known before the configuration parses, so that a typo in a
@@ -41,7 +42,8 @@ async fn main() {
     };
     // An export is a one-shot read of the backend, not a server: it must not bind a
     // port, and it must not rewrite data on its way out.
-    if let Some(path) = export {
+    let as_yaml = export.is_none() && export_yaml.is_some();
+    if let Some(path) = export.or(export_yaml) {
         let data = match backend.load().await {
             Ok(data) => data,
             Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
@@ -52,13 +54,25 @@ async fn main() {
             &config.groups_ou_name,
         );
 
-        let text = rust_rest_ldap::ldif::export(
-            directory.all(),
-            rust_rest_ldap::ldif::Options {
-                operational: export_operational,
-                ..Default::default()
-            },
-        );
+        // Both formats describe the same entries; only their shape differs, so the
+        // selection of operational attributes is one option for both.
+        let text = if as_yaml {
+            rust_rest_ldap::yaml_export::export(
+                directory.all(),
+                rust_rest_ldap::yaml_export::Options {
+                    operational: export_operational,
+                    ..Default::default()
+                },
+            )
+        } else {
+            rust_rest_ldap::ldif::export(
+                directory.all(),
+                rust_rest_ldap::ldif::Options {
+                    operational: export_operational,
+                    ..Default::default()
+                },
+            )
+        };
 
         if path.as_os_str() == "-" {
             print!("{text}");

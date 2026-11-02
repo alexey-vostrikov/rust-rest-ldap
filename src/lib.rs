@@ -32,3 +32,4 @@ pub mod schema;
 pub mod security;
 pub mod server;
 pub mod tls;
+pub mod yaml_export;
