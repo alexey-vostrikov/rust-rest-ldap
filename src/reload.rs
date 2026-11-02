@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, watch};
 use tokio::time::{Duration, MissedTickBehavior};
 
-use crate::backend::{Backend, BackendError};
+use crate::backend::{Backend, BackendError, EntryChange};
 use crate::config::Config;
 use crate::directory::Directory;
 use crate::index::IndexConfig;
@@ -71,6 +71,17 @@ impl Source {
     /// Number of successful reloads so far, for logging and tests.
     pub async fn generation(&self) -> u64 {
         *self.generation.read().await
+    }
+
+    /// Persists a change set, then rebuilds the snapshot from the store.
+    ///
+    /// Memory is never patched in place: the directory is derived from what the
+    /// backend returned, so a store that accepted the change and a snapshot that
+    /// shows it cannot drift apart. The cost is a full reload per write; that is the
+    /// price of a single source of truth until an incremental path is measured.
+    pub async fn apply(&self, changes: &[EntryChange]) -> Result<usize, BackendError> {
+        self.backend.apply(changes).await?;
+        self.reload().await
     }
 
     /// Reloads from the backend and swaps the snapshot.

@@ -4,3 +4,5 @@
 !Cargo.lock
 # release binary copied out of the build container for live checks
 /rust-rest-ldap
+# redb files seeded for live checks
+/build
