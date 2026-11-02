@@ -1,0 +1,362 @@
+//! Configuration: CLI flags, environment variables and the YAML file.
+//!
+//! Precedence (gorestldap had flags and file merged by docopt, so file values
+//! silently beat the environment; here the order is explicit and testable):
+//! CLI flag > environment variable > config file > built-in default.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Deserialize;
+use thiserror::Error;
+
+pub const DEFAULT_BACKEND: &str = "rest";
+pub const DEFAULT_BASE_DN: &str = "dc=example,dc=com";
+pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:389";
+pub const DEFAULT_UPDATE_INTERVAL: &str = "300s";
+pub const DEFAULT_USERS_OU_NAME: &str = "users";
+pub const DEFAULT_GROUPS_OU_NAME: &str = "groups";
+
+pub const ENV_CONFIG_PATH: &str = "CONFIG_PATH";
+pub const ENV_BACKEND: &str = "BACKEND";
+pub const ENV_BASE_DN: &str = "BASE_DN";
+pub const ENV_LISTEN_ADDR: &str = "LDAP_LISTEN_ADDR";
+pub const ENV_UPDATE_INTERVAL: &str = "UPDATE_INTERVAL";
+
+/// Values coming from command line flags.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Args {
+    pub config: Option<PathBuf>,
+    pub backend: Option<String>,
+    pub base_dn: Option<String>,
+    pub listen_addr: Option<String>,
+    pub interval: Option<String>,
+    pub log_path: Option<PathBuf>,
+    pub debug: bool,
+}
+
+/// Fully resolved server configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub backend: String,
+    pub base_dn: String,
+    pub listen_addr: String,
+    pub update_interval: Duration,
+    pub log_path: Option<PathBuf>,
+    pub debug: bool,
+    pub log_timestamp: bool,
+    pub log_caller: bool,
+    pub backends: BTreeMap<String, serde_yaml_ng::Value>,
+    pub respect_control_criticality: bool,
+    pub users_ou_name: String,
+    pub groups_ou_name: String,
+    pub use_tls: bool,
+    pub server_cert: Option<PathBuf>,
+    pub server_key: Option<PathBuf>,
+    pub http_listen_addr: Option<String>,
+    pub callback_auth_token: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("error reading config file '{path}': {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("error parsing config file '{path}': {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml_ng::Error,
+    },
+    #[error("error parsing update interval '{value}': {source}")]
+    Interval {
+        value: String,
+        #[source]
+        source: humantime::DurationError,
+    },
+    #[error("use_tls is enabled, but server_cert and server_key are not both set")]
+    MissingTlsMaterial,
+}
+
+/// Subset of the configuration that lives in the YAML file.
+#[derive(Debug, Default, Deserialize)]
+struct FileConfig {
+    #[serde(default)]
+    log_timestamp: bool,
+    #[serde(default)]
+    log_caller: bool,
+    #[serde(default)]
+    backends: BTreeMap<String, serde_yaml_ng::Value>,
+    #[serde(default = "default_respect_control_criticality")]
+    respect_control_criticality: bool,
+    users_ou_name: Option<String>,
+    groups_ou_name: Option<String>,
+    #[serde(default)]
+    use_tls: bool,
+    server_cert: Option<PathBuf>,
+    server_key: Option<PathBuf>,
+    http_listen_addr: Option<String>,
+    callback_auth_token: Option<String>,
+}
+
+fn default_respect_control_criticality() -> bool {
+    true
+}
+
+/// Reads the config file (when given) and resolves the whole configuration.
+pub fn load(args: Args) -> Result<Config, ConfigError> {
+    let explicit = args.config.clone();
+    let from_env = std::env::var_os(ENV_CONFIG_PATH).map(PathBuf::from);
+    let text = match explicit.or(from_env).as_deref() {
+        Some(path) => Some(read_file(path)?),
+        None => None,
+    };
+    resolve(args, text.as_deref(), |name| std::env::var(name).ok())
+}
+
+fn read_file(path: &Path) -> Result<String, ConfigError> {
+    std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Resolves the configuration from the three sources; the environment is passed
+/// as a closure so tests never touch the process environment.
+pub fn resolve(
+    args: Args,
+    file_text: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Config, ConfigError> {
+    let file: FileConfig = match file_text {
+        Some(text) => serde_yaml_ng::from_str(text).map_err(|source| ConfigError::Parse {
+            path: PathBuf::from("<config>"),
+            source,
+        })?,
+        None => FileConfig {
+            respect_control_criticality: default_respect_control_criticality(),
+            ..FileConfig::default()
+        },
+    };
+
+    let interval_text = pick(args.interval, env(ENV_UPDATE_INTERVAL), None)
+        .unwrap_or_else(|| DEFAULT_UPDATE_INTERVAL.to_string());
+    let update_interval =
+        humantime::parse_duration(&interval_text).map_err(|source| ConfigError::Interval {
+            value: interval_text.clone(),
+            source,
+        })?;
+
+    let users_ou_name = file
+        .users_ou_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_USERS_OU_NAME.to_string())
+        .trim()
+        .to_lowercase();
+    let groups_ou_name = file
+        .groups_ou_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_GROUPS_OU_NAME.to_string())
+        .trim()
+        .to_lowercase();
+
+    let config = Config {
+        backend: pick(args.backend, env(ENV_BACKEND), None)
+            .unwrap_or_else(|| DEFAULT_BACKEND.to_string()),
+        base_dn: super::dn::normalize(
+            &pick(args.base_dn, env(ENV_BASE_DN), None)
+                .unwrap_or_else(|| DEFAULT_BASE_DN.to_string()),
+        ),
+        listen_addr: pick(args.listen_addr, env(ENV_LISTEN_ADDR), None)
+            .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_string()),
+        update_interval,
+        log_path: args.log_path,
+        debug: args.debug,
+        log_timestamp: file.log_timestamp,
+        log_caller: file.log_caller,
+        backends: file.backends,
+        respect_control_criticality: file.respect_control_criticality,
+        users_ou_name,
+        groups_ou_name,
+        use_tls: file.use_tls,
+        server_cert: file.server_cert,
+        server_key: file.server_key,
+        http_listen_addr: file.http_listen_addr.filter(|addr| !addr.trim().is_empty()),
+        callback_auth_token: file.callback_auth_token,
+    };
+
+    if config.use_tls && (config.server_cert.is_none() || config.server_key.is_none()) {
+        return Err(ConfigError::MissingTlsMaterial);
+    }
+
+    Ok(config)
+}
+
+fn pick(cli: Option<String>, env: Option<String>, file: Option<String>) -> Option<String> {
+    [cli, env, file]
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn defaults_apply_without_any_source() {
+        let cfg = resolve(Args::default(), None, no_env).expect("defaults");
+
+        assert_eq!(cfg.backend, "rest");
+        assert_eq!(cfg.base_dn, "dc=example,dc=com");
+        assert_eq!(cfg.listen_addr, "0.0.0.0:389");
+        assert_eq!(cfg.update_interval, Duration::from_secs(300));
+        assert_eq!(cfg.users_ou_name, "users");
+        assert_eq!(cfg.groups_ou_name, "groups");
+        assert!(cfg.respect_control_criticality);
+        assert!(!cfg.use_tls);
+        assert_eq!(cfg.http_listen_addr, None);
+    }
+
+    #[test]
+    fn environment_beats_defaults() {
+        let env = env_of(&[
+            (ENV_BACKEND, "file"),
+            (ENV_LISTEN_ADDR, "127.0.0.1:1389"),
+            (ENV_UPDATE_INTERVAL, "45s"),
+        ]);
+
+        let cfg = resolve(Args::default(), None, env).expect("env config");
+
+        assert_eq!(cfg.backend, "file");
+        assert_eq!(cfg.listen_addr, "127.0.0.1:1389");
+        assert_eq!(cfg.update_interval, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn command_line_beats_environment() {
+        let args = Args {
+            backend: Some("null".to_string()),
+            listen_addr: Some("0.0.0.0:2389".to_string()),
+            ..Args::default()
+        };
+        let env = env_of(&[(ENV_BACKEND, "file"), (ENV_LISTEN_ADDR, "127.0.0.1:1389")]);
+
+        let cfg = resolve(args, None, env).expect("cli config");
+
+        assert_eq!(cfg.backend, "null");
+        assert_eq!(cfg.listen_addr, "0.0.0.0:2389");
+    }
+
+    #[test]
+    fn file_values_are_used_when_no_flag_or_variable_is_set() {
+        let text = "
+users_ou_name: People
+groups_ou_name: Teams
+respect_control_criticality: false
+http_listen_addr: localhost:8080
+callback_auth_token: secret
+use_tls: true
+server_cert: server.crt
+server_key: server.key
+backends:
+  file:
+    users_path: examples/file/users.json
+";
+
+        let cfg = resolve(Args::default(), Some(text), no_env).expect("file config");
+
+        assert_eq!(cfg.users_ou_name, "people");
+        assert_eq!(cfg.groups_ou_name, "teams");
+        assert!(!cfg.respect_control_criticality);
+        assert_eq!(cfg.http_listen_addr.as_deref(), Some("localhost:8080"));
+        assert_eq!(cfg.callback_auth_token.as_deref(), Some("secret"));
+        assert!(cfg.use_tls);
+        assert_eq!(cfg.server_cert.as_deref(), Some(Path::new("server.crt")));
+        assert!(cfg.backends.contains_key("file"));
+    }
+
+    #[test]
+    fn empty_environment_value_does_not_override_defaults() {
+        let env = env_of(&[(ENV_BACKEND, "   ")]);
+
+        let cfg = resolve(Args::default(), None, env).expect("env config");
+
+        assert_eq!(cfg.backend, "rest");
+    }
+
+    #[test]
+    fn base_dn_is_normalized() {
+        let args = Args {
+            base_dn: Some("DC=Test, dc=EXAMPLE,  dc=com".to_string()),
+            ..Args::default()
+        };
+
+        let cfg = resolve(args, None, no_env).expect("config");
+
+        assert_eq!(cfg.base_dn, "dc=test,dc=example,dc=com");
+    }
+
+    #[test]
+    fn invalid_interval_is_rejected_with_the_offending_value() {
+        let args = Args {
+            interval: Some("300 seconds later".to_string()),
+            ..Args::default()
+        };
+
+        let err = resolve(args, None, no_env).expect_err("must reject interval");
+
+        assert_eq!(
+            err.to_string(),
+            "error parsing update interval '300 seconds later': expected number at 12"
+        );
+    }
+
+    #[test]
+    fn tls_without_material_is_rejected() {
+        let text = "
+use_tls: true
+server_cert: server.crt
+";
+
+        let err = resolve(Args::default(), Some(text), no_env).expect_err("must reject tls config");
+
+        assert_eq!(
+            err.to_string(),
+            "use_tls is enabled, but server_cert and server_key are not both set"
+        );
+    }
+
+    #[test]
+    fn broken_config_file_is_rejected_with_path() {
+        let err = resolve(Args::default(), Some("backends: [unclosed"), no_env)
+            .expect_err("must reject broken yaml");
+
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "unexpected {err:?}"
+        );
+    }
+}

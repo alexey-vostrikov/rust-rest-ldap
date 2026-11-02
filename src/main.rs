@@ -1,3 +1,19 @@
+mod cli;
+mod config;
+mod dn;
+
+use clap::Parser;
+
 fn main() {
-    println!("rust-rest-ldap {}", env!("CARGO_PKG_VERSION"));
+    let args: config::Args = cli::Cli::parse().into();
+
+    let config = match config::load(args) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
+
+    println!("{config:#?}");
 }
