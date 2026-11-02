@@ -80,7 +80,11 @@ pub fn matches(
 
             match attributes.get(&name) {
                 Some(attribute) => Ok(attribute.values.iter().any(|value| {
-                    substring_matches(value, attribute.case_sensitive, &substrings.substrings)
+                    substring_matches(
+                        value,
+                        attribute.flags.case_sensitive,
+                        &substrings.substrings,
+                    )
                 })),
                 None => Ok(false),
             }
@@ -94,7 +98,7 @@ pub fn matches(
 }
 
 fn attribute_matches_equality(attribute: &Attribute, value: &str) -> bool {
-    if attribute.case_sensitive {
+    if attribute.flags.case_sensitive {
         return attribute.values.iter().any(|candidate| candidate == value);
     }
     let value = value.to_lowercase();
@@ -179,7 +183,7 @@ mod tests {
     const DN: &str = "cn=admin,ou=users,dc=example,dc=com";
 
     fn attributes() -> Attributes {
-        User {
+        let user = User {
             object_class: vec![
                 "top".to_string(),
                 "posixAccount".to_string(),
@@ -191,8 +195,11 @@ mod tests {
             user_password: Some("{SSHA}rapW2TNEFWp6HxD/nfwsjcBCD8Pi3Bvj".to_string()),
             uid_number: Some(1000),
             ..User::default()
-        }
-        .attributes()
+        };
+
+        crate::mapping::gorestldap::user_entry(&user, "dc=example,dc=com", "users")
+            .attributes()
+            .clone()
     }
 
     fn equality(name: &str, value: &str) -> Filter {

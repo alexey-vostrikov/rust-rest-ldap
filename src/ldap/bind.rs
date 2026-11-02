@@ -5,7 +5,7 @@ use rasn_ldap::{AuthenticationChoice, BindRequest, MessageId, ResultCode};
 use super::responses::bind_response;
 use super::session::{Identity, Session};
 use crate::acl::Requester;
-use crate::directory::{Directory, Entry};
+use crate::directory::Directory;
 use crate::dn;
 use crate::password::verify;
 use crate::security::Security;
@@ -77,9 +77,9 @@ pub fn handle_bind(
         );
     }
 
-    let user = match directory.find(&bind_dn) {
-        Some(Entry::User(user)) => user,
-        _ => {
+    let entry = match directory.find(&bind_dn) {
+        Some(entry) => entry,
+        None => {
             return bind_response(
                 message_id,
                 ResultCode::NoSuchObject,
@@ -88,8 +88,23 @@ pub fn handle_bind(
         }
     };
 
-    let stored_hash = match &user.user_password {
-        Some(hash) if !hash.is_empty() => hash,
+    // Only entries under the users organizational unit are accounts. gorestldap
+    // behaved the same way; here the rule is explicit instead of a side effect of
+    // the data shape, so a group or the domain entry never answers a bind.
+    if !bind_dn.ends_with(&format!(",{}", directory.ou_dn(directory.users_ou_name()))) {
+        return bind_response(
+            message_id,
+            ResultCode::NoSuchObject,
+            &format!("dn '{bind_dn}' not found"),
+        );
+    }
+
+    let stored_hash = match entry
+        .attributes()
+        .get("userPassword")
+        .and_then(|attribute| attribute.values.first())
+    {
+        Some(hash) if !hash.is_empty() => hash.clone(),
         _ => {
             return bind_response(
                 message_id,
@@ -99,8 +114,9 @@ pub fn handle_bind(
         }
     };
 
+    let is_admin = entry.is_admin();
     let rights = security.acl.rights(
-        &Requester::new(&bind_dn, user.ldap_admin),
+        &Requester::new(&bind_dn, is_admin),
         directory,
         &bind_dn,
         None,
@@ -113,9 +129,9 @@ pub fn handle_bind(
         );
     }
 
-    match verify(&password, stored_hash, &security.passwords) {
+    match verify(&password, &stored_hash, &security.passwords) {
         Ok(true) => {
-            session.set_identity(Identity::new(&bind_dn, user.ldap_admin));
+            session.set_identity(Identity::new(&bind_dn, is_admin));
             bind_response(message_id, ResultCode::Success, "")
         }
         Ok(false) => bind_response(message_id, ResultCode::InvalidCredentials, "wrong password"),

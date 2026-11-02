@@ -1,11 +1,14 @@
-//! Directory model: users, groups, OUs and the domain entry.
+//! The directory model: an entry is a DN plus an ordered list of attributes.
 //!
-//! gorestldap kept the entry shape in Go struct tags (`json` for the backend
-//! payload, `ldap:"operational"`, `ldap:"skip"`, `ldap:"case_sensitive_value"`)
-//! and read attributes back through reflection. Here the same information is a
-//! plain ordered attribute list built by each type, so attribute selection,
-//! filtering and comparison work on one representation and no reflection is
-//! involved.
+//! gorestldap kept the shape in Go struct tags (`json` for the backend payload,
+//! `ldap:"operational"`, `ldap:"skip"`, `ldap:"case_sensitive_value"`) and read
+//! attributes back through reflection. Here an entry is data: a DN and a list of
+//! attributes, so anything the backend can express can be stored and returned, and
+//! attribute selection, filtering and comparison work on one representation.
+//!
+//! [`User`] and [`Group`] remain as *parsing* shapes for the gorestldap JSON; they
+//! are not the directory model any more. Turning them into entries is the job of
+//! [`crate::mapping`].
 
 use serde::Deserialize;
 
@@ -15,53 +18,76 @@ pub const ATTR_ENTRY_DN: &str = "entryDN";
 pub const ATTR_HAS_SUBORDINATES: &str = "hasSubordinates";
 pub const ATTR_ENTRY_UUID: &str = "entryUUID";
 pub const ATTR_OBJECT_CLASS: &str = "objectClass";
+/// Server-internal flag: never projected, never filterable.
+pub const ATTR_LDAP_ADMIN: &str = "ldapAdmin";
 
-/// One attribute of an entry: description, values and matching behaviour.
+/// How an attribute behaves in projection and matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AttributeFlags {
+    /// Returned only when asked for explicitly or with `+`, never with `*`.
+    pub operational: bool,
+    /// Compared exactly instead of case-insensitively (passwords).
+    pub case_sensitive: bool,
+    /// Never returned by `*` or `+`: the client has to name it, and the ACL then
+    /// decides whether it may be read.
+    pub sensitive: bool,
+    /// Server-internal: never projected and never matched by a filter; reachable
+    /// only by the server's own code.
+    pub internal: bool,
+}
+
+/// One attribute of an entry: description, values and behaviour.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribute {
-    pub name: &'static str,
+    pub name: String,
     pub values: Vec<String>,
-    /// Operational attributes are returned only when asked for explicitly or
-    /// with `+`, never with `*`.
-    pub operational: bool,
-    /// Values are compared exactly instead of case-insensitively (passwords).
-    pub case_sensitive: bool,
-    /// Sensitive attributes are never returned by `*` or `+`: the client has to
-    /// name them, and the ACL then decides whether they may be read.
-    pub sensitive: bool,
+    pub flags: AttributeFlags,
 }
 
 impl Attribute {
     /// Attribute with explicit values.
-    pub fn new(name: &'static str, values: Vec<String>) -> Self {
+    pub fn new(name: impl Into<String>, values: Vec<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             values,
-            operational: false,
-            case_sensitive: false,
-            sensitive: false,
+            flags: AttributeFlags::default(),
         }
     }
 
     /// Single-valued attribute with a borrowed value.
-    pub fn single(name: &'static str, value: &str) -> Self {
+    pub fn single(name: impl Into<String>, value: &str) -> Self {
         Self::new(name, vec![value.to_string()])
     }
 
-    fn operational(mut self) -> Self {
-        self.operational = true;
+    #[must_use]
+    pub fn operational(mut self) -> Self {
+        self.flags.operational = true;
         self
     }
 
-    fn case_sensitive(mut self) -> Self {
-        self.case_sensitive = true;
+    #[must_use]
+    pub fn case_sensitive(mut self) -> Self {
+        self.flags.case_sensitive = true;
         self
     }
 
-    /// Marks the attribute so that `*` and `+` never include it.
-    fn sensitive(mut self) -> Self {
-        self.sensitive = true;
+    /// Keeps the attribute out of `*` and `+`; an explicit request still returns
+    /// it, so that the ACL can decide.
+    #[must_use]
+    pub fn sensitive(mut self) -> Self {
+        self.flags.sensitive = true;
         self
+    }
+
+    /// Server-internal: invisible in every projection and in every filter.
+    #[must_use]
+    pub fn internal(mut self) -> Self {
+        self.flags.internal = true;
+        self
+    }
+
+    pub fn is_visible(&self) -> bool {
+        !self.flags.internal
     }
 }
 
@@ -76,8 +102,9 @@ impl Attributes {
         Self::default()
     }
 
-    /// Appends an attribute; empty value lists are dropped, so an attribute
-    /// that the backend left empty is absent from the entry.
+    /// Appends an attribute; empty value lists are dropped, so an attribute that
+    /// the backend left empty is absent from the entry.
+    #[must_use]
     pub fn push(mut self, attribute: Attribute) -> Self {
         if !attribute.values.is_empty() {
             self.inner.push(attribute);
@@ -90,10 +117,30 @@ impl Attributes {
     }
 
     /// Case-insensitive lookup by attribute description.
+    ///
+    /// Internal attributes are invisible here: filtering, projection and selection
+    /// all go through this method, so none of them can reach a server-only flag.
     pub fn get(&self, name: &str) -> Option<&Attribute> {
         self.inner
             .iter()
+            .find(|attribute| attribute.is_visible() && attribute.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Lookup that also sees internal attributes; for the server's own code.
+    pub fn internal(&self, name: &str) -> Option<&Attribute> {
+        self.inner
+            .iter()
             .find(|attribute| attribute.name.eq_ignore_ascii_case(name))
+    }
+
+    /// True when the internal attribute holds a truthy value.
+    pub fn internal_flag(&self, name: &str) -> bool {
+        self.internal(name).is_some_and(|attribute| {
+            attribute
+                .values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case("true"))
+        })
     }
 
     /// Applies an LDAP attribute selection list (`*`, `+`, `entryDN`, explicit
@@ -102,7 +149,7 @@ impl Attributes {
     /// An empty selection means `*`, as in RFC 4511 and in gorestldap.
     pub fn select(&self, dn: &str, selection: &[String]) -> Vec<Attribute> {
         let mut out: Vec<Attribute> = Vec::new();
-        let mut seen: Vec<&'static str> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
 
         let entry_dn = || Attribute::single(ATTR_ENTRY_DN, dn).operational();
 
@@ -117,7 +164,10 @@ impl Attributes {
                 "+" => {
                     push_unique(entry_dn(), &mut out, &mut seen);
                     for attribute in &self.inner {
-                        if attribute.operational && !attribute.sensitive {
+                        if attribute.flags.operational
+                            && !attribute.flags.sensitive
+                            && attribute.is_visible()
+                        {
                             push_unique(attribute.clone(), &mut out, &mut seen);
                         }
                     }
@@ -136,10 +186,11 @@ impl Attributes {
         out
     }
 
-    /// Regular (non-operational, non-sensitive) attributes, in insertion order.
-    fn push_regular(&self, out: &mut Vec<Attribute>, seen: &mut Vec<&'static str>) {
+    /// Regular (non-operational, non-sensitive, non-internal) attributes.
+    fn push_regular(&self, out: &mut Vec<Attribute>, seen: &mut Vec<String>) {
         for attribute in &self.inner {
-            if !attribute.operational && !attribute.sensitive {
+            if !attribute.flags.operational && !attribute.flags.sensitive && attribute.is_visible()
+            {
                 push_unique(attribute.clone(), out, seen);
             }
         }
@@ -147,84 +198,62 @@ impl Attributes {
 }
 
 /// Appends the attribute unless one with the same description is already there.
-fn push_unique(attribute: Attribute, out: &mut Vec<Attribute>, seen: &mut Vec<&'static str>) {
+fn push_unique(attribute: Attribute, out: &mut Vec<Attribute>, seen: &mut Vec<String>) {
     if seen
         .iter()
-        .any(|name| name.eq_ignore_ascii_case(attribute.name))
+        .any(|name| name.eq_ignore_ascii_case(&attribute.name))
     {
         return;
     }
-    seen.push(attribute.name);
+    seen.push(attribute.name.clone());
     out.push(attribute);
 }
 
-/// Domain entry: the naming context itself.
+/// One directory entry: its DN and its attributes.
+///
+/// The DN is stored normalized (lowercase, no spaces after commas), because every
+/// lookup, scope test and comparison works on that form.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Domain {
-    pub dc: String,
-    pub entry_uuid: Option<String>,
-    pub has_subordinates: Option<String>,
-    pub object_class: Vec<String>,
+pub struct Entry {
+    dn: String,
+    attributes: Attributes,
 }
 
-impl Domain {
-    pub fn new(dc: &str, entry_uuid: Option<String>) -> Self {
+impl Entry {
+    pub fn new(dn: impl Into<String>, attributes: Attributes) -> Self {
         Self {
-            dc: dc.to_string(),
-            entry_uuid,
-            has_subordinates: None,
-            object_class: vec!["top".to_string(), "domain".to_string()],
+            dn: dn.into(),
+            attributes,
         }
     }
 
-    pub fn attributes(&self) -> Attributes {
-        let mut attributes =
-            Attributes::new().push(Attribute::new(ATTR_OBJECT_CLASS, self.object_class.clone()));
-        if let Some(uuid) = &self.entry_uuid {
-            attributes = attributes.push(Attribute::single(ATTR_ENTRY_UUID, uuid).operational());
-        }
-        if let Some(has_subordinates) = &self.has_subordinates {
-            attributes = attributes
-                .push(Attribute::single(ATTR_HAS_SUBORDINATES, has_subordinates).operational());
-        }
-        attributes
-    }
-}
-
-/// Organizational unit (`ou=users`, `ou=groups`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrganizationalUnit {
-    pub ou: String,
-    pub entry_uuid: Option<String>,
-    pub has_subordinates: Option<String>,
-    pub object_class: Vec<String>,
-}
-
-impl OrganizationalUnit {
-    pub fn new(ou: &str, entry_uuid: Option<String>) -> Self {
-        Self {
-            ou: ou.to_string(),
-            entry_uuid,
-            has_subordinates: None,
-            object_class: vec!["top".to_string(), "organizationalUnit".to_string()],
-        }
+    pub fn dn(&self) -> &str {
+        &self.dn
     }
 
-    pub fn attributes(&self) -> Attributes {
-        let mut attributes =
-            Attributes::new().push(Attribute::new(ATTR_OBJECT_CLASS, self.object_class.clone()));
-        if let Some(uuid) = &self.entry_uuid {
-            attributes = attributes.push(Attribute::single(ATTR_ENTRY_UUID, uuid).operational());
-        }
-        if let Some(has_subordinates) = &self.has_subordinates {
-            attributes = attributes
-                .push(Attribute::single(ATTR_HAS_SUBORDINATES, has_subordinates).operational());
-        }
-        attributes
+    pub fn attributes(&self) -> &Attributes {
+        &self.attributes
+    }
+
+    pub fn into_attributes(self) -> Attributes {
+        self.attributes
+    }
+
+    /// True when the entry carries the server-internal admin flag.
+    pub fn is_admin(&self) -> bool {
+        self.attributes.internal_flag(ATTR_LDAP_ADMIN)
+    }
+
+    /// Object classes of the entry, as the schema (and `objectClass=*`) sees them.
+    pub fn object_classes(&self) -> &[String] {
+        self.attributes
+            .get(ATTR_OBJECT_CLASS)
+            .map(|attribute| attribute.values.as_slice())
+            .unwrap_or_default()
     }
 }
 
-/// User entry loaded from the backend.
+/// User as it arrives from a gorestldap backend (JSON shape, not the model).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct User {
@@ -261,62 +290,7 @@ pub struct User {
     pub member_of: Vec<String>,
 }
 
-impl User {
-    pub fn attributes(&self) -> Attributes {
-        let mut attributes = Attributes::new()
-            .push(Attribute::new(ATTR_OBJECT_CLASS, self.object_class.clone()))
-            .push(Attribute::single("cn", &self.cn));
-
-        if let Some(uid) = &self.uid {
-            attributes = attributes.push(Attribute::single("uid", uid));
-        }
-        if let Some(password) = &self.user_password {
-            attributes = attributes.push(
-                Attribute::single("userPassword", password)
-                    .case_sensitive()
-                    .sensitive(),
-            );
-        }
-        if let Some(value) = &self.display_name {
-            attributes = attributes.push(Attribute::single("displayName", value));
-        }
-        if let Some(value) = &self.given_name {
-            attributes = attributes.push(Attribute::single("givenName", value));
-        }
-        if let Some(value) = &self.sn {
-            attributes = attributes.push(Attribute::single("sn", value));
-        }
-        if let Some(value) = &self.mail {
-            attributes = attributes.push(Attribute::single("mail", value));
-        }
-        if let Some(value) = &self.home_directory {
-            attributes = attributes.push(Attribute::single("homeDirectory", value));
-        }
-        if let Some(value) = &self.login_shell {
-            attributes = attributes.push(Attribute::single("loginShell", value));
-        }
-        if let Some(value) = self.uid_number {
-            attributes = attributes.push(Attribute::single("uidNumber", &value.to_string()));
-        }
-        if let Some(value) = self.gid_number {
-            attributes = attributes.push(Attribute::single("gidNumber", &value.to_string()));
-        }
-        if !self.member_of.is_empty() {
-            attributes = attributes.push(Attribute::new("memberOf", self.member_of.clone()));
-        }
-        if let Some(uuid) = &self.entry_uuid {
-            attributes = attributes.push(Attribute::single(ATTR_ENTRY_UUID, uuid).operational());
-        }
-        if let Some(has_subordinates) = &self.has_subordinates {
-            attributes = attributes
-                .push(Attribute::single(ATTR_HAS_SUBORDINATES, has_subordinates).operational());
-        }
-
-        attributes
-    }
-}
-
-/// Group entry loaded from the backend.
+/// Group as it arrives from a gorestldap backend (JSON shape, not the model).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Group {
@@ -336,64 +310,30 @@ pub struct Group {
     pub member_uid: Vec<String>,
 }
 
-impl Group {
-    pub fn attributes(&self) -> Attributes {
-        let mut attributes = Attributes::new()
-            .push(Attribute::new(ATTR_OBJECT_CLASS, self.object_class.clone()))
-            .push(Attribute::single("cn", &self.cn));
-
-        if let Some(value) = self.gid_number {
-            attributes = attributes.push(Attribute::single("gidNumber", &value.to_string()));
-        }
-        if let Some(value) = &self.description {
-            attributes = attributes.push(Attribute::single("description", value));
-        }
-        if !self.member_uid.is_empty() {
-            attributes = attributes.push(Attribute::new("memberUid", self.member_uid.clone()));
-        }
-        if let Some(uuid) = &self.entry_uuid {
-            attributes = attributes.push(Attribute::single(ATTR_ENTRY_UUID, uuid).operational());
-        }
-        if let Some(has_subordinates) = &self.has_subordinates {
-            attributes = attributes
-                .push(Attribute::single(ATTR_HAS_SUBORDINATES, has_subordinates).operational());
-        }
-
-        attributes
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn user() -> User {
-        User {
-            ldap_admin: true,
-            entry_uuid: Some("8f0e4b6a".to_string()),
-            has_subordinates: Some("FALSE".to_string()),
-            object_class: vec![
-                "top".to_string(),
-                "posixAccount".to_string(),
-                "inetOrgPerson".to_string(),
-            ],
-            cn: "admin".to_string(),
-            uid_number: Some(1000),
-            user_password: Some("{SSHA}abc".to_string()),
-            gid_number: Some(1999),
-            uid: Some("admin".to_string()),
-            display_name: Some("Ivan Petrov".to_string()),
-            given_name: Some("Ivan".to_string()),
-            sn: Some("Petrov".to_string()),
-            mail: Some("i.petrov@example.com".to_string()),
-            home_directory: Some("/home/admin".to_string()),
-            login_shell: Some("/bin/bash".to_string()),
-            member_of: vec!["group_a".to_string()],
-        }
+    fn sample() -> Attributes {
+        Attributes::new()
+            .push(Attribute::new(
+                ATTR_OBJECT_CLASS,
+                vec!["top".to_string(), "inetOrgPerson".to_string()],
+            ))
+            .push(Attribute::single("cn", "admin"))
+            .push(Attribute::single("mail", "i.petrov@example.com"))
+            .push(
+                Attribute::single("userPassword", "{SSHA}abc")
+                    .case_sensitive()
+                    .sensitive(),
+            )
+            .push(Attribute::single(ATTR_ENTRY_UUID, "8f0e4b6a").operational())
+            .push(Attribute::single(ATTR_HAS_SUBORDINATES, "FALSE").operational())
+            .push(Attribute::single(ATTR_LDAP_ADMIN, "true").internal())
     }
 
     #[test]
-    fn parses_backend_payload_with_camel_case_keys() {
+    fn parses_user_payload_with_camel_case_keys() {
         let json = r#"{
             "ldapAdmin": true,
             "entryUUID": "8f0e4b6a",
@@ -435,197 +375,130 @@ mod tests {
     }
 
     #[test]
-    fn user_attributes_keep_ldap_names_and_skip_admin_flag() {
-        let attributes = user().attributes();
+    fn lookup_never_returns_an_internal_attribute() {
+        let attributes = sample();
 
-        assert_eq!(
-            attributes
-                .get("cn")
-                .map(|attribute| attribute.values.clone()),
-            Some(vec!["admin".to_string()])
-        );
-        assert_eq!(
-            attributes
-                .get("mail")
-                .map(|attribute| attribute.values.clone()),
-            Some(vec!["i.petrov@example.com".to_string()])
-        );
-        assert_eq!(
-            attributes
-                .get("objectClass")
-                .map(|attribute| attribute.values.len()),
-            Some(3)
-        );
         assert!(
-            attributes.get("ldapAdmin").is_none(),
-            "ldapAdmin must not leak into the directory"
+            attributes.get(ATTR_LDAP_ADMIN).is_none(),
+            "internal attributes must be invisible to filters and projection"
         );
+        assert!(attributes.internal(ATTR_LDAP_ADMIN).is_some());
     }
 
     #[test]
-    fn absent_optional_values_produce_no_attribute() {
-        let attributes = User {
-            cn: "minimal".to_string(),
-            ..User::default()
-        }
-        .attributes();
+    fn internal_flag_reads_a_truthy_value_only() {
+        assert!(sample().internal_flag(ATTR_LDAP_ADMIN));
 
-        assert!(attributes.get("mail").is_none());
-        assert!(attributes.get("uidNumber").is_none());
-        assert!(attributes.get("memberOf").is_none());
-        assert_eq!(
-            attributes.values().len(),
-            1,
-            "only objectClass and cn remain in an empty entry"
-        );
+        let false_flag =
+            Attributes::new().push(Attribute::single(ATTR_LDAP_ADMIN, "false").internal());
+        assert!(!false_flag.internal_flag(ATTR_LDAP_ADMIN));
+        assert!(!Attributes::new().internal_flag(ATTR_LDAP_ADMIN));
     }
 
     #[test]
-    fn password_is_marked_case_sensitive() {
-        let attributes = user().attributes();
+    fn password_is_case_sensitive_and_sensitive() {
+        let attributes = sample();
+        let password = attributes.get("userPassword").expect("password");
 
-        assert!(
-            attributes
-                .get("userPassword")
-                .expect("password attribute")
-                .case_sensitive
-        );
-        assert!(!attributes.get("cn").expect("cn attribute").case_sensitive);
+        assert!(password.flags.case_sensitive);
+        assert!(password.flags.sensitive);
     }
 
     #[test]
-    fn operational_attributes_are_flagged() {
-        let attributes = user().attributes();
-
-        assert!(attributes.get(ATTR_ENTRY_UUID).expect("uuid").operational);
-        assert!(
-            attributes
-                .get(ATTR_HAS_SUBORDINATES)
-                .expect("subordinates")
-                .operational
-        );
-        assert!(
-            !attributes
-                .get("objectClass")
-                .expect("objectClass")
-                .operational
-        );
-    }
-
-    #[test]
-    fn selection_star_returns_regular_attributes_only() {
-        let attributes = user().attributes();
+    fn wildcard_excludes_operational_sensitive_and_internal() {
+        let attributes = sample();
         let selected = attributes.select("cn=admin,ou=users,dc=example,dc=com", &["*".to_string()]);
 
-        let names: Vec<&str> = selected.iter().map(|attribute| attribute.name).collect();
-        assert!(names.contains(&"cn"));
-        assert!(names.contains(&"objectClass"));
-        assert!(!names.contains(&ATTR_ENTRY_UUID));
-        assert!(!names.contains(&ATTR_ENTRY_DN));
+        let names: Vec<&str> = selected.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["objectClass", "cn", "mail"]);
     }
 
     #[test]
-    fn selection_plus_returns_entry_dn_and_operational_attributes() {
-        let attributes = user().attributes();
+    fn plus_returns_operational_but_not_sensitive_or_internal() {
+        let attributes = sample();
         let selected = attributes.select("cn=admin,ou=users,dc=example,dc=com", &["+".to_string()]);
 
-        let names: Vec<&str> = selected.iter().map(|attribute| attribute.name).collect();
+        let names: Vec<&str> = selected.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
             names,
             vec![ATTR_ENTRY_DN, ATTR_ENTRY_UUID, ATTR_HAS_SUBORDINATES]
         );
-        assert_eq!(
-            selected[0].values,
-            vec!["cn=admin,ou=users,dc=example,dc=com".to_string()]
-        );
     }
 
     #[test]
-    fn selection_of_explicit_names_is_case_insensitive_and_keeps_order() {
-        let attributes = user().attributes();
-        let selected = attributes.select(
-            "cn=admin,ou=users,dc=example,dc=com",
-            &[
-                "MAIL".to_string(),
-                "cn".to_string(),
-                "nosuchAttribute".to_string(),
-            ],
-        );
-
-        let names: Vec<&str> = selected.iter().map(|attribute| attribute.name).collect();
-        assert_eq!(names, vec!["mail", "cn"]);
-    }
-
-    #[test]
-    fn empty_selection_means_all_regular_attributes() {
-        let attributes = user().attributes();
-        let selected = attributes.select("cn=admin,ou=users,dc=example,dc=com", &[]);
-
-        assert_eq!(
-            selected.len(),
-            attributes.values().len() - 3,
-            "operational and sensitive attributes are excluded"
-        );
-        assert!(
-            selected
-                .iter()
-                .all(|attribute| attribute.name != "userPassword"),
-            "a wildcard must never return the password hash"
-        );
-    }
-
-    #[test]
-    fn explicit_selection_can_return_the_password_for_the_acl_to_decide() {
-        let attributes = user().attributes();
-
+    fn explicit_name_returns_a_sensitive_attribute_for_the_acl_to_judge() {
+        let attributes = sample();
         let selected = attributes.select(
             "cn=admin,ou=users,dc=example,dc=com",
             &["userPassword".to_string()],
         );
 
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].name, "userPassword");
+        assert!(selected[0].flags.sensitive);
+    }
+
+    #[test]
+    fn explicit_name_cannot_reach_an_internal_attribute() {
+        let attributes = sample();
+
         assert!(
-            selected[0].sensitive,
-            "the caller still needs to know the attribute is sensitive"
+            attributes
+                .select(
+                    "cn=admin,ou=users,dc=example,dc=com",
+                    &[ATTR_LDAP_ADMIN.to_string()]
+                )
+                .is_empty()
         );
     }
 
     #[test]
-    fn repeated_selection_does_not_duplicate_attributes() {
-        let attributes = user().attributes();
+    fn selection_is_case_insensitive_and_keeps_order() {
+        let attributes = sample();
+        let selected = attributes.select(
+            "cn=admin,ou=users,dc=example,dc=com",
+            &["MAIL".to_string(), "cn".to_string(), "nosuch".to_string()],
+        );
+
+        let names: Vec<&str> = selected.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["mail", "cn"]);
+    }
+
+    #[test]
+    fn repeated_selection_does_not_duplicate() {
+        let attributes = sample();
         let selected = attributes.select(
             "cn=admin,ou=users,dc=example,dc=com",
             &["cn".to_string(), "cn".to_string(), "*".to_string()],
         );
 
-        let cn_count = selected
-            .iter()
-            .filter(|attribute| attribute.name == "cn")
-            .count();
-        assert_eq!(cn_count, 1);
+        assert_eq!(selected.iter().filter(|a| a.name == "cn").count(), 1);
     }
 
     #[test]
-    fn domain_and_ou_expose_object_class_and_skip_naming_attribute() {
-        let domain = Domain::new("example", Some("uuid-d".to_string()));
-        let domain_attributes = domain.attributes();
-        assert_eq!(
-            domain_attributes
-                .get(ATTR_OBJECT_CLASS)
-                .map(|a| a.values.clone()),
-            Some(vec!["top".to_string(), "domain".to_string()])
-        );
-        assert!(domain_attributes.get("dc").is_none());
+    fn empty_value_list_drops_the_attribute() {
+        let attributes = Attributes::new()
+            .push(Attribute::new("mail", vec![]))
+            .push(Attribute::single("cn", "x"));
 
-        let ou = OrganizationalUnit::new("users", Some("uuid-o".to_string()));
-        let ou_attributes = ou.attributes();
-        assert_eq!(
-            ou_attributes
-                .get(ATTR_OBJECT_CLASS)
-                .map(|a| a.values.clone()),
-            Some(vec!["top".to_string(), "organizationalUnit".to_string()])
-        );
-        assert!(ou_attributes.get("ou").is_none());
+        assert!(attributes.get("mail").is_none());
+        assert_eq!(attributes.values().len(), 1);
+    }
+
+    #[test]
+    fn entry_exposes_dn_classes_and_admin_flag() {
+        let entry = Entry::new("cn=admin,ou=users,dc=example,dc=com", sample());
+
+        assert_eq!(entry.dn(), "cn=admin,ou=users,dc=example,dc=com");
+        assert_eq!(entry.object_classes(), ["top", "inetOrgPerson"]);
+        assert!(entry.is_admin());
+        assert!(entry.attributes().get("cn").is_some());
+    }
+
+    #[test]
+    fn entry_without_classes_returns_an_empty_slice() {
+        let entry = Entry::new("dc=example,dc=com", Attributes::new());
+
+        assert!(entry.object_classes().is_empty());
+        assert!(!entry.is_admin());
     }
 }
