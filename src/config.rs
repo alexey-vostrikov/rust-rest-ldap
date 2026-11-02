@@ -188,6 +188,15 @@ struct FileConfig {
     log_timestamp: bool,
     #[serde(default)]
     log_caller: bool,
+    /// Which backend to serve from, on which address, and for which naming context.
+    ///
+    /// The command line and the environment come first; these are the third source, so a
+    /// unit file need not repeat flag by flag what the configuration already says. A flag
+    /// still wins, because a one-off run against another backend must not require editing
+    /// a file.
+    backend: Option<String>,
+    base_dn: Option<String>,
+    listen_addr: Option<String>,
     #[serde(default)]
     backends: BTreeMap<String, serde_json::Value>,
     #[serde(default = "default_respect_control_criticality")]
@@ -344,13 +353,13 @@ pub fn resolve(
         .to_lowercase();
 
     let config = Config {
-        backend: pick(args.backend, env(ENV_BACKEND), None)
+        backend: pick(args.backend, env(ENV_BACKEND), file.backend)
             .unwrap_or_else(|| DEFAULT_BACKEND.to_string()),
         base_dn: super::dn::normalize(
-            &pick(args.base_dn, env(ENV_BASE_DN), None)
+            &pick(args.base_dn, env(ENV_BASE_DN), file.base_dn)
                 .unwrap_or_else(|| DEFAULT_BASE_DN.to_string()),
         ),
-        listen_addr: pick(args.listen_addr, env(ENV_LISTEN_ADDR), None)
+        listen_addr: pick(args.listen_addr, env(ENV_LISTEN_ADDR), file.listen_addr)
             .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_string()),
         update_interval,
         log_path: args.log_path,
@@ -597,6 +606,52 @@ backends:
         let cfg = resolve(Args::default(), None, env).expect("env config");
 
         assert_eq!(cfg.backend, "rest");
+    }
+
+    #[test]
+    fn the_backend_can_come_from_the_file_and_the_command_line_wins() {
+        // The unit file runs the binary with no flags at all: what is served has to be
+        // readable from the configuration. A flag still overrides it, because a one-off
+        // run against another backend must not require editing a file.
+        let text = "
+backend: redb
+backends:
+  redb:
+    path: /var/lib/rust-rest-ldap/directory.redb
+";
+
+        let cfg = resolve(Args::default(), Some(text), no_env).expect("file config");
+        assert_eq!(cfg.backend, "redb");
+
+        let args = Args {
+            backend: Some("null".to_string()),
+            ..Args::default()
+        };
+        let cfg = resolve(args, Some(text), no_env).expect("cli config");
+        assert_eq!(cfg.backend, "null");
+    }
+
+    #[test]
+    fn the_naming_context_and_the_address_can_come_from_the_file() {
+        // Without this a unit file has to carry `-B` and `-L`, which means the same fact
+        // lives in two places and drifts: the address is edited in the configuration and
+        // the service keeps listening where the flag says.
+        let text = "
+base_dn: DC=Test, DC=Example, DC=Com
+listen_addr: 127.0.0.1:1389
+";
+
+        let cfg = resolve(Args::default(), Some(text), no_env).expect("file config");
+        assert_eq!(cfg.base_dn, "dc=test,dc=example,dc=com");
+        assert_eq!(cfg.listen_addr, "127.0.0.1:1389");
+
+        // The flag still decides, and it is normalized the same way.
+        let args = Args {
+            listen_addr: Some("127.0.0.1:2389".to_string()),
+            ..Args::default()
+        };
+        let cfg = resolve(args, Some(text), no_env).expect("cli config");
+        assert_eq!(cfg.listen_addr, "127.0.0.1:2389");
     }
 
     #[test]
