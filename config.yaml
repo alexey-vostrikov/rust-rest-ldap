@@ -14,6 +14,13 @@ backends:
 
 respect_control_criticality: true
 
+# Password hashes: weak schemes are refused unless listed one by one here.
+# Known weak schemes: ssha, sha, smd5, md5, ssha256, ssha384, ssha512, sha256,
+# sha384, sha512, crypt-md5, crypt-sha256, crypt-sha512, cleartext.
+passwords:
+  store_scheme: argon2id      # argon2id (default) or pbkdf2-sha512
+  allow_weak: [ssha]          # gorestldap data uses {SSHA}
+
 users_ou_name: users
 groups_ou_name: groups
 

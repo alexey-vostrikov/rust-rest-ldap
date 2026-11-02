@@ -5,7 +5,8 @@ use rasn_ldap::{AuthenticationChoice, BindRequest, MessageId, ResultCode};
 use super::responses::bind_response;
 use super::session::{Identity, Session};
 use crate::directory::{Directory, Entry};
-use crate::{dn, ssha};
+use crate::dn;
+use crate::password::{PasswordPolicy, verify};
 
 /// Handles a bind request and updates the session identity.
 ///
@@ -16,6 +17,7 @@ pub fn handle_bind(
     directory: &Directory,
     message_id: MessageId,
     request: &BindRequest,
+    passwords: &PasswordPolicy,
 ) -> rasn_ldap::LdapMessage {
     session.reset();
 
@@ -85,7 +87,7 @@ pub fn handle_bind(
         }
     };
 
-    match ssha::validate_password(&password, stored_hash) {
+    match verify(&password, stored_hash, passwords) {
         Ok(true) => {
             session.set_identity(Identity::new(&bind_dn, user.ldap_admin));
             bind_response(message_id, ResultCode::Success, "")
@@ -103,6 +105,15 @@ pub fn handle_bind(
 mod tests {
     use super::*;
     use crate::model::{Group, User};
+    use crate::password::{StoreScheme, hash as hash_password};
+
+    fn policy() -> PasswordPolicy {
+        PasswordPolicy::strict()
+    }
+
+    fn hash(value: &str) -> String {
+        hash_password(value, StoreScheme::Argon2id).expect("hash")
+    }
 
     const BASE: &str = "dc=example,dc=com";
     const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
@@ -113,13 +124,13 @@ mod tests {
             ldap_admin: true,
             cn: "admin".to_string(),
             uid: Some("admin".to_string()),
-            user_password: Some(ssha::hash_password("admin-secret", b"12345678")),
+            user_password: Some(hash("admin-secret")),
             ..User::default()
         };
         let alice = User {
             cn: "alice".to_string(),
             uid: Some("alice".to_string()),
-            user_password: Some(ssha::hash_password("alice-secret", b"12345678")),
+            user_password: Some(hash("alice-secret")),
             ..User::default()
         };
         let passwordless = User {
@@ -172,6 +183,7 @@ mod tests {
             &directory,
             1,
             &request(3, ADMIN_DN, b"admin-secret"),
+            &policy(),
         );
 
         assert_eq!(code(&response), ResultCode::Success);
@@ -191,6 +203,7 @@ mod tests {
             &directory,
             2,
             &request(3, ALICE_DN, b"alice-secret"),
+            &policy(),
         );
 
         assert_eq!(code(&response), ResultCode::Success);
@@ -209,6 +222,7 @@ mod tests {
             &directory,
             3,
             &request(3, ADMIN_DN, b"not-the-password"),
+            &policy(),
         );
 
         assert_eq!(code(&response), ResultCode::InvalidCredentials);
@@ -226,6 +240,7 @@ mod tests {
             &directory,
             4,
             &request(3, "cn=nobody,ou=users,dc=example,dc=com", b"x"),
+            &policy(),
         );
 
         assert_eq!(code(&response), ResultCode::NoSuchObject);
@@ -245,8 +260,15 @@ mod tests {
             &directory,
             5,
             &request(3, "cn=group_a,ou=groups,dc=example,dc=com", b"x"),
+            &policy(),
         );
-        let domain = handle_bind(&mut session, &directory, 6, &request(3, BASE, b"x"));
+        let domain = handle_bind(
+            &mut session,
+            &directory,
+            6,
+            &request(3, BASE, b"x"),
+            &policy(),
+        );
 
         assert_eq!(code(&group), ResultCode::NoSuchObject);
         assert_eq!(code(&domain), ResultCode::NoSuchObject);
@@ -262,6 +284,7 @@ mod tests {
             &directory,
             7,
             &request(3, "mail=admin@example.com,dc=example,dc=com", b"x"),
+            &policy(),
         );
 
         assert_eq!(code(&response), ResultCode::InvalidDnSyntax);
@@ -280,7 +303,7 @@ mod tests {
             )),
         );
 
-        let response = handle_bind(&mut session, &directory, 8, &sasl);
+        let response = handle_bind(&mut session, &directory, 8, &sasl, &policy());
 
         assert_eq!(code(&response), ResultCode::AuthMethodNotSupported);
         assert!(diagnostic(&response).contains("GSSAPI"));
@@ -296,6 +319,7 @@ mod tests {
             &directory,
             9,
             &request(2, ADMIN_DN, b"admin-secret"),
+            &policy(),
         );
 
         assert_eq!(code(&response), ResultCode::ProtocolError);
@@ -310,7 +334,13 @@ mod tests {
         let directory = directory();
         let mut session = Session::new();
 
-        let response = handle_bind(&mut session, &directory, 10, &request(3, "", b""));
+        let response = handle_bind(
+            &mut session,
+            &directory,
+            10,
+            &request(3, "", b""),
+            &policy(),
+        );
 
         assert_eq!(code(&response), ResultCode::Success);
         assert!(session.identity().is_none());
@@ -321,7 +351,13 @@ mod tests {
         let directory = directory();
         let mut session = Session::new();
 
-        let response = handle_bind(&mut session, &directory, 11, &request(3, "", b"secret"));
+        let response = handle_bind(
+            &mut session,
+            &directory,
+            11,
+            &request(3, "", b"secret"),
+            &policy(),
+        );
 
         assert_eq!(code(&response), ResultCode::UnwillingToPerform);
         assert_eq!(
@@ -340,6 +376,7 @@ mod tests {
             &directory,
             12,
             &request(3, "cn=nopassword,ou=users,dc=example,dc=com", b"x"),
+            &policy(),
         );
 
         assert_eq!(code(&response), ResultCode::InvalidCredentials);
@@ -355,6 +392,7 @@ mod tests {
             &directory,
             13,
             &request(3, ADMIN_DN, b"admin-secret"),
+            &policy(),
         );
         assert!(session.identity().is_some());
 
@@ -363,6 +401,7 @@ mod tests {
             &directory,
             14,
             &request(3, ADMIN_DN, b"wrong"),
+            &policy(),
         );
 
         assert!(session.identity().is_none());
@@ -378,6 +417,7 @@ mod tests {
             &directory,
             15,
             &request(3, "uid=alice,ou=users,dc=example,dc=com", b"alice-secret"),
+            &policy(),
         );
 
         assert_eq!(code(&response), ResultCode::Success);
@@ -397,6 +437,7 @@ mod tests {
             &directory,
             16,
             &request(3, "CN=Admin, OU=Users, DC=Example, DC=Com", b"admin-secret"),
+            &policy(),
         );
 
         assert_eq!(code(&response), ResultCode::Success);

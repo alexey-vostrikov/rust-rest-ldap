@@ -13,7 +13,7 @@
         ],
         "cn": "admin",
         "uidNumber": 1000,
-        "userPassword": "{SSHA}rapW2TNEFWp6HxD/nfwsjcBCD8Pi3Bvj",
+        "userPassword": "$argon2id$v=19$m=19456,t=2,p=1$KJlu8xYuhj0GvcgE3BCVPQ$ATNdpHo40aRAXA2hM2HXH0KneXVItc8VfCnOLj9+fq4",
         "gidNumber": 1999,
         "uid": "admin",
         "displayName": "Ivan Petrov",
