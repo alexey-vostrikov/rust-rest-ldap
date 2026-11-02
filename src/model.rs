@@ -29,7 +29,8 @@ pub struct Attribute {
 }
 
 impl Attribute {
-    fn new(name: &'static str, values: Vec<String>) -> Self {
+    /// Attribute with explicit values.
+    pub fn new(name: &'static str, values: Vec<String>) -> Self {
         Self {
             name,
             values,
@@ -38,7 +39,8 @@ impl Attribute {
         }
     }
 
-    fn single(name: &'static str, value: &str) -> Self {
+    /// Single-valued attribute with a borrowed value.
+    pub fn single(name: &'static str, value: &str) -> Self {
         Self::new(name, vec![value.to_string()])
     }
 

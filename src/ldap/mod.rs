@@ -2,8 +2,10 @@
 
 pub mod bind;
 pub mod codec;
+pub mod filter;
 pub mod paged;
 pub mod responses;
+pub mod search;
 pub mod session;
 
 use rasn_ldap::{LdapMessage, ProtocolOp, ResultCode};
@@ -27,8 +29,14 @@ pub enum Action {
 /// Operations this server does not implement answer with their own result
 /// envelope and `unwillingToPerform`, so a client sees a real LDAP error instead
 /// of a dropped connection.
-pub fn handle(session: &mut Session, directory: &Directory, message: LdapMessage) -> Action {
+pub fn handle(
+    session: &mut Session,
+    directory: &Directory,
+    respect_critical_controls: bool,
+    message: LdapMessage,
+) -> Action {
     let message_id = message.message_id;
+    let controls = message.controls.clone();
 
     match message.protocol_op {
         ProtocolOp::BindRequest(request) => Action::Reply(vec![bind::handle_bind(
@@ -39,14 +47,14 @@ pub fn handle(session: &mut Session, directory: &Directory, message: LdapMessage
             Action::Close
         }
         ProtocolOp::AbandonRequest(_) => Action::Silent,
-        ProtocolOp::SearchRequest(request) => Action::Reply(vec![responses::search_done(
+        ProtocolOp::SearchRequest(request) => Action::Reply(search::handle_search(
+            session,
+            directory,
             message_id,
-            ResultCode::UnwillingToPerform,
-            &format!(
-                "search on '{}' is not implemented yet",
-                request.base_object.0
-            ),
-        )]),
+            &request,
+            controls.as_ref(),
+            respect_critical_controls,
+        )),
         ProtocolOp::CompareRequest(_) => Action::Reply(vec![responses::compare_response(
             message_id,
             ResultCode::UnwillingToPerform,
@@ -148,7 +156,12 @@ mod tests {
         let directory = directory();
         let mut session = Session::new();
 
-        let action = handle(&mut session, &directory, bind_message(1, b"admin-secret"));
+        let action = handle(
+            &mut session,
+            &directory,
+            true,
+            bind_message(1, b"admin-secret"),
+        );
 
         assert_eq!(codes(&action), vec![ResultCode::Success]);
         assert!(session.is_admin());
@@ -158,11 +171,17 @@ mod tests {
     fn unbind_closes_the_connection_and_drops_the_identity() {
         let directory = directory();
         let mut session = Session::new();
-        handle(&mut session, &directory, bind_message(1, b"admin-secret"));
+        handle(
+            &mut session,
+            &directory,
+            true,
+            bind_message(1, b"admin-secret"),
+        );
 
         let action = handle(
             &mut session,
             &directory,
+            true,
             LdapMessage::new(2, ProtocolOp::UnbindRequest(UnbindRequest)),
         );
 
@@ -207,8 +226,51 @@ mod tests {
         );
 
         for message in [add, delete, modify_dn, compare] {
-            let action = handle(&mut session, &directory, message);
+            let action = handle(&mut session, &directory, true, message);
             assert_eq!(codes(&action), vec![ResultCode::UnwillingToPerform]);
+        }
+    }
+
+    #[test]
+    fn search_is_dispatched_to_the_search_handler() {
+        let directory = directory();
+        let mut session = Session::new();
+        handle(
+            &mut session,
+            &directory,
+            true,
+            bind_message(1, b"admin-secret"),
+        );
+
+        let search = LdapMessage::new(
+            2,
+            ProtocolOp::SearchRequest(rasn_ldap::SearchRequest::new(
+                LdapDn::from(BASE),
+                rasn_ldap::SearchRequestScope::WholeSubtree,
+                rasn_ldap::SearchRequestDerefAliases::NeverDerefAliases,
+                0,
+                0,
+                false,
+                rasn_ldap::Filter::Present(AttributeDescription::from("objectClass")),
+                vec![],
+            )),
+        );
+
+        let action = handle(&mut session, &directory, true, search);
+
+        match action {
+            Action::Reply(messages) => {
+                assert!(
+                    messages.len() > 1,
+                    "a subtree search must return entries, got {}",
+                    messages.len()
+                );
+                assert!(matches!(
+                    messages.last().expect("done").protocol_op,
+                    ProtocolOp::SearchResDone(_)
+                ));
+            }
+            other => panic!("unexpected action: {other:?}"),
         }
     }
 
@@ -227,6 +289,9 @@ mod tests {
             )),
         );
 
-        assert_eq!(handle(&mut session, &directory, response), Action::Close);
+        assert_eq!(
+            handle(&mut session, &directory, true, response),
+            Action::Close
+        );
     }
 }
