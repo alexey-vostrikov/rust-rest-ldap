@@ -16,6 +16,7 @@ use super::filter;
 use super::paged::{self, PAGED_RESULTS_OID, Page};
 use super::responses::{self, search_done_with_controls, search_result_entry};
 use super::session::Session;
+use super::sort;
 use crate::directory::Directory;
 use crate::model::{Attribute, Attributes};
 use crate::security::Security;
@@ -51,6 +52,9 @@ pub fn handle_search(
 
     let mut page = Page::default();
     let mut has_paged_control = false;
+    let mut sort_request: Option<sort::SortRequest> = None;
+    let mut sort_critical = false;
+    let mut virtual_list: Option<sort::VirtualList> = None;
     for control in controls.into_iter().flatten() {
         if control.control_type.as_ref() == PAGED_RESULTS_OID.as_bytes() {
             has_paged_control = true;
@@ -72,6 +76,49 @@ pub fn handle_search(
                         message_id,
                         ResultCode::ProtocolError,
                         "paged results control carries no value",
+                    )];
+                }
+            }
+        } else if control.control_type.as_ref() == sort::SORT_OID.as_bytes() {
+            sort_critical = control.criticality;
+            match control.control_value.as_ref() {
+                Some(value) => match sort::decode_sort(value.as_ref()) {
+                    Ok(request) => sort_request = Some(request),
+                    Err(err) => {
+                        // A sort the server cannot read must not become "unsorted but
+                        // successful": the client asked for an order.
+                        return vec![responses::search_done(
+                            message_id,
+                            ResultCode::ProtocolError,
+                            &format!("error decoding the sort control: {err}"),
+                        )];
+                    }
+                },
+                None => {
+                    return vec![responses::search_done(
+                        message_id,
+                        ResultCode::ProtocolError,
+                        "the sort control carries no value",
+                    )];
+                }
+            }
+        } else if control.control_type.as_ref() == sort::VLV_OID.as_bytes() {
+            match control.control_value.as_ref() {
+                Some(value) => match sort::decode_vlv(value.as_ref()) {
+                    Ok(list) => virtual_list = Some(list),
+                    Err(err) => {
+                        return vec![responses::search_done(
+                            message_id,
+                            ResultCode::ProtocolError,
+                            &format!("error decoding the VLV control: {err}"),
+                        )];
+                    }
+                },
+                None => {
+                    return vec![responses::search_done(
+                        message_id,
+                        ResultCode::ProtocolError,
+                        "the VLV control carries no value",
                     )];
                 }
             }
@@ -142,6 +189,62 @@ pub fn handle_search(
         matched.push((entry_dn, entry.attributes().clone()));
     }
 
+    // Sort before limits and paging: a client that asks for a sorted page means "the
+    // first twenty of the sorted list", not "the first twenty, sorted".
+    let mut sort_response: Option<sort::SortResponse> = None;
+    if let Some(request) = &sort_request {
+        match sort::check_rules(request) {
+            Ok(()) => {
+                matched.sort_by(|(left_dn, left), (right_dn, right)| {
+                    sort::compare_attributes(left_dn, left, right_dn, right, &request.keys)
+                });
+                sort_response = Some(sort::SortResponse::ok());
+            }
+            Err(err) => {
+                // A critical sort that cannot be honoured must refuse the search: the
+                // client said it cannot work with an unsorted answer, and returning one
+                // with a note in a control is exactly the silent wrong order it guarded
+                // against. A non-critical sort reports the failure and returns the
+                // entries as they came.
+                if sort_critical && security.respect_control_criticality {
+                    return vec![responses::search_done(
+                        message_id,
+                        ResultCode::InappropriateMatching,
+                        &format!("cannot apply the sort control: {err}"),
+                    )];
+                }
+
+                sort_response = Some(sort::SortResponse::failed(
+                    sort::SortResult::InappropriateMatching,
+                    request.keys.first().map(|key| key.attribute.as_str()),
+                ));
+            }
+        }
+    }
+
+    // VLV narrows the sorted list to a window; without a sort it has no meaning, which is
+    // why RFC 2891 pairs them and this server refuses the combination it cannot answer.
+    let mut vlv_response: Option<sort::VirtualListResponse> = None;
+    let mut window: Option<(usize, usize)> = None;
+    if let Some(list) = &virtual_list {
+        if sort_request.is_none() {
+            return vec![responses::search_done(
+                message_id,
+                ResultCode::UnwillingToPerform,
+                "the virtual list view control requires the sort control",
+            )];
+        }
+
+        let content_count = matched.len() as u32;
+        window = Some(list.window(matched.len()));
+        vlv_response = Some(sort::VirtualListResponse {
+            target_position: list.target_position(matched.len()),
+            content_count,
+            result: sort::SortResult::Success,
+            context: Vec::new(),
+        });
+    }
+
     // Client size limit: applied to the entries that matched, per RFC 4511.
     let size_limit = request.size_limit as usize;
     let size_limit_exceeded = size_limit > 0 && matched.len() > size_limit;
@@ -172,14 +275,22 @@ pub fn handle_search(
         )];
     }
 
-    let page_size = if has_paged_control && page.is_requested() {
-        page.size as usize
-    } else {
-        matched.len()
+    // A VLV window replaces the page boundaries: the client asked for a range of the
+    // sorted list, not for the next page of one. Paged results and VLV together would be
+    // two answers to the same question, so the window wins and the cookie is not used.
+    let (page_start, page_end) = match window {
+        Some((from, to)) => (from, to),
+        None => {
+            let page_size = if has_paged_control && page.is_requested() {
+                page.size as usize
+            } else {
+                matched.len()
+            };
+            (offset, (offset + page_size).min(matched.len()))
+        }
     };
-    let page_end = (offset + page_size).min(matched.len());
 
-    let mut messages: Vec<LdapMessage> = matched[offset..page_end]
+    let mut messages: Vec<LdapMessage> = matched[page_start..page_end]
         .iter()
         .map(|(dn, attributes)| {
             let visible: Vec<Attribute> = attributes
@@ -201,16 +312,35 @@ pub fn handle_search(
         })
         .collect();
 
-    let controls_out: Controls = if has_paged_control {
+    let mut controls_out: Controls = Vec::new();
+
+    // A sorted search without the sort response leaves the client guessing whether the
+    // order it sees is the order it asked for.
+    if let Some(response) = sort_response
+        .as_ref()
+        .filter(|_| sort_request.is_some() || sort_critical)
+    {
+        controls_out.push(responses::control(
+            sort::SORT_RESPONSE_OID,
+            false,
+            Some(&response.encode()),
+        ));
+    }
+    if let Some(response) = &vlv_response {
+        controls_out.push(responses::control(
+            sort::VLV_RESPONSE_OID,
+            false,
+            Some(&response.encode()),
+        ));
+    }
+    if has_paged_control && window.is_none() {
         let cookie = if page_end < matched.len() {
             page_end.to_string().into_bytes()
         } else {
             Vec::new()
         };
-        vec![responses::paged_results_control(&Page::new(0, cookie))]
-    } else {
-        Vec::new()
-    };
+        controls_out.push(responses::paged_results_control(&Page::new(0, cookie)));
+    }
 
     let code = if size_limit_exceeded {
         ResultCode::SizeLimitExceeded
