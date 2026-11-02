@@ -26,6 +26,18 @@ pub enum Kind {
     Pres,
     /// `(attribute=value)`.
     Eq,
+    /// `(attribute=*part*)` and its anchored forms.
+    ///
+    /// A trigram index: every value contributes the three-character windows of itself
+    /// between word boundaries, and a pattern contributes the windows of its literal parts.
+    /// A pattern whose parts are all shorter than three characters narrows nothing, because
+    /// there is no window to look up.
+    Sub,
+    /// `(attribute>=value)` and `(attribute<=value)`.
+    ///
+    /// The values of the attribute kept in order, each with the entries that have it, so a
+    /// bound is an ordered range rather than a scan.
+    Ord,
 }
 
 impl Kind {
@@ -33,6 +45,8 @@ impl Kind {
         match self {
             Kind::Pres => "pres",
             Kind::Eq => "eq",
+            Kind::Sub => "sub",
+            Kind::Ord => "ord",
         }
     }
 }
@@ -48,6 +62,24 @@ pub enum Query {
         attribute: Arc<str>,
         value: String,
     },
+    /// A substring pattern, split into the parts the filter gave it.
+    ///
+    /// The parts are kept apart rather than joined: an initial fragment can only match at the
+    /// start of a value and a final one only at the end, and the boundary is what makes the
+    /// index selective. Joined into one string they would match anywhere, which is still a
+    /// superset and therefore still correct - and much less useful.
+    Substring {
+        attribute: Arc<str>,
+        initial: Option<String>,
+        any: Vec<String>,
+        final_part: Option<String>,
+    },
+    /// `(attribute>=value)` or `(attribute<=value)`.
+    Range {
+        attribute: Arc<str>,
+        bound: RangeBound,
+        value: String,
+    },
     And(Vec<Query>),
     Or(Vec<Query>),
     /// Never narrows: the complement of an indexable part is usually everything.
@@ -56,9 +88,34 @@ pub enum Query {
     Unindexed,
 }
 
+/// How a value is ordered by the `ord` index.
+///
+/// Numbers sort as numbers and everything else as folded text, because that is what the
+/// filter's `>=` and `<=` compare: `10` is above `9` as a number and below it as text. An
+/// index that ordered `10` and `9` as text would exclude `10` from `(n>=9)` - a false
+/// negative, the one answer an index must never give.
+///
+/// The two kinds never mix inside one attribute's map: an attribute whose values are all
+/// integers gets `Num`, one with no integers gets `Text`, and a mixed attribute is left
+/// unordered so that queries over it fall back to the scan.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum OrderKey {
+    Num(i64),
+    Text(String),
+}
+
+/// Which side of a value a range query keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeBound {
+    /// `(attribute>=value)`, the bound included.
+    AtLeast,
+    /// `(attribute<=value)`, the bound included.
+    AtMost,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum IndexError {
-    #[error("unknown index kind '{0}', expected pres or eq")]
+    #[error("unknown index kind '{0}', expected pres, eq, sub or ord")]
     UnknownKind(String),
 }
 
@@ -103,6 +160,8 @@ fn parse_kind(name: &str) -> Result<Kind, IndexError> {
     match name.trim().to_ascii_lowercase().as_str() {
         "pres" => Ok(Kind::Pres),
         "eq" => Ok(Kind::Eq),
+        "sub" => Ok(Kind::Sub),
+        "ord" => Ok(Kind::Ord),
         other => Err(IndexError::UnknownKind(other.to_string())),
     }
 }
@@ -112,6 +171,14 @@ fn parse_kind(name: &str) -> Result<Kind, IndexError> {
 pub struct Index {
     presence: HashMap<Arc<str>, RoaringBitmap>,
     equality: HashMap<Arc<str>, HashMap<String, RoaringBitmap>>,
+    /// Trigram per attribute, with the entries whose value contains it.
+    substrings: HashMap<Arc<str>, HashMap<String, RoaringBitmap>>,
+    /// Value per attribute, in order, with the entries that hold it.
+    ordered: HashMap<Arc<str>, BTreeMap<OrderKey, RoaringBitmap>>,
+    /// Attributes whose values are all integers, which is what makes a numeric range exact.
+    ordered_numeric: BTreeSet<Arc<str>>,
+    /// Attributes with at least one integer value; the rest are pure text.
+    ordered_mixed: BTreeSet<Arc<str>>,
     /// Attributes whose values must be matched exactly rather than case-folded.
     case_sensitive: BTreeSet<Arc<str>>,
     default_kinds: BTreeSet<Kind>,
@@ -134,6 +201,10 @@ impl Index {
         let mut index = Self {
             presence: HashMap::new(),
             equality: HashMap::new(),
+            substrings: HashMap::new(),
+            ordered: HashMap::new(),
+            ordered_numeric: BTreeSet::new(),
+            ordered_mixed: BTreeSet::new(),
             case_sensitive: BTreeSet::new(),
             default_kinds,
             built: BTreeMap::new(),
@@ -143,7 +214,13 @@ impl Index {
             let id = position as u32;
 
             for attribute in entry.attributes().values() {
-                let name = Arc::clone(&attribute.name);
+                // Keys are lowercase because the filter lowercases attribute descriptions
+                // before building a query (RFC 4512 makes the name case-insensitive). Storing
+                // the name as written meant `uidNumber` and `objectClass` - that is, most of
+                // the attributes a directory actually has - were never found, and the index
+                // silently narrowed nothing while every test that only compared answers still
+                // passed.
+                let name: Arc<str> = crate::model::attribute_name(&attribute.name.to_lowercase());
                 if attribute.flags.case_sensitive {
                     index.case_sensitive.insert(Arc::clone(&name));
                 }
@@ -165,19 +242,82 @@ impl Index {
                         .insert(Kind::Pres);
                 }
 
-                if kinds.contains(&Kind::Eq) {
+                if kinds.contains(&Kind::Eq) || kinds.contains(&Kind::Ord) {
                     let case_sensitive = attribute.flags.case_sensitive;
                     for value in attribute.values.iter() {
                         let key = fold(value, case_sensitive);
+
+                        if kinds.contains(&Kind::Eq) {
+                            index
+                                .equality
+                                .entry(Arc::clone(&name))
+                                .or_default()
+                                .entry(key.clone())
+                                .or_default()
+                                .insert(id);
+                        }
+
+                        if kinds.contains(&Kind::Ord) {
+                            // The attribute's numeric-ness is decided by its values, so a
+                            // mixed one is remembered as such and left to the scan.
+                            match key.parse::<i64>() {
+                                Ok(number) => {
+                                    index
+                                        .ordered
+                                        .entry(Arc::clone(&name))
+                                        .or_default()
+                                        .entry(OrderKey::Num(number))
+                                        .or_default()
+                                        .insert(id);
+                                    index.ordered_numeric.insert(Arc::clone(&name));
+                                }
+                                Err(_) => {
+                                    index
+                                        .ordered
+                                        .entry(Arc::clone(&name))
+                                        .or_default()
+                                        .entry(OrderKey::Text(key.clone()))
+                                        .or_default()
+                                        .insert(id);
+                                    index.ordered_mixed.insert(Arc::clone(&name));
+                                }
+                            }
+                        }
+                    }
+
+                    if kinds.contains(&Kind::Eq) {
                         index
-                            .equality
+                            .built
                             .entry(Arc::clone(&name))
                             .or_default()
-                            .entry(key)
-                            .or_default()
-                            .insert(id);
+                            .insert(Kind::Eq);
                     }
-                    index.built.entry(name).or_default().insert(Kind::Eq);
+                    if kinds.contains(&Kind::Ord) {
+                        index
+                            .built
+                            .entry(Arc::clone(&name))
+                            .or_default()
+                            .insert(Kind::Ord);
+                    }
+                }
+
+                if kinds.contains(&Kind::Sub) {
+                    let case_sensitive = attribute.flags.case_sensitive;
+                    for value in attribute.values.iter() {
+                        // The value is indexed between its boundaries: `^` and `$` are what
+                        // an anchored part of a pattern looks up.
+                        let padded = format!("^{}$", fold(value, case_sensitive));
+                        for trigram in trigrams(&padded) {
+                            index
+                                .substrings
+                                .entry(Arc::clone(&name))
+                                .or_default()
+                                .entry(trigram)
+                                .or_default()
+                                .insert(id);
+                        }
+                    }
+                    index.built.entry(name).or_default().insert(Kind::Sub);
                 }
             }
         }
@@ -201,26 +341,121 @@ impl Index {
     /// Candidate ids for `query`, or `None` when the index cannot narrow it.
     pub fn candidates(&self, query: &Query) -> Option<RoaringBitmap> {
         match query {
-            Query::Presence(name) => self
-                .presence
-                .get(name)
-                .or_else(|| self.presence.get(&name.to_lowercase() as &str))
-                .cloned(),
+            Query::Presence(name) => lookup(&self.presence, name).cloned(),
             Query::Equality { attribute, value } => {
-                let case_sensitive = self.case_sensitive.contains(attribute);
+                let case_sensitive = contains(&self.case_sensitive, attribute);
                 let key = fold(value, case_sensitive);
-                self.equality
-                    .get(attribute)
+                lookup(&self.equality, attribute)
                     .and_then(|values| values.get(&key))
                     // An indexed attribute with no such value is a real empty answer,
                     // not "unknown": the map exists for every value ever seen.
                     .cloned()
                     .or_else(|| {
-                        self.built
-                            .get(attribute)
+                        lookup_tree(&self.built, attribute)
                             .filter(|kinds| kinds.contains(&Kind::Eq))
                             .map(|_| RoaringBitmap::new())
                     })
+            }
+            Query::Substring {
+                attribute,
+                initial,
+                any,
+                final_part,
+            } => {
+                // Every trigram the pattern implies must be present in the value, so the
+                // candidates are the intersection. A part shorter than three characters
+                // implies nothing and is skipped; if nothing at all is left the index stands
+                // aside rather than answering with an empty set, which would be a lie.
+                let mut wanted: Vec<String> = Vec::new();
+                if let Some(initial) = initial {
+                    // `part*` can only match at the start, so the boundary belongs in the
+                    // lookup: this is what keeps an anchored fragment selective.
+                    wanted.extend(trigrams(&format!("^{initial}")));
+                }
+                for part in any {
+                    // Interior: the part as written, in both the value and the lookup.
+                    wanted.extend(trigrams(part));
+                }
+                if let Some(final_part) = final_part {
+                    wanted.extend(trigrams(&format!("{final_part}$")));
+                }
+
+                if wanted.is_empty() {
+                    // Every part was shorter than three characters; nothing to look up.
+                    return None;
+                }
+
+                let buckets = lookup(&self.substrings, attribute);
+
+                // An attribute with no substring index: stand aside and let the scan answer.
+                let buckets = buckets?;
+
+                let mut narrowed = RoaringBitmap::new();
+                for (index, trigram) in wanted.iter().enumerate() {
+                    let Some(bitmap) = buckets.get(trigram) else {
+                        // The attribute is indexed, so a trigram nobody has cannot match:
+                        // an empty answer, not "unknown".
+                        return Some(RoaringBitmap::new());
+                    };
+
+                    if index == 0 {
+                        narrowed = bitmap.clone();
+                    } else {
+                        narrowed &= bitmap;
+                    }
+                }
+
+                Some(narrowed)
+            }
+            Query::Range {
+                attribute,
+                bound,
+                value,
+            } => {
+                let case_sensitive = contains(&self.case_sensitive, attribute);
+                let key = fold(value, case_sensitive);
+
+                let buckets = lookup(&self.ordered, attribute);
+
+                // An attribute nobody has an ordered index for: stand aside. The difference
+                // from the equality case is that a map exists only for attributes that hold
+                // values, so its absence here says nothing about the data.
+                let buckets = buckets?;
+
+                // The key has to be ordered the same way the filter compares, or the range
+                // would leave out entries the filter would have matched. An attribute whose
+                // values are all integers gets a numeric key; one with no integers gets text;
+                // a mixed one and a bound of the other kind get nothing, because neither
+                // ordering describes the comparison.
+                let all_numeric = self.ordered_numeric.contains(attribute)
+                    || self
+                        .ordered_numeric
+                        .contains(&attribute.to_lowercase() as &str);
+                let mixed = self.ordered_mixed.contains(attribute)
+                    || self
+                        .ordered_mixed
+                        .contains(&attribute.to_lowercase() as &str);
+
+                let key = match key.parse::<i64>() {
+                    // One kind per attribute: a numeric bound belongs in a map of numbers,
+                    // and a text bound in a map of text. Anything else is a comparison the
+                    // map cannot describe.
+                    Ok(number) if all_numeric && !mixed => OrderKey::Num(number),
+                    Err(_) if !all_numeric && !mixed => OrderKey::Text(key),
+                    _ => return None,
+                };
+
+                let range: Box<dyn Iterator<Item = &RoaringBitmap>> = match bound {
+                    RangeBound::AtLeast => Box::new(buckets.range(key..).map(|(_, ids)| ids)),
+                    RangeBound::AtMost => Box::new(buckets.range(..=key).map(|(_, ids)| ids)),
+                };
+
+                let mut union = RoaringBitmap::new();
+                for bitmap in range {
+                    union |= bitmap;
+                }
+
+                Some(union)
             }
             Query::And(parts) => {
                 let mut narrowed: Option<RoaringBitmap> = None;
@@ -263,6 +498,18 @@ impl Index {
             .values()
             .map(|bitmap| bitmap.serialized_size())
             .sum();
+        let substrings: usize = self
+            .substrings
+            .values()
+            .flat_map(|buckets| buckets.values())
+            .map(|bitmap| bitmap.serialized_size())
+            .sum();
+        let ordered: usize = self
+            .ordered
+            .values()
+            .flat_map(|buckets| buckets.values())
+            .map(|bitmap| bitmap.serialized_size())
+            .sum();
         let equality: usize = self
             .equality
             .values()
@@ -270,12 +517,56 @@ impl Index {
             .map(|bitmap| bitmap.serialized_size())
             .sum();
 
-        presence + equality
+        presence + equality + substrings + ordered
     }
 
     pub fn is_empty(&self) -> bool {
-        self.presence.is_empty() && self.equality.is_empty()
+        self.presence.is_empty()
+            && self.equality.is_empty()
+            && self.substrings.is_empty()
+            && self.ordered.is_empty()
     }
+}
+
+/// The value under `name`, whether the caller spelled it the way RFC 4512 allows or the way
+/// the index stores it.
+///
+/// Attribute descriptions are case-insensitive, and the filter lowercases them before asking
+/// while the index keeps its keys lowercase as well. This helper is the one place that
+/// bridges the two, so a query written as `uidNumber` and one written as `uidnumber` are the
+/// same question.
+fn lookup<'a, V>(map: &'a HashMap<Arc<str>, V>, name: &str) -> Option<&'a V> {
+    map.get(name)
+        .or_else(|| map.get(name.to_lowercase().as_str()))
+}
+
+/// The same, for the one map kept in order.
+fn lookup_tree<'a, V>(map: &'a BTreeMap<Arc<str>, V>, name: &str) -> Option<&'a V> {
+    map.get(name)
+        .or_else(|| map.get(name.to_lowercase().as_str()))
+}
+
+/// The same, for a set.
+fn contains(set: &BTreeSet<Arc<str>>, name: &str) -> bool {
+    set.contains(name) || set.contains(name.to_lowercase().as_str())
+}
+
+/// Every three-character window of `text`.
+///
+/// The padding is left to the caller, because it is what distinguishes the three parts of a
+/// pattern: an initial fragment is matched against `^part`, a final one against `part$`, and
+/// an interior one against the part itself. Padding all three would turn `(cn=*ob*)` into a
+/// request for values beginning with `ob`, and "bob" would stop matching - a false negative,
+/// which is the one direction an index must never fail in.
+///
+/// Fewer than three characters yield no window at all, and the index stands aside.
+fn trigrams(text: &str) -> Vec<String> {
+    let characters: Vec<char> = text.chars().collect();
+
+    characters
+        .windows(3)
+        .map(|window| window.iter().collect())
+        .collect()
 }
 
 fn fold(value: &str, case_sensitive: bool) -> String {
@@ -343,6 +634,16 @@ mod tests {
                     )
                 })
                 .collect(),
+        }
+    }
+
+    /// `(attribute=*part*)`, the shape the filter parser produces for a bare substring.
+    fn any_substring(attribute: &str, part: &str) -> Query {
+        Query::Substring {
+            attribute: attribute.into(),
+            initial: None,
+            any: vec![part.to_string()],
+            final_part: None,
         }
     }
 
@@ -550,10 +851,13 @@ mod tests {
 
     #[test]
     fn an_unknown_kind_is_rejected_with_its_name() {
-        let error =
-            Index::build(&directory(), &config(&[("cn", &["sub"])], &[])).expect_err("must reject");
+        // `substring` is what someone writes for `sub`, and saying so is the point of the
+        // error: the configuration is read at startup, so the operator hears about the typo
+        // before the server takes a request.
+        let error = Index::build(&directory(), &config(&[("cn", &["substring"])], &[]))
+            .expect_err("must reject");
 
-        assert_eq!(error, IndexError::UnknownKind("sub".to_string()));
+        assert_eq!(error, IndexError::UnknownKind("substring".to_string()));
     }
 
     #[test]
@@ -583,5 +887,293 @@ mod tests {
 
         assert!(index.is_empty());
         assert!(index.built_attributes().next().is_none());
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Substring and range indexes.
+    // -----------------------------------------------------------------------------------
+
+    #[test]
+    fn a_substring_query_narrows_to_the_entries_that_can_match() {
+        let entries = directory();
+        let index = Index::build(&entries, &config(&[("mail", &["sub"])], &[])).expect("index");
+
+        // `*example*` is in both addresses, and also in the group's memberUid? No: memberUid
+        // holds "ann" and "bob", so only the two users carry the trigram.
+        assert_eq!(
+            ids(index.candidates(&any_substring("mail", "example"))),
+            vec![0, 1],
+            "both mail values contain 'example'"
+        );
+
+        assert_eq!(
+            ids(index.candidates(&any_substring("mail", "ann"))),
+            vec![0],
+            "only Ann's address contains 'ann'"
+        );
+    }
+
+    #[test]
+    fn an_anchored_substring_uses_the_boundary_and_not_only_the_interior() {
+        // `ann*` is an initial fragment: it can only match a value that *starts* with it.
+        // Without boundary trigrams the index would answer with every entry holding "ann"
+        // anywhere, which is still a superset - correct but useless - so this checks the
+        // selectivity, not the correctness.
+        let entries = directory();
+        let index = Index::build(&entries, &config(&[("mail", &["sub"])], &[])).expect("index");
+
+        let initial = ids(index.candidates(&Query::Substring {
+            attribute: "mail".into(),
+            initial: Some("ann".to_string()),
+            any: Vec::new(),
+            final_part: None,
+        }));
+        assert_eq!(initial, vec![0]);
+
+        // `example` is in both addresses and at neither start: as an interior part it finds
+        // two entries, as an initial one it finds none. That difference *is* the boundary
+        // trigrams; without them both queries would answer the same.
+        assert_eq!(
+            ids(index.candidates(&any_substring("mail", "example"))),
+            vec![0, 1]
+        );
+        assert!(
+            ids(index.candidates(&Query::Substring {
+                attribute: "mail".into(),
+                initial: Some("example".to_string()),
+                any: Vec::new(),
+                final_part: None,
+            }))
+            .is_empty(),
+            "no address starts with 'example'"
+        );
+    }
+
+    #[test]
+    fn a_pattern_too_short_to_make_a_trigram_narrows_nothing() {
+        // Two characters cannot form a trigram. Answering with an empty bitmap would be
+        // wrong - `(cn=a*)` matches "Ann" - so the index has to stand aside.
+        let entries = directory();
+        let index = Index::build(&entries, &config(&[("cn", &["sub"])], &[])).expect("index");
+
+        assert_eq!(
+            index.candidates(&any_substring("cn", "an")),
+            None,
+            "no trigram, no narrowing"
+        );
+    }
+
+    #[test]
+    fn a_substring_on_an_unindexed_attribute_narrows_nothing() {
+        let index = Index::build(&directory(), &config(&[("cn", &["sub"])], &[])).expect("index");
+
+        assert_eq!(index.candidates(&any_substring("mail", "example")), None);
+    }
+
+    #[test]
+    fn a_trigram_the_index_never_saw_is_an_empty_answer() {
+        // The attribute *is* indexed, so a value nobody has cannot match: this is a real
+        // empty result, not "the index cannot tell".
+        let entries = directory();
+        let index = Index::build(&entries, &config(&[("mail", &["sub"])], &[])).expect("index");
+
+        assert_eq!(
+            ids(index.candidates(&any_substring("mail", "zzzz"))),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn substrings_are_folded_like_equality_is() {
+        let entries = directory();
+        let index = Index::build(&entries, &config(&[("cn", &["sub"])], &[])).expect("index");
+
+        // The stored value is "Ann"; the filter comes from a person typing in lowercase.
+        assert_eq!(ids(index.candidates(&any_substring("cn", "ann"))), vec![0]);
+    }
+
+    #[test]
+    fn a_range_query_narrows_to_the_entries_on_that_side() {
+        let entries = vec![
+            entry("cn=a,dc=example,dc=com", &[("uidNumber", &["100"])]),
+            entry("cn=b,dc=example,dc=com", &[("uidNumber", &["200"])]),
+            entry("cn=c,dc=example,dc=com", &[("uidNumber", &["300"])]),
+        ];
+        let index =
+            Index::build(&entries, &config(&[("uidNumber", &["ord"])], &[])).expect("index");
+
+        assert_eq!(
+            ids(index.candidates(&Query::Range {
+                attribute: "uidNumber".into(),
+                bound: RangeBound::AtLeast,
+                value: "200".to_string(),
+            })),
+            vec![1, 2],
+            "`>= 200` includes the bound itself"
+        );
+
+        assert_eq!(
+            ids(index.candidates(&Query::Range {
+                attribute: "uidNumber".into(),
+                bound: RangeBound::AtMost,
+                value: "200".to_string(),
+            })),
+            vec![0, 1],
+            "`<= 200` includes the bound itself"
+        );
+    }
+
+    #[test]
+    fn a_numeric_range_orders_by_value_and_not_by_text() {
+        // The failure this guards: as text, "10" sorts before "9", so `(n>=9)` would leave
+        // out 10 and 100 - entries the filter matches. A false negative is the one answer an
+        // index must never give, and it is invisible unless the values differ in width.
+        let entries = vec![
+            entry("cn=one,dc=example,dc=com", &[("uidNumber", &["9"])]),
+            entry("cn=two,dc=example,dc=com", &[("uidNumber", &["10"])]),
+            entry("cn=three,dc=example,dc=com", &[("uidNumber", &["100"])]),
+        ];
+        let index =
+            Index::build(&entries, &config(&[("uidNumber", &["ord"])], &[])).expect("index");
+
+        assert_eq!(
+            ids(index.candidates(&Query::Range {
+                attribute: "uidNumber".into(),
+                bound: RangeBound::AtLeast,
+                value: "9".to_string(),
+            })),
+            vec![0, 1, 2],
+            "all three are at least 9, including the wider numbers"
+        );
+
+        assert_eq!(
+            ids(index.candidates(&Query::Range {
+                attribute: "uidNumber".into(),
+                bound: RangeBound::AtMost,
+                value: "10".to_string(),
+            })),
+            vec![0, 1],
+            "9 and 10 are at most 10; 100 is not"
+        );
+    }
+
+    #[test]
+    fn a_mixed_attribute_stands_aside_rather_than_guessing() {
+        // One attribute holding both numbers and words has no single order that matches the
+        // filter, so the index must not answer at all: the scan decides.
+        let entries = vec![
+            entry("cn=a,dc=example,dc=com", &[("roomNumber", &["10"])]),
+            entry("cn=b,dc=example,dc=com", &[("roomNumber", &["lab"])]),
+        ];
+        let index =
+            Index::build(&entries, &config(&[("roomNumber", &["ord"])], &[])).expect("index");
+
+        assert_eq!(
+            index.candidates(&Query::Range {
+                attribute: "roomNumber".into(),
+                bound: RangeBound::AtLeast,
+                value: "9".to_string(),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_range_beyond_the_data_is_empty_rather_than_unknown() {
+        let entries = vec![entry("cn=a,dc=example,dc=com", &[("uidNumber", &["100"])])];
+        let index =
+            Index::build(&entries, &config(&[("uidNumber", &["ord"])], &[])).expect("index");
+
+        assert_eq!(
+            ids(index.candidates(&Query::Range {
+                attribute: "uidNumber".into(),
+                bound: RangeBound::AtLeast,
+                value: "900".to_string(),
+            })),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn a_range_on_an_unindexed_attribute_narrows_nothing() {
+        let index = Index::build(&directory(), &config(&[("mail", &["ord"])], &[])).expect("index");
+
+        assert_eq!(
+            index.candidates(&Query::Range {
+                attribute: "uidNumber".into(),
+                bound: RangeBound::AtLeast,
+                value: "1".to_string(),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn every_attribute_with_several_values_is_in_each_of_its_buckets() {
+        // `memberUid` holds two values; a search for either has to find the group.
+        let entries = directory();
+        let index =
+            Index::build(&entries, &config(&[("memberUid", &["eq", "sub"])], &[])).expect("index");
+
+        assert_eq!(
+            ids(index.candidates(&any_substring("memberUid", "ann"))),
+            vec![2]
+        );
+        assert_eq!(
+            ids(index.candidates(&any_substring("memberUid", "bob"))),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn an_attribute_whose_name_has_capitals_is_indexed_like_any_other() {
+        // The filter lowercases every attribute description before asking the index, so the
+        // index has to keep its keys lowercase too. Storing `uidNumber` meant the lookup for
+        // "uidnumber" missed, the index narrowed nothing, and only a test that asserts the
+        // candidate *set* rather than comparing answers could see it.
+        let entries = vec![
+            entry("cn=a,dc=example,dc=com", &[("uidNumber", &["100"])]),
+            entry("cn=b,dc=example,dc=com", &[("uidNumber", &["200"])]),
+            entry("cn=c,dc=example,dc=com", &[("uidNumber", &["300"])]),
+        ];
+        let index =
+            Index::build(&entries, &config(&[("uidNumber", &["eq", "ord"])], &[])).expect("index");
+
+        assert_eq!(
+            ids(index.candidates(&Query::Equality {
+                attribute: "uidnumber".into(),
+                value: "200".to_string(),
+            })),
+            vec![1],
+            "a lowercase query has to find a camelCase attribute"
+        );
+
+        assert_eq!(
+            ids(index.candidates(&Query::Range {
+                attribute: "uidnumber".into(),
+                bound: RangeBound::AtLeast,
+                value: "200".to_string(),
+            })),
+            vec![1, 2]
+        );
+
+        // Both spellings work, because the query side tries the name as written too.
+        assert_eq!(
+            ids(index.candidates(&Query::Equality {
+                attribute: "uidNumber".into(),
+                value: "200".to_string(),
+            })),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn the_new_kinds_are_named_as_the_configuration_names_them() {
+        assert_eq!(Kind::Sub.name(), "sub");
+        assert_eq!(Kind::Ord.name(), "ord");
+
+        // And a typo is still a startup error that lists what exists.
+        let err = parse_kind("substring").expect_err("must refuse");
+        assert!(err.to_string().contains("sub"), "{err}");
     }
 }

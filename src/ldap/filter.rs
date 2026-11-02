@@ -9,11 +9,11 @@
 //! asked for `>=` must see `unwillingToPerform` instead of a silently empty
 //! result.
 
-use rasn_ldap::{Filter, SubstringChoice};
+use rasn_ldap::{AttributeValueAssertion, Filter, SubstringChoice};
 use thiserror::Error;
 
 use crate::dn;
-use crate::index::Query;
+use crate::index::{Query, RangeBound};
 use crate::model::{Attribute, Attributes};
 
 /// Attribute description that matches on the entry's DN instead of its values.
@@ -47,7 +47,93 @@ pub fn to_query(filter: &Filter) -> Query {
                 value: String::from_utf8_lossy(assertion.assertion_value.as_ref()).into_owned(),
             }
         }
+        Filter::Substrings(substrings) => {
+            let name = substrings.r#type.0.to_lowercase();
+            if name == ENTRY_DN {
+                return Query::Unindexed;
+            }
+
+            // The parts are kept apart because the index treats them differently: an initial
+            // fragment matches at the start of a value, a final one at the end, and the
+            // padding that makes those lookups selective cannot be applied to all of them.
+            let mut initial = None;
+            let mut any = Vec::new();
+            let mut final_part = None;
+
+            for choice in substrings.substrings.iter() {
+                match choice {
+                    SubstringChoice::Initial(value) => {
+                        initial = Some(String::from_utf8_lossy(value.as_ref()).into_owned());
+                    }
+                    SubstringChoice::Any(value) => {
+                        any.push(String::from_utf8_lossy(value.as_ref()).into_owned());
+                    }
+                    SubstringChoice::Final(value) => {
+                        final_part = Some(String::from_utf8_lossy(value.as_ref()).into_owned());
+                    }
+                    // A part this build does not know: the index cannot describe the pattern,
+                    // and guessing would narrow to the wrong set - which is the one mistake
+                    // an index must not make.
+                    _ => return Query::Unindexed,
+                }
+            }
+
+            Query::Substring {
+                attribute: name.into(),
+                initial,
+                any,
+                final_part,
+            }
+        }
+        Filter::GreaterOrEqual(assertion) => range(assertion, RangeBound::AtLeast),
+        Filter::LessOrEqual(assertion) => range(assertion, RangeBound::AtMost),
         _ => Query::Unindexed,
+    }
+}
+
+/// `>=` and `<=`: whether any value of the attribute is on the requested side.
+///
+/// The ordering is the one `sort` uses, not a second opinion: a search that sorts one way and
+/// selects another is a bug nobody finds until the two disagree about a name with a space in
+/// it. `>=` and `<=` include the bound, as RFC 4511 says they do.
+fn compares(
+    attributes: &Attributes,
+    assertion: &AttributeValueAssertion,
+    accept: fn(std::cmp::Ordering) -> bool,
+) -> bool {
+    let name = assertion.attribute_desc.0.to_lowercase();
+    let bound = String::from_utf8_lossy(assertion.assertion_value.as_ref()).into_owned();
+
+    let Some(attribute) = attributes.get(&name) else {
+        return false;
+    };
+
+    attribute.values.iter().any(|stored| {
+        // Numeric only when both sides are numbers: "10" is greater than "9" as a number and
+        // smaller than it as text, and the schema is not consulted here - the values decide.
+        let numeric =
+            crate::ldap::sort::looks_numeric(stored) && crate::ldap::sort::looks_numeric(&bound);
+
+        accept(crate::ldap::sort::order_values(
+            stored,
+            &bound,
+            numeric,
+            attribute.flags.case_sensitive,
+        ))
+    })
+}
+
+/// A comparison reduced to the range it keeps.
+fn range(assertion: &AttributeValueAssertion, bound: RangeBound) -> Query {
+    let name = assertion.attribute_desc.0.to_lowercase();
+    if name == ENTRY_DN {
+        return Query::Unindexed;
+    }
+
+    Query::Range {
+        attribute: name.into(),
+        bound,
+        value: String::from_utf8_lossy(assertion.assertion_value.as_ref()).into_owned(),
     }
 }
 
@@ -116,8 +202,12 @@ pub fn matches(
                 None => Ok(false),
             }
         }
-        Filter::GreaterOrEqual(_) => Err(FilterError::Unsupported("greaterOrEqual")),
-        Filter::LessOrEqual(_) => Err(FilterError::Unsupported("lessOrEqual")),
+        Filter::GreaterOrEqual(assertion) => {
+            Ok(compares(attributes, assertion, std::cmp::Ordering::is_ge))
+        }
+        Filter::LessOrEqual(assertion) => {
+            Ok(compares(attributes, assertion, std::cmp::Ordering::is_le))
+        }
         Filter::ApproxMatch(_) => Err(FilterError::Unsupported("approxMatch")),
         Filter::ExtensibleMatch(_) => Err(FilterError::Unsupported("extensibleMatch")),
         other => Err(FilterError::Unsupported(unsupported_name(other))),
@@ -401,7 +491,11 @@ mod tests {
     }
 
     #[test]
-    fn ordering_and_approximate_filters_are_reported_as_unsupported() {
+    fn ordering_is_answered_and_approximate_matching_is_not() {
+        // The entry has uidNumber 1000. `>=` and `<=` are answered now - the ordered index
+        // and the comparison were built together, since an index over a filter the server
+        // refuses is worth nothing - and approximate matching is still reported as
+        // unsupported rather than answered with equality.
         let assertion = rasn_ldap::AttributeValueAssertion::new(
             rasn_ldap::AttributeDescription::from("uidNumber"),
             rasn::types::OctetString::from(&b"999"[..]),
@@ -413,11 +507,13 @@ mod tests {
                 DN,
                 &Filter::GreaterOrEqual(assertion.clone())
             ),
-            Err(FilterError::Unsupported("greaterOrEqual"))
+            Ok(true),
+            "1000 >= 999"
         );
         assert_eq!(
             matches(&attributes(), DN, &Filter::LessOrEqual(assertion.clone())),
-            Err(FilterError::Unsupported("lessOrEqual"))
+            Ok(false),
+            "1000 is not <= 999"
         );
         assert_eq!(
             matches(&attributes(), DN, &Filter::ApproxMatch(assertion)),

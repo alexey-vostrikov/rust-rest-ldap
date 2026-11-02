@@ -231,9 +231,10 @@ mod tests {
 
     #[test]
     fn a_filter_the_server_cannot_evaluate_is_reported_as_such() {
-        // `greaterOrEqual` is not implemented by the filter yet; a critical assertion
-        // on it must say so instead of pretending it matched.
-        let filter = rasn_ldap::Filter::GreaterOrEqual(AttributeValueAssertion::new(
+        // Approximate matching is still not implemented; a critical assertion on it must say
+        // so instead of pretending it matched. `>=` used to be the example here, and stopped
+        // being one when the filter learned to answer it.
+        let filter = rasn_ldap::Filter::ApproxMatch(AttributeValueAssertion::new(
             AttributeDescription::from("cn"),
             rasn::types::OctetString::from("a".as_bytes()),
         ));
@@ -242,6 +243,22 @@ mod tests {
         match evaluate(Some(&controls), &entry()) {
             Assertion::Unusable(reason) => assert!(reason.contains("evaluate"), "{reason}"),
             other => panic!("expected an unusable assertion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_ordering_filter_can_now_be_asserted_on() {
+        // The counterpart: what used to be refused is answered, so an assertion on it is
+        // evaluated rather than reported unusable.
+        let filter = rasn_ldap::Filter::GreaterOrEqual(AttributeValueAssertion::new(
+            AttributeDescription::from("cn"),
+            rasn::types::OctetString::from("a".as_bytes()),
+        ));
+        let controls = control(&filter, true);
+
+        match evaluate(Some(&controls), &entry()) {
+            Assertion::Matches | Assertion::Failed => {}
+            other => panic!("an ordering filter must be evaluated, got {other:?}"),
         }
     }
 }

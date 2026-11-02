@@ -747,8 +747,10 @@ mod tests {
 
     #[test]
     fn unsupported_filter_is_reported_not_silently_empty() {
+        // Approximate matching is the filter this server still refuses; answering it with an
+        // empty result would look like "no such person" instead of "not implemented".
         let session = admin_session();
-        let filter = Filter::GreaterOrEqual(AttributeValueAssertion::new(
+        let filter = Filter::ApproxMatch(AttributeValueAssertion::new(
             AttributeDescription::from("cn"),
             rasn::types::OctetString::from(b"a".as_slice()),
         ));
@@ -760,7 +762,36 @@ mod tests {
         assert_eq!(result_code(&messages), ResultCode::UnwillingToPerform);
         assert_eq!(
             diagnostic(&messages),
-            "unsupported filter type 'greaterOrEqual'"
+            "unsupported filter type 'approxMatch'"
+        );
+    }
+
+    #[test]
+    fn an_ordering_filter_is_answered() {
+        // `(uidNumber>=100)` used to be refused; now the filter compares and the ordered
+        // index narrows, and the two have to agree about who is above the bound.
+        let session = admin_session();
+        // The fixture's users are `admin` and `alice`, so `(cn>=alice)` is the pair the
+        // ordering has to separate: "admin" sorts before "alice" and is excluded, "alice"
+        // and the group `group_a` sort after it and are kept.
+        let filter = Filter::GreaterOrEqual(AttributeValueAssertion::new(
+            AttributeDescription::from("cn"),
+            rasn::types::OctetString::from(b"alice".as_slice()),
+        ));
+        let request = request(BASE, SearchRequestScope::WholeSubtree, filter, 0, &[]);
+
+        let messages = search(&session, &request, None);
+
+        assert_eq!(result_code(&messages), ResultCode::Success);
+        let found = dns(&messages);
+
+        assert!(
+            found.contains(&"cn=alice,ou=users,dc=example,dc=com".to_string()),
+            "the bound itself matches: {found:?}"
+        );
+        assert!(
+            !found.contains(&"cn=admin,ou=users,dc=example,dc=com".to_string()),
+            "'admin' sorts before 'alice' and must be excluded: {found:?}"
         );
     }
 
