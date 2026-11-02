@@ -96,6 +96,53 @@ async fn main() {
         return;
     }
 
+    // The first administrator, for a store no client can write to yet: `add` needs a bind,
+    // and a bind needs an entry. Runs before the listener, so the directory is
+    // administrable from the first connection rather than after a manual edit.
+    if let Some(section) = config.bootstrap.clone() {
+        let secret =
+            match rust_rest_ldap::bootstrap::password(&section, |name| std::env::var(name).ok()) {
+                Ok(secret) => secret,
+                Err(err) => fatal(&i18n::t("error.bootstrap", &[("detail", &err.to_string())])),
+            };
+        let spec = match rust_rest_ldap::bootstrap::Spec::new(
+            section.dn.as_deref(),
+            &config.base_dn,
+            &config.users_ou_name,
+            secret.expose(),
+        ) {
+            Ok(spec) => spec,
+            Err(err) => fatal(&i18n::t("error.bootstrap", &[("detail", &err.to_string())])),
+        };
+
+        match rust_rest_ldap::bootstrap::seed_with(&backend, &spec, &config.passwords).await {
+            Ok(rust_rest_ldap::bootstrap::Outcome::Created { dn }) => eprintln!(
+                "{}",
+                i18n::t(
+                    "start.bootstrap_created",
+                    &[
+                        ("dn", &dn),
+                        (
+                            "scheme",
+                            rust_rest_ldap::bootstrap::scheme_name(&config.passwords)
+                        ),
+                    ],
+                )
+            ),
+            // Said out loud rather than skipped in silence: a bootstrap section left in
+            // the configuration of a directory in use is a question the operator will ask,
+            // and "it did nothing" is the answer.
+            Ok(rust_rest_ldap::bootstrap::Outcome::NotEmpty { entries }) => eprintln!(
+                "{}",
+                i18n::t(
+                    "start.bootstrap_not_empty",
+                    &[("entries", &entries.to_string())]
+                )
+            ),
+            Err(err) => fatal(&i18n::t("error.bootstrap", &[("detail", &err.to_string())])),
+        }
+    }
+
     let (source, directory) = match rust_rest_ldap::reload::Source::load(&config, backend).await {
         Ok(loaded) => loaded,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
@@ -440,6 +487,12 @@ fn config_message(err: &config::ConfigError) -> String {
             key = "config.locale";
             owned.push(("value".to_string(), value.clone()));
             owned.push(("path".to_string(), format!("locale/{value}.yaml")));
+        }
+        config::ConfigError::BootstrapPasswordMissing => {
+            key = "config.bootstrap_password_missing";
+        }
+        config::ConfigError::BootstrapPasswordAmbiguous => {
+            key = "config.bootstrap_password_ambiguous";
         }
         config::ConfigError::DangerousSettingsNotAcknowledged { settings } => {
             key = "config.dangerous";

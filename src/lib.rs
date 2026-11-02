@@ -11,6 +11,7 @@
 
 pub mod acl;
 pub mod backend;
+pub mod bootstrap;
 pub mod cli;
 pub mod config;
 pub mod danger;

@@ -123,6 +123,23 @@ use_tls: false
 # The callback listener has no TLS, so callback_auth_token travels in the clear on
 # every reload request. Set the address only on a trusted network, and say so here.
 AllowPlainHttpRest: "Yes I know this is bad idea"
+# The first administrator.
+#
+# An empty directory cannot be filled over the protocol: `add` needs a bind, and a bind
+# needs an entry with a password that does not exist yet. This section names that entry;
+# it is created at startup if, and only if, the store holds nothing at all. Left in place
+# afterwards it does nothing, and says so in the log.
+#
+# The password comes from a file or an environment variable, never from the command line:
+# arguments are visible in `ps` to every user on the machine.
+#
+# Only the `redb` backend can be seeded: the JSON backends read a file the server does not
+# own, so an administrator created there would vanish at the next reload.
+#bootstrap:
+#  dn: cn=admin,ou=users,dc=example,dc=com     # default
+#  password_file: /etc/rust-rest-ldap/admin.pass
+#  # password_env: RUST_REST_LDAP_ADMIN_PASSWORD
+
 # Observability.
 #   journal        - path of the change journal, one JSON object per accepted write:
 #                    time, op, dn, actor, peer, result code. A delete leaves no entry to

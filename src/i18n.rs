@@ -405,6 +405,18 @@ const ENGLISH: &[(&str, &str)] = &[
     ("error.client", "client {peer}: {detail}"),
     ("error.journal", "cannot write the change journal: {detail}"),
     (
+        "error.bootstrap",
+        "cannot create the first administrator: {detail}",
+    ),
+    (
+        "start.bootstrap_created",
+        "created the first administrator '{dn}' with a {scheme} hash; remove the bootstrap section from the configuration",
+    ),
+    (
+        "start.bootstrap_not_empty",
+        "bootstrap skipped: the store already holds {entries} entries, and the first administrator is only created in an empty one",
+    ),
+    (
         "error.shutdown_timeout",
         "graceful shutdown timed out after {grace}, closing remaining connections",
     ),
@@ -433,6 +445,14 @@ const ENGLISH: &[(&str, &str)] = &[
     (
         "config.plain_http",
         "http_listen_addr is set to '{address}' but the callback listener speaks plain HTTP, so its token travels in the clear; add AllowPlainHttpRest: 'Yes I know this is bad idea' next to it if that is acceptable",
+    ),
+    (
+        "config.bootstrap_password_missing",
+        "the 'bootstrap' section names no password: set password_file or password_env, or remove the section",
+    ),
+    (
+        "config.bootstrap_password_ambiguous",
+        "the 'bootstrap' section names both password_file and password_env; pick one, so that where the first administrator's password comes from has one answer",
     ),
     (
         "config.dangerous",

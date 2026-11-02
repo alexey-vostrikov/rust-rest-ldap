@@ -138,6 +138,7 @@ mod tests {
             dangerous_settings: Vec::new(),
             integrity: crate::integrity::IntegrityConfig::default(),
             observability: crate::config::ObservabilityConfig::default(),
+            bootstrap: None,
             locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),
             locale_file: None,
         };
