@@ -415,6 +415,27 @@ const ENGLISH: &[(&str, &str)] = &[
         "check.schema_violation",
         "schema violation in '{dn}': {detail}",
     ),
+    ("error.index", "cannot build the index: {detail}"),
+    (
+        "check.index_mismatch",
+        "index disagrees with the data for {query}: missing [{lost}], unexpected [{extra}]",
+    ),
+    (
+        "check.index_loose",
+        "index on '{attribute}' narrows less than it could: {extra} extra candidates over the sample",
+    ),
+    (
+        "check.index_sound",
+        "index is sound: {checked} queries compared with a scan, {skipped} left to the scan",
+    ),
+    (
+        "check.index_broken",
+        "index is NOT sound: of {checked} queries compared with a scan, {missing} would lose entries and {wrong} disagree with it",
+    ),
+    (
+        "check.reindex_done",
+        "indexed {entries} entries, {attributes} attributes, {bytes} bytes in {millis} ms",
+    ),
     (
         "check.ok",
         "configuration is usable: backend '{backend}', base '{base_dn}', {entries} entries, {broken} with schema violations",

@@ -366,18 +366,25 @@ impl Index {
                 // candidates are the intersection. A part shorter than three characters
                 // implies nothing and is skipped; if nothing at all is left the index stands
                 // aside rather than answering with an empty set, which would be a lie.
+                // Every part is folded the way the stored value was: the index holds
+                // lowercase trigrams for an ordinary attribute, so a lookup for "Ann" has to
+                // become "ann" or it finds nothing. Leaving the query unfolded is a false
+                // negative, and the fixture that hid it held only lowercase values.
+                let case_sensitive = contains(&self.case_sensitive, attribute);
+                let fold_part = |part: &str| fold(part, case_sensitive);
+
                 let mut wanted: Vec<String> = Vec::new();
                 if let Some(initial) = initial {
                     // `part*` can only match at the start, so the boundary belongs in the
                     // lookup: this is what keeps an anchored fragment selective.
-                    wanted.extend(trigrams(&format!("^{initial}")));
+                    wanted.extend(trigrams(&format!("^{}", fold_part(initial))));
                 }
                 for part in any {
-                    // Interior: the part as written, in both the value and the lookup.
-                    wanted.extend(trigrams(part));
+                    // Interior: the part as given, folded to match the stored trigrams.
+                    wanted.extend(trigrams(&fold_part(part)));
                 }
                 if let Some(final_part) = final_part {
-                    wanted.extend(trigrams(&format!("{final_part}$")));
+                    wanted.extend(trigrams(&format!("{}$", fold_part(final_part))));
                 }
 
                 if wanted.is_empty() {
@@ -892,6 +899,50 @@ mod tests {
     // -----------------------------------------------------------------------------------
     // Substring and range indexes.
     // -----------------------------------------------------------------------------------
+
+    #[test]
+    fn a_pattern_with_no_trigram_stands_aside_rather_than_answering() {
+        // `(cn=*n*)` is one character: no window to look up. Answering with an empty set
+        // would say "nothing matches", which is a lie - "Ann" matches.
+        let entries = vec![entry("cn=a,dc=example,dc=com", &[("cn", &["Ann"])])];
+        let index = Index::build(&entries, &config(&[("cn", &["sub"])], &[])).expect("index");
+
+        assert_eq!(
+            index.candidates(&any_substring("cn", "n")),
+            None,
+            "one character cannot narrow, and standing aside is the honest answer"
+        );
+    }
+
+    #[test]
+    fn a_substring_query_is_folded_like_the_value_it_searches() {
+        // The stored value is "Ann"; a search typed as `(cn=*Ann*)` has to find it. Building
+        // the query trigrams without folding produced "^An"/"Ann", the index held
+        // "^an"/"ann", the lookup missed and the answer came back empty - a false negative,
+        // and invisible to any fixture whose values were already lowercase.
+        let entries = vec![
+            entry("cn=a,dc=example,dc=com", &[("cn", &["Ann"])]),
+            entry("cn=b,dc=example,dc=com", &[("cn", &["Bob"])]),
+        ];
+        let index = Index::build(&entries, &config(&[("cn", &["sub"])], &[])).expect("index");
+
+        // Three characters and up: a trigram exists, so the index must answer with Ann.
+        for part in ["Ann", "ann", "ANN"] {
+            let candidates = index.candidates(&Query::Substring {
+                attribute: "cn".into(),
+                initial: None,
+                any: vec![part.to_string()],
+                final_part: None,
+            });
+
+            let bitmap = candidates.expect("a trigram exists, so the index must answer");
+            assert!(
+                bitmap.contains(0),
+                "'{part}' must find 'Ann', got {:?}",
+                bitmap.iter().collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn a_substring_query_narrows_to_the_entries_that_can_match() {

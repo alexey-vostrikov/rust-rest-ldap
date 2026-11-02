@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, head};
+use axum::routing::{get, head, post};
 use subtle::ConstantTimeEq;
 
 use crate::reload::Source;
@@ -31,7 +31,39 @@ pub fn router(state: Arc<HttpState>) -> Router {
         .route("/callback", head(callback))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
+        .route("/reindex", post(reindex))
         .with_state(state)
+}
+
+/// `POST /reindex`: rebuild the indexes over the snapshot in memory.
+///
+/// Authorised with the same token as the callback, because it is an operation rather than a
+/// reading. The answer is the measurement itself: entries, attributes, bytes and how long it
+/// took. There is nothing to repair - every write rebuilds the index - so this exists to
+/// answer "what does a rebuild cost here", which is what decides whether an attribute
+/// deserves a trigram index.
+async fn reindex(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> (StatusCode, String) {
+    let Some(expected) = state.callback_token.as_deref() else {
+        return (StatusCode::NOT_FOUND, String::new());
+    };
+
+    if !token_matches(&headers, expected) {
+        return (StatusCode::UNAUTHORIZED, String::new());
+    }
+
+    match state.source.reindex().await {
+        Ok(done) => (
+            StatusCode::OK,
+            format!(
+                "entries={} attributes={} bytes={} millis={}\n",
+                done.entries,
+                done.attributes,
+                done.bytes,
+                done.elapsed.as_millis()
+            ),
+        ),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err}\n")),
+    }
 }
 
 async fn healthz() -> (StatusCode, &'static str) {
@@ -163,6 +195,28 @@ mod tests {
         })
     }
 
+    /// Sends a request and returns the body as well, for the endpoint that answers with one.
+    async fn send_body(
+        router: Router,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(token) = token {
+            builder = builder.header("Authorization", token);
+        }
+        let request = builder.body(Body::empty()).expect("request");
+
+        let response = router.oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
     async fn send(
         router: Router,
         method: &str,
@@ -257,6 +311,82 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(source.generation().await, 0);
+    }
+
+    #[tokio::test]
+    async fn reindex_reports_what_it_cost() {
+        let dir = tempdir().expect("tempdir");
+        let (source, _users) =
+            source(dir.path(), r#"[{"cn":"admin","objectClass":["top"]}]"#).await;
+        let router = router(state(Arc::clone(&source), Some("secret")));
+
+        let (status, body) = send_body(router, "POST", "/reindex", Some("Token secret")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        // The fixture configures no indexes, so the attribute count is zero and the number
+        // that matters is the entries: the naming context, both units and the one user. The
+        // point of the assertion is that the answer *is* the measurement, not a bare "ok".
+        assert!(
+            body.contains("entries=4") && body.contains("attributes=0") && body.contains("millis="),
+            "the answer is the measurement: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_needs_the_token() {
+        // It rebuilds rather than reads, so it is authorised like the callback. A directory
+        // whose index anyone can rebuild on demand is one where anyone can spend its CPU.
+        let dir = tempdir().expect("tempdir");
+        let (source, _users) = source(dir.path(), "[]").await;
+
+        assert_eq!(
+            send(
+                router(state(Arc::clone(&source), Some("secret"))),
+                "POST",
+                "/reindex",
+                Some("Token wrong")
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(
+                router(state(Arc::clone(&source), Some("secret"))),
+                "POST",
+                "/reindex",
+                None
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        // And an unconfigured token disables it with the callback, rather than leaving it open.
+        assert_eq!(
+            send(
+                router(state(source, None)),
+                "POST",
+                "/reindex",
+                Some("Token anything")
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_does_not_reload_the_backend() {
+        // The indexes are rebuilt over the snapshot in memory: the generation counter, which
+        // counts reloads of the store, must not move.
+        let dir = tempdir().expect("tempdir");
+        let (source, _users) =
+            source(dir.path(), r#"[{"cn":"admin","objectClass":["top"]}]"#).await;
+        let router = router(state(Arc::clone(&source), Some("secret")));
+
+        assert_eq!(
+            send(router, "POST", "/reindex", Some("Token secret")).await,
+            StatusCode::OK
+        );
+        assert_eq!(source.generation().await, 0);
+        assert_eq!(source.directory().await.users().len(), 1);
     }
 
     #[tokio::test]

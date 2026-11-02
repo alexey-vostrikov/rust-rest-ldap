@@ -338,6 +338,67 @@ fn substring_filters_agree() {
 }
 
 #[test]
+fn substrings_agree_when_the_data_has_capitals() {
+    // The bug this guards was found by the runtime check, not by a test: every value in the
+    // fixture was lowercase, so folding the query made no difference and the missing fold
+    // was invisible. A directory of real names is not lowercase.
+    let entries = vec![
+        entry_with(
+            "cn=Ann,ou=users,dc=example,dc=com",
+            &[("cn", &["Ann"]), ("sn", &["Smith-Jones"])],
+        ),
+        entry_with(
+            "cn=Bob,ou=users,dc=example,dc=com",
+            &[("cn", &["Bob"]), ("sn", &["Smithson"])],
+        ),
+    ];
+
+    let config = IndexConfig {
+        default: vec!["pres".to_string()],
+        attributes: [("cn", vec!["eq", "sub"]), ("sn", vec!["eq", "sub"])]
+            .into_iter()
+            .map(|(name, kinds)| {
+                (
+                    name.to_string(),
+                    kinds.into_iter().map(str::to_string).collect(),
+                )
+            })
+            .collect(),
+    };
+
+    let plain = Directory::from_entries(BASE, "users", "groups", entries.clone());
+    let indexed = plain.clone().with_indexes(&config).expect("indexes");
+
+    for filter in [
+        substring("cn", "Ann"),
+        substring("cn", "ann"),
+        substring("cn", "ANN"),
+        substring_any("cn", "ob"),
+        substring_any("sn", "Smith"),
+        substring_any("sn", "smith"),
+        substring_final("sn", "son"),
+    ] {
+        assert_eq!(
+            search(&indexed, filter.clone()),
+            search(&plain, filter.clone()),
+            "{filter:?}: the indexed answer must match the scan"
+        );
+    }
+}
+
+/// An entry from explicit values, for the small fixtures above.
+fn entry_with(dn: &str, pairs: &[(&str, &[&str])]) -> Entry {
+    let mut attributes = Attributes::new();
+    for (name, values) in pairs {
+        attributes = attributes.push(Attribute::new(
+            *name,
+            values.iter().map(|value| value.to_string()).collect(),
+        ));
+    }
+    Entry::new(dn, attributes)
+}
+
+#[test]
 fn substring_filters_that_cannot_be_indexed_agree_too() {
     // Two characters make no trigram: the index stands aside and the scan answers.
     assert_same(&substring("cn", "us"), "(cn=us*)");
