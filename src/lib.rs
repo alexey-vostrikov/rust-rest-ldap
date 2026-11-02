@@ -20,3 +20,4 @@ pub mod model;
 pub mod password;
 pub mod security;
 pub mod server;
+pub mod tls;

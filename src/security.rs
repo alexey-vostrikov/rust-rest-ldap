@@ -18,6 +18,10 @@ pub struct Security {
     pub acl: Acl,
     /// Simple bind over an unencrypted connection is refused when false.
     pub allow_plaintext_simple_bind: bool,
+    /// The listener speaks TLS from the first byte (LDAPS).
+    pub ldaps: bool,
+    /// A certificate and key are configured, so StartTLS can be offered.
+    pub starttls: bool,
 }
 
 impl Default for Security {
@@ -27,6 +31,8 @@ impl Default for Security {
             passwords: PasswordPolicy::strict(),
             acl: Acl::default(),
             allow_plaintext_simple_bind: true,
+            ldaps: false,
+            starttls: false,
         }
     }
 }
@@ -38,7 +44,16 @@ impl Security {
             passwords: config.passwords.clone(),
             acl: config.acl.clone(),
             allow_plaintext_simple_bind: config.allow_plaintext_simple_bind,
+            ldaps: config.use_tls,
+            // Both, because the same certificate serves LDAPS and StartTLS and
+            // config load already refuses use_tls without material.
+            starttls: config.server_cert.is_some() && config.server_key.is_some(),
         }
+    }
+
+    /// Whether StartTLS can be offered on a plain connection.
+    pub fn tls_available(&self) -> bool {
+        self.starttls
     }
 }
 

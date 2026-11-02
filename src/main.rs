@@ -62,10 +62,33 @@ async fn main() {
     };
     println!("ldap: listening on {}", config.listen_addr);
 
+    // A certificate is shared by LDAPS and StartTLS; its presence decides whether
+    // either is offered at all.
+    let acceptor = match (&config.server_cert, &config.server_key) {
+        (Some(cert), Some(key)) => match rust_rest_ldap::tls::acceptor(cert, key) {
+            Ok(acceptor) => Some(acceptor),
+            Err(err) => fatal(&err.to_string()),
+        },
+        _ => None,
+    };
+    if config.use_tls {
+        println!(
+            "ldaps: enabled, certificate {}",
+            config
+                .server_cert
+                .as_ref()
+                .map_or("<none>", |path| path.to_str().unwrap_or("<invalid path>"))
+        );
+    } else if acceptor.is_some() {
+        println!("starttls: enabled");
+    }
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let serving = tokio::spawn(rust_rest_ldap::server::serve(
         listener,
+        acceptor,
+        config.use_tls,
         Arc::new(directory),
         Arc::new(security),
         shutdown_rx,

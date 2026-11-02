@@ -7,6 +7,7 @@ pub mod paged;
 pub mod responses;
 pub mod search;
 pub mod session;
+pub mod starttls;
 
 use rasn_ldap::{LdapMessage, ProtocolOp, ResultCode};
 
@@ -21,6 +22,8 @@ pub enum Action {
     Reply(Vec<LdapMessage>),
     /// Keep the connection open without responding (abandon).
     Silent,
+    /// Answer with a success response, then switch the connection to TLS.
+    StartTls(rasn_ldap::MessageId),
     /// Close the connection (unbind, protocol violation).
     Close,
 }
@@ -81,12 +84,20 @@ pub fn handle(
             ResultCode::UnwillingToPerform,
             "modify dn is not supported",
         )]),
-        ProtocolOp::ExtendedReq(_) => Action::Reply(vec![responses::extended_response(
-            message_id,
-            ResultCode::UnwillingToPerform,
-            "extended operations are not supported",
-            None,
-        )]),
+        ProtocolOp::ExtendedReq(request) => {
+            if starttls::is_starttls(request.request_name.as_ref()) {
+                // The connection loop owns the acceptor, so availability is decided
+                // there: the dispatcher only recognises the operation.
+                Action::StartTls(message_id)
+            } else {
+                Action::Reply(vec![responses::extended_response(
+                    message_id,
+                    ResultCode::UnwillingToPerform,
+                    "unsupported extended operation",
+                    None,
+                )])
+            }
+        }
         // A client must not send responses to the server.
         _ => Action::Close,
     }
