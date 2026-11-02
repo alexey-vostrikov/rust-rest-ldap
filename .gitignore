@@ -10,3 +10,9 @@
 ldapsearch
 ldapmodify
 ldapadd
+ldaputil
+ldapdelete
+ldapmodrdn
+ldapcompare
+ldapwhoami
+ldappasswd
