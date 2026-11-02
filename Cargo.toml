@@ -50,3 +50,9 @@ rcgen = "0.14.10"
 serde_json = "1.0.154"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+
+# A local copy of rasn-ldap with the RFC 4511 result codes upstream is missing
+# (118-123, including assertionFailed). The patch is the enum variants only; it is
+# meant to be offered upstream and dropped once a release carries them.
+[patch.crates-io]
+rasn-ldap = { path = "vendor/rasn-ldap" }

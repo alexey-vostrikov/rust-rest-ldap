@@ -103,6 +103,7 @@ fn run(session: &Session, dn: &str, changes: Vec<ModifyRequestChanges>) -> Outco
         &directory(),
         1,
         &request(dn, changes),
+        None,
         &Security::default(),
     )
 }
@@ -359,6 +360,7 @@ fn modifying_an_operational_attribute_is_a_constraint_violation() {
             ALICE_DN,
             vec![change(ChangeOperation::Replace, "entryUUID", &["cccc"])],
         ),
+        None,
         &security,
     );
 
@@ -393,6 +395,7 @@ fn schema_off_lets_the_write_through() {
         &directory(),
         1,
         &request(ALICE_DN, vec![change(ChangeOperation::Delete, "sn", &[])]),
+        None,
         &security,
     );
 
