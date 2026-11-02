@@ -107,6 +107,8 @@ mod tests {
             http_listen_addr: None,
             callback_auth_token: Some("secret".to_string()),
             passwords: Default::default(),
+            schema: crate::schema::Schema::core(),
+            schema_mode: crate::schema::Mode::Strict,
             acl: Default::default(),
             allow_plaintext_simple_bind: true,
         };

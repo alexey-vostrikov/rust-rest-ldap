@@ -21,6 +21,7 @@ pub mod mapping;
 pub mod model;
 pub mod password;
 pub mod reload;
+pub mod schema;
 pub mod security;
 pub mod server;
 pub mod tls;

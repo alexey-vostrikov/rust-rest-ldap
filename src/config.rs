@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::acl::{AccessRuleConfig, Acl, AclError};
 use crate::password::PasswordPolicy;
+use crate::schema::{Mode as SchemaMode, Schema, SchemaError};
 use crate::password::policy::{PasswordConfig, PolicyError};
 
 pub const DEFAULT_BACKEND: &str = "rest";
@@ -61,6 +62,8 @@ pub struct Config {
     pub http_listen_addr: Option<String>,
     pub callback_auth_token: Option<String>,
     pub passwords: PasswordPolicy,
+    pub schema: Schema,
+    pub schema_mode: SchemaMode,
     pub acl: Acl,
     pub allow_plaintext_simple_bind: bool,
 }
@@ -91,6 +94,20 @@ pub enum ConfigError {
     Password(#[from] PolicyError),
     #[error(transparent)]
     Access(#[from] AclError),
+    #[error("error loading schema from '{path}': {source}")]
+    Schema {
+        path: String,
+        #[source]
+        source: SchemaError,
+    },
+    #[error("error reading schema file '{path}': {source}")]
+    SchemaRead {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("unknown schema mode: {0}")]
+    SchemaMode(String),
 }
 
 /// Subset of the configuration that lives in the YAML file.
@@ -117,6 +134,18 @@ struct FileConfig {
     access: Option<Vec<AccessRuleConfig>>,
     #[serde(default)]
     bind: BindConfig,
+    #[serde(default)]
+    schema: SchemaConfig,
+}
+
+/// `schema:` section of the configuration file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SchemaConfig {
+    /// `strict` (default), `warn` or `off`.
+    pub mode: Option<String>,
+    /// Extra `.schema` files, read after the built-in definitions.
+    pub files: Vec<PathBuf>,
 }
 
 /// `bind:` section of the configuration file.
@@ -221,6 +250,13 @@ pub fn resolve(
         http_listen_addr: file.http_listen_addr.filter(|addr| !addr.trim().is_empty()),
         callback_auth_token: file.callback_auth_token,
         passwords: PasswordPolicy::from_config(file.passwords.as_ref())?,
+        schema: load_schema(&file.schema)?,
+        schema_mode: match file.schema.mode.as_deref() {
+            None => SchemaMode::Strict,
+            Some(text) => text
+                .parse()
+                .map_err(|err: String| ConfigError::SchemaMode(err))?,
+        },
         acl: crate::acl::from_config(file.access.as_deref())?,
         allow_plaintext_simple_bind: file.bind.allow_plaintext_simple,
     };
@@ -230,6 +266,26 @@ pub fn resolve(
     }
 
     Ok(config)
+}
+
+/// Builds the schema: built-in definitions first, then every configured file.
+fn load_schema(config: &SchemaConfig) -> Result<Schema, ConfigError> {
+    let mut schema = Schema::core();
+
+    for path in &config.files {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::SchemaRead {
+            path: path.display().to_string(),
+            source,
+        })?;
+        schema
+            .extend(&text)
+            .map_err(|source| ConfigError::Schema {
+                path: path.display().to_string(),
+                source,
+            })?;
+    }
+
+    Ok(schema)
 }
 
 fn pick(cli: Option<String>, env: Option<String>, file: Option<String>) -> Option<String> {

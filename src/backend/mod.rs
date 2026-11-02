@@ -128,6 +128,11 @@ pub enum BackendError {
     UpdateNotSupported,
     #[error("redb error on '{path}': {reason}")]
     Redb { path: String, reason: String },
+    #[error("data does not match the schema ({count} problems), first ones: {}", first.join("; "))]
+    SchemaViolations {
+        count: usize,
+        first: Vec<String>,
+    },
 }
 
 /// Selected backend.
