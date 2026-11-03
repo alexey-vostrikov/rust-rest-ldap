@@ -441,7 +441,11 @@ fn ou_entry(ou_name: &str, base_dn: &str) -> Entry {
 }
 
 /// Deterministic entry UUID: UUIDv5 in the OID namespace, as gorestldap does.
-fn entry_uuid(dn: &str) -> String {
+///
+/// Public because content synchronisation has to name an entry that has never been written
+/// through the protocol and therefore carries no `entryUUID` of its own. The value depends only on
+/// the DN, so it is the same after a restart - which is what a replica needs from an identity.
+pub fn entry_uuid(dn: &str) -> String {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, dn.as_bytes()).to_string()
 }
 

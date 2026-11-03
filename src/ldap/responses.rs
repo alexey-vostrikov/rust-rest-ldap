@@ -38,6 +38,15 @@ pub fn search_result_entry(
     dn: &str,
     attributes: &[Attribute],
 ) -> LdapMessage {
+    search_result_entry_with_controls(message_id, dn, attributes, Vec::new())
+}
+
+pub fn search_result_entry_with_controls(
+    message_id: MessageId,
+    dn: &str,
+    attributes: &[Attribute],
+    controls: Vec<rasn_ldap::Control>,
+) -> LdapMessage {
     let attributes = attributes
         .iter()
         .map(|attribute| {
@@ -54,10 +63,15 @@ pub fn search_result_entry(
         })
         .collect();
 
-    LdapMessage::new(
+    let mut message = LdapMessage::new(
         message_id,
         ProtocolOp::SearchResEntry(SearchResultEntry::new(LdapDn::from(dn), attributes)),
-    )
+    );
+    if !controls.is_empty() {
+        message.controls = Some(controls);
+    }
+
+    message
 }
 
 pub fn search_done(message_id: MessageId, code: ResultCode, diagnostic: &str) -> LdapMessage {

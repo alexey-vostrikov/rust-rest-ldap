@@ -20,6 +20,7 @@ pub const MANAGEDSAIT_OID: &str = "2.16.840.1.113730.3.4.2";
 use super::responses::{self, search_done_with_controls, search_result_entry};
 use super::session::Session;
 use super::sort;
+use super::sync;
 use crate::directory::Directory;
 use crate::model::{Attribute, Attributes};
 use crate::security::Security;
@@ -62,6 +63,7 @@ pub fn handle_search(
     let mut sort_critical = false;
     let mut virtual_list: Option<sort::VirtualList> = None;
     let mut manage_dsa_it = false;
+    let mut sync_request: Option<sync::SyncRequest> = None;
     for control in controls.into_iter().flatten() {
         if control.control_type.as_ref() == PAGED_RESULTS_OID.as_bytes() {
             has_paged_control = true;
@@ -126,6 +128,24 @@ pub fn handle_search(
                         message_id,
                         ResultCode::ProtocolError,
                         "the VLV control carries no value",
+                    )];
+                }
+            }
+        } else if control.control_type.as_ref() == sync::SYNC_OID.as_bytes() {
+            let Some(value) = control.control_value.as_ref() else {
+                return vec![responses::search_done(
+                    message_id,
+                    ResultCode::ProtocolError,
+                    "the sync control carries no value",
+                )];
+            };
+            match sync::decode_request(value.as_ref()) {
+                Ok(request) => sync_request = Some(request),
+                Err(err) => {
+                    return vec![responses::search_done(
+                        message_id,
+                        ResultCode::ProtocolError,
+                        &format!("error decoding the sync control: {err}"),
                     )];
                 }
             }
@@ -202,6 +222,22 @@ pub fn handle_search(
             message_id,
             ResultCode::NoSuchObject,
             &format!("no such object: {base_object}"),
+        )];
+    }
+
+    // `refreshAndPersist` is a second mode of the connection: the answer stays open and changes
+    // are pushed as they happen. This server does not implement it, and §2.5 of RFC 4533 has the
+    // code for saying so - `syncRefreshRequired` tells the client to start again in a mode this
+    // server can serve, which is a better answer than a refreshOnly stream the client would wait
+    // on forever.
+    if sync_request
+        .as_ref()
+        .is_some_and(|sync| sync.mode == sync::Mode::RefreshAndPersist)
+    {
+        return vec![responses::search_done(
+            message_id,
+            ResultCode::UnwillingToPerform,
+            "refreshAndPersist is not implemented: ask again with refreshOnly",
         )];
     }
 
@@ -347,6 +383,14 @@ pub fn handle_search(
         }
     };
 
+    // The identity each entry is reported under. Taken from the entry's own `entryUUID` when it
+    // has one, and from the DN otherwise: a replica that is given a made-up identity files the
+    // entry under the wrong object, and the deterministic UUID depends only on the DN, so it is
+    // the same after a restart.
+    let sync_cookie = sync_request
+        .as_ref()
+        .map(|_| directory.snapshot().to_string().into_bytes());
+
     let mut messages: Vec<LdapMessage> = matched[page_start..page_end]
         .iter()
         .map(|(dn, attributes)| {
@@ -365,11 +409,39 @@ pub fn handle_search(
             } else {
                 visible
             };
-            search_result_entry(message_id, dn, &selected)
+            let state_controls = match (&sync_request, &sync_cookie) {
+                (Some(_), Some(cookie)) => {
+                    let uuid = attributes
+                        .get(crate::model::ATTR_ENTRY_UUID)
+                        .and_then(|attribute| attribute.values.first().cloned())
+                        .unwrap_or_else(|| crate::directory::entry_uuid(dn));
+                    match sync::uuid_bytes(&uuid) {
+                        // `present`: this answer describes the directory as it is now, and the
+                        // client reconciles. Without a history of changes there is nothing to
+                        // report as `add` or `modify` - and a wrong state is worse than none.
+                        Some(uuid) => vec![sync::state_control(
+                            sync::State::Present,
+                            &uuid,
+                            Some(cookie),
+                        )],
+                        None => Vec::new(),
+                    }
+                }
+                _ => Vec::new(),
+            };
+
+            responses::search_result_entry_with_controls(message_id, dn, &selected, state_controls)
         })
         .collect();
 
     let mut controls_out: Controls = Vec::new();
+
+    // The end of a synchronised answer carries its own control, and only that: RFC 4533 §2.5
+    // says a client that does not find it must treat the refresh as failed even if every entry
+    // arrived.
+    if let Some(cookie) = &sync_cookie {
+        controls_out.push(sync::done_control(Some(cookie), false));
+    }
 
     // A sorted search without the sort response leaves the client guessing whether the
     // order it sees is the order it asked for.
