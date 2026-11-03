@@ -146,10 +146,11 @@ pub enum Error {
     )]
     OutsideBase { dn: String, base_dn: String },
     #[error(
-        "bootstrap is configured for the '{backend}' backend, which does not keep writes of \
-         its own; use the 'redb' backend, or prepare the store with an offline tool"
+        "bootstrap is configured for the '{backend}' backend, which stores users and groups \
+         as fixed objects and has no place for a whole entry; use the 'redb' backend, or \
+         prepare the store with an offline tool"
     )]
-    ReadOnlyBackend { backend: String },
+    BackendCannotStoreEntries { backend: String },
     #[error("cannot read the bootstrap password from '{path}': {source}")]
     PasswordFile {
         path: String,
@@ -216,8 +217,8 @@ pub async fn seed_with(
     // Refused before the store is read: a backend that cannot keep the write would create
     // an administrator that disappears at the next restart, and the operator would find
     // out by not being able to log in.
-    if !backend.keeps_writes() {
-        return Err(Error::ReadOnlyBackend {
+    if !backend.stores_entries() {
+        return Err(Error::BackendCannotStoreEntries {
             backend: backend.name().to_string(),
         });
     }

@@ -231,8 +231,8 @@ async fn a_backend_that_cannot_keep_the_write_is_refused() {
         .await
         .expect_err("must refuse");
     assert!(
-        matches!(err, Error::ReadOnlyBackend { .. }),
-        "expected ReadOnlyBackend, got {err}"
+        matches!(err, Error::BackendCannotStoreEntries { .. }),
+        "expected BackendCannotStoreEntries, got {err}"
     );
 }
 
