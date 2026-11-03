@@ -13,6 +13,7 @@ pub mod acl;
 pub mod backend;
 pub mod bootstrap;
 pub mod cli;
+pub mod cli_connection;
 pub mod client;
 pub mod config;
 pub mod config_store;

@@ -14,7 +14,8 @@ use rasn_ldap::{
     Control, LdapDn, LdapString, ResultCode, SearchRequest, SearchRequestDerefAliases,
     SearchRequestScope,
 };
-use rust_rest_ldap::client::{Client, Options, Trust};
+use rust_rest_ldap::cli_connection::Connection;
+use rust_rest_ldap::client::{Client, Options};
 use rust_rest_ldap::ldap::filter_parse;
 use rust_rest_ldap::ldap::{paged, sort};
 use rust_rest_ldap::ldif;
@@ -159,6 +160,23 @@ impl Deref {
     }
 }
 
+impl Cli {
+    /// This tool's flags as the shared connection settings.
+    fn connection(&self) -> Connection {
+        Connection {
+            url: self.url.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            bind_dn: self.bind_dn.clone(),
+            password: self.password.clone(),
+            ask_password: self.ask_password,
+            starttls: self.starttls,
+            insecure: self.insecure,
+            ca_cert: self.ca_cert.clone(),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -205,7 +223,7 @@ impl From<rust_rest_ldap::client::Error> for Failure {
 }
 
 async fn run(cli: &Cli) -> Result<ResultCode, Failure> {
-    let url = url_of(cli)?;
+    let connection = cli.connection();
 
     let filter = match &cli.filter {
         Some(text) => filter_parse::parse(text)
@@ -236,22 +254,15 @@ async fn run(cli: &Cli) -> Result<ResultCode, Failure> {
 
     let options = Options {
         timeout: std::time::Duration::from_secs(cli.timeout),
-        trust: trust_of(cli),
+        trust: connection.trust(),
         ..Options::default()
     };
 
-    let client = Client::connect(&url, options).await?;
+    let client = Client::connect(&connection.url(), options).await?;
 
-    // A bind only when a DN or a password was given: an anonymous search is a legitimate
-    // question, and forcing a bind would change what is being asked.
-    if !cli.bind_dn.is_empty() || cli.password.is_some() || cli.ask_password {
-        let password = password_of(cli)?;
-        client.bind(&cli.bind_dn, &password).await?;
-    }
-
-    if cli.starttls > 0 {
-        client.starttls().await?;
-    }
+    // `authenticate` binds only when a DN or a password was given: an anonymous search is a
+    // legitimate question, and forcing a bind would change what is being asked.
+    connection.authenticate(&client).await?;
 
     let page_size = page_size_of(cli)?;
     let entries = collect(cli, &client, request, page_size).await?;
@@ -443,51 +454,6 @@ fn wrap_enabled(cli: &Cli) -> bool {
     true
 }
 
-fn url_of(cli: &Cli) -> Result<String, Failure> {
-    if let Some(url) = &cli.url {
-        return Ok(url.clone());
-    }
-
-    let host = cli.host.clone().unwrap_or_else(|| "localhost".to_string());
-    match cli.port {
-        Some(port) => Ok(format!("ldap://{host}:{port}")),
-        None => Ok(format!("ldap://{host}")),
-    }
-}
-
-fn trust_of(cli: &Cli) -> Trust {
-    if cli.insecure {
-        return Trust::Insecure;
-    }
-    match &cli.ca_cert {
-        Some(path) => Trust::File(path.clone()),
-        None => Trust::WebPki,
-    }
-}
-
-/// The password, from the flag or from the terminal.
-fn password_of(cli: &Cli) -> Result<String, Failure> {
-    if let Some(password) = &cli.password {
-        return Ok(password.clone());
-    }
-
-    if !cli.ask_password {
-        // A bind DN with no password is an unauthenticated bind, which servers refuse; saying
-        // so beats sending an empty password and reporting the refusal as a bad credential.
-        return Ok(String::new());
-    }
-
-    eprint!("Enter LDAP Password: ");
-    let _ = std::io::stderr().flush();
-
-    let mut password = String::new();
-    std::io::stdin()
-        .read_line(&mut password)
-        .map_err(|err| Failure::Usage(format!("cannot read the password: {err}")))?;
-
-    Ok(password.trim_end_matches(['\r', '\n']).to_string())
-}
-
 fn scope_of(scope: Scope) -> SearchRequestScope {
     match scope {
         Scope::Base => SearchRequestScope::BaseObject,
@@ -506,6 +472,7 @@ fn exit_code(code: ResultCode) -> ExitCode {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use rust_rest_ldap::client::Trust;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("ldapsearch").chain(args.iter().copied()))
@@ -528,21 +495,26 @@ mod tests {
     }
 
     #[test]
-    fn a_url_is_built_from_host_and_port_when_the_url_is_absent() {
-        let cli = parse(&["-h", "ldap.example.com", "-p", "1389"]);
+    fn the_connection_settings_come_from_the_flags() {
+        // Building a URL and choosing a trust policy are tested once, in `cli_connection`;
+        // what belongs to this tool is that its flags reach them.
+        let cli = parse(&[
+            "-h",
+            "ldap.example.com",
+            "-p",
+            "1389",
+            "--cacert",
+            "/etc/ca.pem",
+        ]);
+        let connection = cli.connection();
+
+        assert_eq!(connection.url(), "ldap://ldap.example.com:1389");
         assert_eq!(
-            url_of(&cli).ok().as_deref(),
-            Some("ldap://ldap.example.com:1389")
+            connection.trust(),
+            Trust::File(std::path::PathBuf::from("/etc/ca.pem"))
         );
 
-        let cli = parse(&["-h", "ldap.example.com"]);
-        assert_eq!(
-            url_of(&cli).ok().as_deref(),
-            Some("ldap://ldap.example.com")
-        );
-
-        let cli = parse(&[]);
-        assert_eq!(url_of(&cli).expect("url"), "ldap://localhost");
+        assert_eq!(parse(&[]).connection().url(), "ldap://localhost");
     }
 
     #[test]
@@ -656,21 +628,5 @@ mod tests {
             ExitCode::from(49)
         );
         assert_eq!(exit_code(ResultCode::SizeLimitExceeded), ExitCode::from(4));
-    }
-
-    #[test]
-    fn the_trust_policy_follows_the_flags() {
-        assert!(matches!(
-            trust_of(&parse(&["-H", "ldap://h"])),
-            Trust::WebPki
-        ));
-        assert!(matches!(
-            trust_of(&parse(&["-H", "ldap://h", "--insecure"])),
-            Trust::Insecure
-        ));
-        assert!(matches!(
-            trust_of(&parse(&["-H", "ldap://h", "--cacert", "/etc/ca.pem"])),
-            Trust::File(_)
-        ));
     }
 }
