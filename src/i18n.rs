@@ -636,6 +636,93 @@ mod tests {
         assert_eq!(Locale::parse(""), None);
     }
 
+    // ---- the language decision, tested as a decision ----
+    //
+    // These were impossible while the decision lived in `main`: it read the environment, opened
+    // the configuration file and probed the filesystem in one function, and a private function
+    // in a binary cannot be reached by a test.
+
+    fn no_catalogue(_: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    #[test]
+    fn a_loaded_configuration_decides_before_anything_is_scanned() {
+        let decided = Locale::parse("de").expect("a tag");
+        let resolved = resolve_language(
+            Some((decided.clone(), Source::Config, None)),
+            // The file asks for Russian and must lose: the configuration already loaded, so its
+            // answer is the one that counts.
+            Some("locale: ru\n"),
+            &|name| (name == "RUST_REST_LDAP_LOCALE").then(|| "fr".to_string()),
+            no_catalogue,
+        );
+
+        assert_eq!(resolved.0, decided);
+        assert_eq!(resolved.1, Source::Config);
+    }
+
+    #[test]
+    fn a_file_that_did_not_load_still_governs_the_language_of_its_own_complaint() {
+        let resolved = resolve_language(
+            None,
+            Some("locale: ru\nbase_dn: [unclosed\n"),
+            &|name| (name == "RUST_REST_LDAP_LOCALE").then(|| "fr".to_string()),
+            no_catalogue,
+        );
+
+        assert_eq!(
+            resolved.0,
+            Locale::parse("ru").expect("a tag"),
+            "the file wins over the environment for its own errors"
+        );
+        assert_eq!(resolved.1, Source::Config);
+    }
+
+    #[test]
+    fn without_a_file_the_environment_decides() {
+        let resolved = resolve_language(
+            None,
+            None,
+            &|name| (name == "RUST_REST_LDAP_LOCALE").then(|| "ru".to_string()),
+            no_catalogue,
+        );
+
+        assert_eq!(resolved.0, Locale::parse("ru").expect("a tag"));
+        assert_eq!(resolved.1, Source::Env);
+    }
+
+    #[test]
+    fn an_english_file_does_not_shadow_the_environment() {
+        // `locale: en` says "the built-in English", which is not a decision to overrule the
+        // environment: the operator asked for no translation, not for English over their locale.
+        let resolved = resolve_language(
+            None,
+            Some("locale: en\n"),
+            &|name| (name == "RUST_REST_LDAP_LOCALE").then(|| "ru".to_string()),
+            no_catalogue,
+        );
+
+        assert_eq!(resolved.0, Locale::parse("ru").expect("a tag"));
+        assert_eq!(resolved.1, Source::Env);
+    }
+
+    #[test]
+    fn the_catalogue_is_looked_up_for_the_language_that_was_chosen() {
+        let looked_for = std::cell::RefCell::new(Vec::new());
+        let resolved = resolve_language(None, Some("locale: ru\n"), &|_| None, |tag| {
+            looked_for.borrow_mut().push(tag.to_string());
+            Some(std::path::PathBuf::from(format!("locale/{tag}.yaml")))
+        });
+
+        assert_eq!(looked_for.into_inner(), vec!["ru".to_string()]);
+        assert_eq!(
+            resolved.2,
+            Some(std::path::PathBuf::from("locale/ru.yaml")),
+            "and its path is handed back, not opened here"
+        );
+    }
+
     #[test]
     fn english_is_built_in_and_complete() {
         let catalog = Catalog::builtin();
