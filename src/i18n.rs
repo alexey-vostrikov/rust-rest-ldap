@@ -442,6 +442,10 @@ const ENGLISH: &[(&str, &str)] = &[
         "client {peer} sent a malformed message, connection closed",
     ),
     ("error.client", "client {peer}: {detail}"),
+    (
+        "error.panic",
+        "connection {peer} ended in an internal error; the listeners are unaffected",
+    ),
     ("error.journal", "cannot write the change journal: {detail}"),
     (
         "error.bootstrap",
