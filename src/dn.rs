@@ -115,6 +115,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_escaped_comma_does_not_end_the_rdn() {
+        // RFC 4514 lets a value carry a comma as `\,`. Splitting at the first comma turned
+        // `cn=Doe\, John,ou=...` into the value `Doe\` and the parent ` John,ou=...` - a defect
+        // that lived in every consumer of a DN and only missed entries with a comma in the name.
+        let (attribute, value, parent) =
+            split_first_rdn(r"cn=Doe\, John,ou=users,dc=example,dc=com");
+
+        assert_eq!(attribute, "cn");
+        assert_eq!(value, r"Doe\, John");
+        assert_eq!(parent, "ou=users,dc=example,dc=com");
+    }
+
+    #[test]
+    fn a_separator_after_an_escaped_one_is_a_separator() {
+        // The escape ends at the character it protects. Leaving it open would make the rest of
+        // the DN escaped, and the split would never happen.
+        let (_, value, parent) = split_first_rdn(r"cn=a\,b,ou=users,dc=example,dc=com");
+
+        assert_eq!(value, r"a\,b");
+        assert_eq!(parent, "ou=users,dc=example,dc=com");
+    }
+
+    #[test]
+    fn an_escaped_backslash_does_not_protect_the_next_character() {
+        // `\\` is one literal backslash; the comma after it is a separator again.
+        let (_, value, parent) = split_first_rdn(r"cn=a\\,ou=users");
+
+        assert_eq!(value, r"a\\");
+        assert_eq!(parent, "ou=users");
+    }
+
+    #[test]
+    fn the_first_character_is_not_treated_as_escaped() {
+        // `\,x` is an escaped comma at the very start: the escape protects it, so there is no
+        // separator at all. Starting the flag as "already escaped" would consume the backslash
+        // without protecting anything and split at the comma instead.
+        assert_eq!(split_unescaped(r"\,x", ','), None);
+        assert_eq!(split_unescaped("x,y", ','), Some(("x", "y")));
+    }
+
+    #[test]
+    fn a_dn_without_a_separator_has_no_parent() {
+        let (attribute, value, parent) = split_first_rdn("cn=solo");
+
+        assert_eq!(attribute, "cn");
+        assert_eq!(value, "solo");
+        assert_eq!(parent, "");
+    }
+
+    #[test]
+    fn unescaping_removes_the_directory_escapes_and_keeps_hex_pairs() {
+        assert_eq!(unescape(r"Doe\, John"), "Doe, John");
+        assert_eq!(unescape(r"a\+b"), "a+b");
+        // A hex pair is a byte, and turning it into a character here could split a multibyte
+        // one; it is left as written for whoever decodes it.
+        assert_eq!(unescape(r"caf\c3\a9"), r"caf\c3\a9");
+        // A trailing backslash alone is kept rather than swallowed.
+        assert_eq!(unescape("a\\"), "a\\");
+    }
+
+    #[test]
     fn lowercases_and_removes_spaces_after_comma() {
         assert_eq!(
             normalize("DC=Test, dc=EXAMPLE,  dc=com"),
