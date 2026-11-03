@@ -35,7 +35,6 @@ pub const VLV_OID: &str = "2.16.840.1.113730.3.4.9";
 pub const VLV_RESPONSE_OID: &str = "2.16.840.1.113730.3.4.10";
 
 const SEQUENCE_TAG: u8 = 0x30;
-const SET_TAG: u8 = 0x31;
 const OCTET_STRING_TAG: u8 = 0x04;
 const INTEGER_TAG: u8 = 0x02;
 const ENUMERATED_TAG: u8 = 0x0a;
@@ -220,16 +219,15 @@ pub fn decode_sort(value: &[u8]) -> Result<SortRequest, ControlError> {
         return Err(ControlError::TrailingBytes);
     }
 
-    let mut inner = Reader::new(body);
-    let keys_body = inner.set()?;
-    if !inner.is_empty() {
-        // The control has an optional `criticality`-like tail in some dialects; this
-        // server does not use it, and ignoring it silently would be a guess.
-        return Err(ControlError::TrailingBytes);
-    }
-
+    // RFC 2891 §2.4: `SortKeyList ::= SEQUENCE OF SEQUENCE { ... }`. The control *value* is the
+    // key list itself, so what came out of `sequence()` above is already the list of keys.
+    //
+    // This used to read a second container here, as a SET - `SEQUENCE { SET { keys } }` - which
+    // is not the wire format. Both the encoder and the decoder agreed on that shape, so every
+    // round-trip test passed while a real client's `30 06 30 04 04 02 "cn"` was read as "a key
+    // list holding nothing, and then an OCTET STRING where a key should be".
     let mut keys = Vec::new();
-    let mut keys_reader = Reader::new(keys_body);
+    let mut keys_reader = Reader::new(body);
     while !keys_reader.is_empty() {
         let key_body = keys_reader.sequence()?;
         let mut key_reader = Reader::new(key_body);
@@ -241,13 +239,26 @@ pub fn decode_sort(value: &[u8]) -> Result<SortRequest, ControlError> {
             reverse: false,
         };
 
-        // Optional `orderingRule` and `reverseOrder` follow, in that order.
-        if !key_reader.is_empty() && key_reader.peek() == Some(OCTET_STRING_TAG) {
-            let rule = String::from_utf8_lossy(key_reader.octet_string()?).into_owned();
+        // Optional `orderingRule [0]` and `reverseOrder [1]` follow, in that order. Both are
+        // context-tagged, and the universal forms are accepted as well: the RFC is the
+        // standard, and being unable to read what a client actually puts on the wire is a
+        // worse failure than accepting a second spelling of the same thing.
+        if !key_reader.is_empty()
+            && matches!(key_reader.peek(), Some(CONTEXT_0) | Some(OCTET_STRING_TAG))
+        {
+            key_reader.advance();
+            let rule = String::from_utf8_lossy(key_reader.with_length()?).into_owned();
             key.ordering_rule = Some(rule);
         }
-        if !key_reader.is_empty() && key_reader.peek() == Some(BOOLEAN_TAG) {
-            key.reverse = key_reader.boolean()?;
+        if !key_reader.is_empty()
+            && matches!(key_reader.peek(), Some(CONTEXT_1) | Some(BOOLEAN_TAG))
+        {
+            key_reader.advance();
+            let content = key_reader.with_length()?;
+            if content.len() != 1 {
+                return Err(ControlError::Truncated);
+            }
+            key.reverse = content[0] != 0;
         }
         if !key_reader.is_empty() {
             return Err(ControlError::UnexpectedTag(key_reader.peek().unwrap_or(0)));
@@ -287,9 +298,10 @@ pub fn encode_sort(request: &SortRequest) -> Vec<u8> {
         }
 
         if key.reverse {
-            // `reverseOrder` is a BOOLEAN, and only `true` is ever written: absent and
-            // `false` mean the same thing, and BER prefers the shorter form.
-            body.push(BOOLEAN_TAG);
+            // `reverseOrder [1] BOOLEAN DEFAULT FALSE`: context-tagged, and only `true` is ever
+            // written, because absent and `false` mean the same thing and BER prefers the
+            // shorter form. A live client sends `81 01 ff` here, not `01 01 ff`.
+            body.push(CONTEXT_1);
             body.push(1);
             body.push(0xff);
         }
@@ -299,13 +311,10 @@ pub fn encode_sort(request: &SortRequest) -> Vec<u8> {
         keys.extend_from_slice(&body);
     }
 
-    let mut set = vec![SET_TAG];
-    set.extend(encode_length(keys.len()));
-    set.extend_from_slice(&keys);
-
+    // `SortKeyList ::= SEQUENCE OF SEQUENCE`, so the container of the keys is a SEQUENCE.
     let mut out = vec![SEQUENCE_TAG];
-    out.extend(encode_length(set.len()));
-    out.extend_from_slice(&set);
+    out.extend(encode_length(keys.len()));
+    out.extend_from_slice(&keys);
 
     out
 }
@@ -641,11 +650,6 @@ impl<'a> Reader<'a> {
         self.with_length()
     }
 
-    fn set(&mut self) -> Result<&'a [u8], ControlError> {
-        self.expect(SET_TAG)?;
-        self.with_length()
-    }
-
     fn octet_string(&mut self) -> Result<&'a [u8], ControlError> {
         self.expect(OCTET_STRING_TAG)?;
         self.with_length()
@@ -668,15 +672,6 @@ impl<'a> Reader<'a> {
             value = (value << 8) | *byte as i64;
         }
         Ok(value)
-    }
-
-    fn boolean(&mut self) -> Result<bool, ControlError> {
-        self.expect(BOOLEAN_TAG)?;
-        let content = self.with_length()?;
-        if content.len() != 1 {
-            return Err(ControlError::Truncated);
-        }
-        Ok(content[0] != 0)
     }
 
     fn with_length(&mut self) -> Result<&'a [u8], ControlError> {
@@ -909,9 +904,101 @@ mod tests {
 
     #[test]
     fn an_empty_key_list_is_refused() {
+        // `30 00` is a legal BER encoding of an empty `SEQUENCE OF`.
+        assert_eq!(decode_sort(&[0x30, 0x00]), Err(ControlError::NoKeys));
+    }
+
+    // ---- what a real client puts on the wire ----
+    //
+    // These bytes were captured from the OpenLDAP `ldapsearch` of this machine talking to this
+    // server. They are the reason this codec was wrong: encode and decode agreed with each
+    // other, so every round-trip test passed, and both disagreed with the client. A round trip
+    // proves self-consistency, never correctness.
+
+    #[test]
+    fn the_bytes_a_live_client_sends_for_one_ascending_key_decode() {
+        // `-E sss=cn`:
+        //   30 06            SortKeyList (a SEQUENCE, not a SET)
+        //     30 04          SortKey
+        //       04 02 "cn"   attributeType
         assert_eq!(
-            decode_sort(&[0x30, 0x02, 0x31, 0x00]),
-            Err(ControlError::NoKeys)
+            decode_sort(&[0x30, 0x06, 0x30, 0x04, 0x04, 0x02, b'c', b'n']),
+            Ok(SortRequest {
+                keys: vec![SortKey {
+                    attribute: "cn".to_string(),
+                    ordering_rule: None,
+                    reverse: false,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn the_bytes_a_live_client_sends_for_a_reverse_key_decode() {
+        // `-E sss=-cn`: `30 09 30 07 04 02 "cn" 81 01 ff` - reverseOrder is `[1]`, context 0x81,
+        // where this server both wrote and expected a universal BOOLEAN 0x01.
+        assert_eq!(
+            decode_sort(&[
+                0x30, 0x09, 0x30, 0x07, 0x04, 0x02, b'c', b'n', 0x81, 0x01, 0xff
+            ]),
+            Ok(SortRequest {
+                keys: vec![SortKey {
+                    attribute: "cn".to_string(),
+                    ordering_rule: None,
+                    reverse: true,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn the_bytes_a_live_client_sends_for_a_key_with_an_ordering_rule_decode() {
+        // `-E sss=cn:caseExactOrderingMatch`:
+        //   30 1e 30 1c 04 02 "cn" 80 16 "caseExactOrderingMatch"
+        // The rule is `[0]`, context 0x80; the decoder expected a universal OCTET STRING, so a
+        // round trip with a rule would have failed - which is why no round trip had one.
+        let mut value = vec![0x30, 0x1e, 0x30, 0x1c, 0x04, 0x02, b'c', b'n', 0x80, 0x16];
+        value.extend_from_slice(b"caseExactOrderingMatch");
+
+        assert_eq!(
+            decode_sort(&value),
+            Ok(SortRequest {
+                keys: vec![SortKey {
+                    attribute: "cn".to_string(),
+                    ordering_rule: Some("caseExactOrderingMatch".to_string()),
+                    reverse: false,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn what_this_server_encodes_is_what_a_live_client_encodes() {
+        // The whole point: not that encode and decode agree, but that they agree with the client.
+        let one = SortRequest {
+            keys: vec![SortKey {
+                attribute: "cn".to_string(),
+                ordering_rule: None,
+                reverse: false,
+            }],
+        };
+        assert_eq!(
+            encode_sort(&one),
+            vec![0x30, 0x06, 0x30, 0x04, 0x04, 0x02, b'c', b'n']
+        );
+
+        let reversed = SortRequest {
+            keys: vec![SortKey {
+                attribute: "cn".to_string(),
+                ordering_rule: None,
+                reverse: true,
+            }],
+        };
+        assert_eq!(
+            encode_sort(&reversed),
+            vec![
+                0x30, 0x09, 0x30, 0x07, 0x04, 0x02, b'c', b'n', 0x81, 0x01, 0xff
+            ]
         );
     }
 

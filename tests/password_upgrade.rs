@@ -103,6 +103,13 @@ fn legacy_policy(upgrade: Option<bool>) -> PasswordPolicy {
     .expect("policy")
 }
 
+fn security_unable_to_store(policy: PasswordPolicy) -> Security {
+    Security {
+        can_upgrade_password_hashes: false,
+        ..security(policy)
+    }
+}
+
 fn security(policy: PasswordPolicy) -> Security {
     Security {
         passwords: policy,
@@ -228,6 +235,29 @@ fn a_hash_already_in_the_store_scheme_is_left_alone() {
     assert!(
         upgrade.is_none(),
         "rewriting a hash that is already correct would touch the store on every bind"
+    );
+}
+
+#[test]
+fn a_backend_that_cannot_store_an_entry_does_not_get_one() {
+    // The file backend keeps a fixed user/group document and refuses a whole entry. Asking it
+    // anyway meant the refusal was written to stderr on every successful bind - one line per
+    // login, forever. The decision is taken once, at startup, from the backend.
+    let directory = directory(&ssha(SECRET));
+
+    let mut session = Session::new();
+    let outcome = bind::handle_bind_outcome(
+        &mut session,
+        &directory,
+        1,
+        &bind_request(ALICE_DN, SECRET),
+        &security_unable_to_store(legacy_policy(None)),
+    );
+
+    assert_eq!(code(&outcome.message), ResultCode::Success);
+    assert!(
+        outcome.upgrade.is_none(),
+        "a store that cannot take the entry must not be handed one"
     );
 }
 

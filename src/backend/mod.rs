@@ -192,6 +192,20 @@ impl Backend {
     }
 
     /// The name this backend is configured under.
+    /// Whether this backend can store a whole entry as an upsert.
+    ///
+    /// Not the same question as `keeps_entries_verbatim`: the REST backend maps an entry onto
+    /// its user or group object, so what it stores is not the entry - but it does accept the
+    /// write. The file backend refuses an entry outright: its document has fixed fields, and a
+    /// whole entry has nowhere to go.
+    ///
+    /// A caller that writes without a client waiting for an answer - the password-hash upgrade
+    /// after a successful bind is the only one - asks this first, rather than attempting a write
+    /// it already knows will be refused.
+    pub fn accepts_entry_upserts(&self) -> bool {
+        !matches!(self, Backend::File(_) | Backend::Null(_))
+    }
+
     /// Whether an accepted change is in the store exactly as it was handed over.
     ///
     /// True for the redb store, which writes the entry as one key and reads it back unchanged.

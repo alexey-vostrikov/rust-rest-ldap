@@ -403,7 +403,11 @@ async fn main() {
     };
     // The same schema handle the source holds: a reload through the source has to reach
     // the write path, and a copy would make the two disagree after the first reload.
-    let security = Security::from_config(&config).with_schema(source.shared_schema());
+    let security = Security::from_config(&config)
+        .with_schema(source.shared_schema())
+        // The file backend stores a fixed user/group document and refuses a whole entry, so an
+        // upgrade it cannot keep was attempted on every bind. Decided once, here.
+        .with_password_upgrade(source.accepts_entry_upserts());
 
     println!(
         "{}",

@@ -189,7 +189,11 @@ fn authenticate(
             // The password is in hand for the only time: if the stored hash is not in
             // the configured scheme, write the new one now. `needs_rehash` returns
             // false when the operator turned the upgrade off.
-            if security.passwords.needs_rehash(&stored_hash) {
+            // `can_upgrade_password_hashes` is false when the backend cannot store a whole
+            // entry: attempting it anyway refused the write on every single bind and printed a
+            // line about it each time, which is noise rather than news.
+            if security.can_upgrade_password_hashes && security.passwords.needs_rehash(&stored_hash)
+            {
                 match crate::password::store::hash(&password, security.passwords.store_scheme()) {
                     Ok(upgraded) => {
                         *upgrade = Some(replace_password(entry, &upgraded));

@@ -67,7 +67,7 @@ fn admin() -> Session {
     session
 }
 
-/// Encodes a sort control value: `SEQUENCE { SEQUENCE OF SortKey, ... }`.
+/// Encodes a sort control value: `SortKeyList ::= SEQUENCE OF SortKey` (RFC 2891 §2.4).
 fn sort_value(keys: &[(&str, bool)]) -> Vec<u8> {
     let mut key_list = Vec::new();
     for (attribute, reverse) in keys {
@@ -77,7 +77,8 @@ fn sort_value(keys: &[(&str, bool)]) -> Vec<u8> {
         key.extend_from_slice(attribute.as_bytes());
 
         if *reverse {
-            key.extend_from_slice(&[0x01, 0x01, 0xff]);
+            // `reverseOrder [1] BOOLEAN`: context-tagged, `81 01 ff`, as a live client sends.
+            key.extend_from_slice(&[0x81, 0x01, 0xff]);
         }
 
         key_list.push(0x30);
@@ -85,13 +86,11 @@ fn sort_value(keys: &[(&str, bool)]) -> Vec<u8> {
         key_list.extend_from_slice(&key);
     }
 
-    let mut inner = vec![0x31];
-    inner.push(key_list.len() as u8);
-    inner.extend_from_slice(&key_list);
-
+    // `SortKeyList ::= SEQUENCE OF SEQUENCE`, so the value is one sequence of keys. A SET in
+    // the middle was this project's own invention; a live client sends `30 06 30 04 04 02 cn`.
     let mut out = vec![0x30];
-    out.push(inner.len() as u8);
-    out.extend_from_slice(&inner);
+    out.push(key_list.len() as u8);
+    out.extend_from_slice(&key_list);
     out
 }
 
@@ -424,18 +423,13 @@ fn an_unknown_ordering_rule_fails_a_non_critical_sort_without_refusing_the_searc
     // The control value carries `madeUpMatch` as the ordering rule.
     let mut key = vec![0x04, 0x02, b'c', b'n'];
     let rule = b"madeUpMatch";
-    key.push(0x04);
+    key.push(0x80);
     key.push(rule.len() as u8);
     key.extend_from_slice(rule);
 
-    let mut key_list = vec![0x30, key.len() as u8];
-    key_list.extend_from_slice(&key);
-
-    let mut inner = vec![0x31, key_list.len() as u8];
-    inner.extend_from_slice(&key_list);
-
-    let mut value = vec![0x30, inner.len() as u8];
-    value.extend_from_slice(&inner);
+    // The value is the key list, and each key is itself a sequence: `30 len [30 len key]`.
+    let mut value = vec![0x30, key.len() as u8 + 2, 0x30, key.len() as u8];
+    value.extend_from_slice(&key);
 
     let messages = search(Some(vec![control(SORT_OID, false, value)]), 0);
 
@@ -453,18 +447,13 @@ fn a_critical_sort_that_cannot_be_honoured_refuses_the_search() {
     // sort it cannot get must be an error, not a note.
     let mut key = vec![0x04, 0x02, b'c', b'n'];
     let rule = b"madeUpMatch";
-    key.push(0x04);
+    key.push(0x80);
     key.push(rule.len() as u8);
     key.extend_from_slice(rule);
 
-    let mut key_list = vec![0x30, key.len() as u8];
-    key_list.extend_from_slice(&key);
-
-    let mut inner = vec![0x31, key_list.len() as u8];
-    inner.extend_from_slice(&key_list);
-
-    let mut value = vec![0x30, inner.len() as u8];
-    value.extend_from_slice(&inner);
+    // The value is the key list, and each key is itself a sequence: `30 len [30 len key]`.
+    let mut value = vec![0x30, key.len() as u8 + 2, 0x30, key.len() as u8];
+    value.extend_from_slice(&key);
 
     let messages = search(Some(vec![control(SORT_OID, true, value)]), 0);
 
