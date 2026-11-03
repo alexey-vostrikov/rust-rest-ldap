@@ -1,6 +1,4 @@
 CARGO ?= ./scripts/cargo.sh
-CRAPPER ?= $(HOME)/DevOps/3part/crapper/.venv/bin/python -m crapper
-DRYER ?= $(HOME)/DevOps/3part/dryer/.venv/bin/python -m dryer
 
 .PHONY: build test lint fmt fmt-check check all install miri fuzz fuzz-all metrics dup mutate
 
@@ -70,17 +68,17 @@ install: build
 # target/coverage/**, so the report is copied there; and it must be fresh, or the numbers
 # describe a tree that no longer exists.
 metrics:
-	./scripts/metrics.sh llvm-cov --lcov --output-path /w/.metrics/lcov.info --no-cfg-coverage
-	sed -i 's|^SF:/w/|SF:'"$$PWD"'/|' .metrics/lcov.info
-	mkdir -p target/coverage
-	cp .metrics/lcov.info target/coverage/lcov.info
-	$(CRAPPER) --root . -s ./src --use-existing-coverage
+	./scripts/metrics.sh cargo llvm-cov --lcov --output-path /w/target/coverage/lcov.info --no-cfg-coverage
+	./scripts/metrics.sh crapper --root /w -s /w/src --use-existing-coverage
 
 # Duplicates only: no coverage needed, so this is the cheap one and the one worth running often.
 dup:
-	$(DRYER) --root . -s ./src
+	./scripts/metrics.sh dryer --root /w -s /w/src
 
-# Mutation over a list of files. See the limitation in scripts/mutate-files.sh: today the numbers
-# come out wrong because the test command runs in a container that cannot see the overlay.
+# Mutation, inside the image where the overlay reaches the build. One file at a time.
+#
+# Known cost: the worker path carries a fresh UUID per run, so cargo's package fingerprint never
+# matches and the crate is rebuilt from scratch for every mutant - 27 minutes for 7 sites. D8 in
+# docs/plan.md has the fix; until then a mutation score from this project is not a number.
 mutate:
-	./scripts/mutate-files.sh $(FILES)
+	./scripts/mutate.sh $(FILES)
