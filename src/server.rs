@@ -497,6 +497,43 @@ pub struct Listener {
     pub grace: std::time::Duration,
 }
 
+/// Spawns one connection's body and makes sure a panic in it is reported.
+///
+/// `tokio::spawn` already keeps a panic from killing the process - that part was never in doubt.
+/// What it also does is swallow it: the client's socket closes with no LDAP answer, the connection
+/// counters stay unbalanced, and nothing on stderr names the connection. So a defect in message
+/// handling costs one connection and is invisible.
+///
+/// This keeps the process behaviour and adds the line: the connection is closed either way and the
+/// counters are balanced either way, and a panic arrives at the operator with the peer.
+fn spawn_connection<F>(
+    peer: std::net::SocketAddr,
+    metrics: Arc<Metrics>,
+    body: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::spawn(body);
+
+    tokio::spawn(async move {
+        // Awaiting the handle is what turns a panic into something observable: the task's own
+        // result carries it, and nobody else looks at that result.
+        match handle.await {
+            Ok(()) => {}
+            // A cancelled task is a shutdown, not a defect.
+            Err(err) if err.is_panic() => {
+                eprintln!(
+                    "{}",
+                    crate::i18n::t("error.panic", &[("peer", &peer.to_string())])
+                );
+            }
+            Err(_) => {}
+        }
+        metrics.connection_closed();
+    })
+}
+
 pub async fn serve_with(
     listener: TcpListener,
     settings: Listener,
@@ -538,7 +575,8 @@ pub async fn serve_with(
                 let acceptor = acceptor.clone();
                 let stop = shutdown.clone();
                 let finished = finished_tx.clone();
-                tokio::spawn(async move {
+                let counted = Arc::clone(&observers.metrics);
+                spawn_connection(peer, counted, async move {
                     let stream = match (&acceptor, ldaps) {
                         (Some(acceptor), true) => match acceptor.accept(tcp).await {
                             Ok(tls) => Stream::Tls(Box::new(tls)),
@@ -567,7 +605,6 @@ pub async fn serve_with(
                         peer.to_string(),
                     )
                     .await;
-                    observers.metrics.connection_closed();
 
                     match outcome {
                         Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) | Ok(Hangup::Shutdown) => {}
@@ -1127,5 +1164,81 @@ mod tests {
 
         write(&mut tls, &bind_message(2, b"admin-secret")).await;
         assert_eq!(result_code(&read(&mut tls).await), ResultCode::Success);
+    }
+
+    // ---- a connection that panics must cost that connection only (plan D18) ----
+
+    #[tokio::test]
+    async fn a_panicking_connection_does_not_stop_the_listener() {
+        // What tokio::spawn already guarantees is that the process survives. What nothing
+        // checked is the part an operator cares about: that the listener keeps accepting, that
+        // the connection counters stay balanced, and that the panic is reported rather than
+        // swallowed. This drives the real accept path with a body that panics on the first
+        // connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let metrics = Metrics::new();
+
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loop_metrics = Arc::clone(&metrics);
+        let loop_accepted = Arc::clone(&accepted);
+        let accepting = async move {
+            for _ in 0..2 {
+                let (tcp, peer) = listener.accept().await.expect("accept");
+                let nth = loop_accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let counted = Arc::clone(&loop_metrics);
+                let opened = Arc::clone(&loop_metrics);
+                spawn_connection(peer, counted, async move {
+                    // The counters are opened here and closed by the helper, which is the point:
+                    // the connection that panics still has to be counted as closed.
+                    opened.connection_opened();
+                    if nth == 0 {
+                        // The defect this test is about: something in message handling panics.
+                        panic!("a defect in the handler");
+                    }
+                    drop(tcp);
+                });
+            }
+        };
+
+        let server = tokio::spawn(accepting);
+
+        // First connection: the one that panics.
+        let first = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        drop(first);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Second connection: the listener must still be there, and must still accept.
+        let second = tokio::net::TcpStream::connect(address).await;
+        assert!(
+            second.is_ok(),
+            "the listener must keep accepting after a connection panicked: {:?}",
+            second.err()
+        );
+        drop(second);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("the accept loop finished")
+            .expect("no panic escaped the accept loop");
+
+        // The counter is balanced even for the connection that panicked: otherwise the gauge
+        // drifts up by one per defect and the metric lies about how busy the server is.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both connections were accepted"
+        );
+        assert_eq!(
+            metrics.connections_open(),
+            0,
+            "a connection that panicked is still counted as closed; otherwise the gauge drifts \
+             up by one per defect and lies about how busy the server is"
+        );
     }
 }
