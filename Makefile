@@ -1,6 +1,6 @@
 CARGO ?= ./scripts/cargo.sh
 
-.PHONY: build test lint fmt fmt-check check all install
+.PHONY: build test lint fmt fmt-check check all install miri fuzz fuzz-all
 
 build:
 	$(CARGO) build --release
@@ -18,6 +18,33 @@ lint:
 	$(CARGO) clippy --all-targets -- -D warnings
 
 check: fmt-check lint test
+
+# Miri over the modules that contain no system calls. The interpreted run is ten to a hundred
+# times slower, so it is a module list and not the whole suite: the rest cannot run under Miri
+# at all, because it opens sockets and files.
+#
+# What this buys: the crate forbids unsafe, so undefined behaviour cannot be written here - what
+# Miri checks is that this code does not rely on undefined behaviour in the standard library on
+# the paths it actually executes.
+MIRI_MODULES = dn ldap::codec ldap::filter ldap::filter_parse ldap::assertion ldap::paged sort index mutate schema
+
+miri:
+	@for module in $(MIRI_MODULES); do \
+		echo "=== miri: $$module"; \
+		$(CARGO) +nightly miri test --lib "$$module::" || exit 1; \
+	done
+
+# A fuzz target per parser that reads something an outsider controls. A panicking parser is a
+# server that can be stopped from outside; `forbid(unsafe_code)` does not prevent a panic.
+fuzz:
+	./scripts/fuzz.sh $(TARGET) $(SECONDS)
+
+# One minute each, which is enough to keep the corpus alive between longer runs.
+fuzz-all:
+	@for target in codec filter ldif schema dn endpoint; do \
+		echo "=== fuzz: $$target"; \
+		./scripts/fuzz.sh "$$target" 60 || exit 1; \
+	done
 
 all: check build
 

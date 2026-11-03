@@ -1,0 +1,66 @@
+[package]
+name = "rust-rest-ldap-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Marks this crate as a fuzz target set: `cargo fuzz` looks for it.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rust-rest-ldap = { path = ".." }
+
+# One target per parser that reads something an outsider controls. A parser that panics is a
+# server that can be stopped from outside, which is why these are the ones worth fuzzing:
+# the directory's own code cannot cause undefined behaviour (the crate forbids unsafe), but a
+# panic is not undefined behaviour and `forbid` does not prevent it.
+
+[[bin]]
+name = "codec"
+path = "fuzz_targets/codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter"
+path = "fuzz_targets/filter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ldif"
+path = "fuzz_targets/ldif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "schema"
+path = "fuzz_targets/schema.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dn"
+path = "fuzz_targets/dn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "endpoint"
+path = "fuzz_targets/endpoint.rs"
+test = false
+doc = false
+bench = false
+
+# The same patch the crate itself applies. Without it the fuzz build resolves `rasn-ldap` from
+# crates.io, which does not have the assertion-failed result code this project added to its
+# vendored copy - and the fuzzer fails to compile against a library the server never uses.
+[patch.crates-io]
+rasn-ldap = { path = "../vendor/rasn-ldap" }
