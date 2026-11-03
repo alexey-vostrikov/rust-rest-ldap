@@ -980,8 +980,8 @@ server_cert: server.crt
         assert!(cfg.backends.contains_key("file"));
         assert!(cfg.backends.contains_key("redb"));
         assert!(
-            !cfg.backends.contains_key("rest"),
-            "the shipped example must not offer the backend this build does not have"
+            cfg.backends.contains_key("rest"),
+            "the shipped example documents all three backends"
         );
         assert!(!cfg.use_tls);
     }

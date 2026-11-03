@@ -1106,6 +1106,7 @@ access:
                 "cn=backends,cn=config",
                 "cn=file,cn=backends,cn=config",
                 "cn=redb,cn=backends,cn=config",
+                "cn=rest,cn=backends,cn=config",
                 "cn=bind,cn=config",
                 "cn=indexes,cn=config",
                 "cn=attributes,cn=indexes,cn=config",

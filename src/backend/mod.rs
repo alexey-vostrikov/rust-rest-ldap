@@ -10,12 +10,15 @@ use crate::model::{Entry, Group, User};
 use thiserror::Error;
 
 pub mod file;
+pub mod http;
 pub mod null;
 pub mod redb_store;
+pub mod rest;
 
 pub use file::FileBackend;
 pub use null::NullBackend;
 pub use redb_store::RedbBackend;
+pub use rest::RestBackend;
 
 /// Directory payload as the backends hand it over.
 ///
@@ -128,6 +131,8 @@ pub enum BackendError {
     UpdateNotSupported,
     #[error("redb error on '{path}': {reason}")]
     Redb { path: String, reason: String },
+    #[error("the REST service at '{url}' did not answer: {detail}")]
+    Rest { url: String, detail: String },
     #[error("error building indexes: {0}")]
     Index(#[from] crate::index::IndexError),
     #[error("data does not match the schema ({count} problems), first ones: {}", first.join("; "))]
@@ -148,15 +153,18 @@ pub enum Backend {
     File(FileBackend),
     Null(NullBackend),
     Redb(RedbBackend),
+    Rest(RestBackend),
 }
 
 impl Backend {
-    /// Whether a change written to this backend is still there after a restart.
+    /// Whether this backend can store a whole entry, attributes and all.
     ///
-    /// The JSON backends read a file that the server does not own: a write either goes to
-    /// a file the next reload overwrites, or fails halfway through a set. Anything that
-    /// has to leave a trace - seeding, for one - needs a backend that says yes here.
-    pub fn keeps_writes(&self) -> bool {
+    /// Seeding needs this and not merely durability: the administrator it writes is an entry
+    /// with a password hash, and the backends with a fixed user/group model - `file` and
+    /// `rest` - have nowhere to put it. The REST backend does keep what it writes, in somebody
+    /// else's service; that is a different property, and asking this one is what keeps the
+    /// refusal honest.
+    pub fn stores_entries(&self) -> bool {
         matches!(self, Backend::Redb(_))
     }
 
@@ -166,6 +174,7 @@ impl Backend {
             Backend::File(_) => "file",
             Backend::Null(_) => "null",
             Backend::Redb(_) => "redb",
+            Backend::Rest(_) => "rest",
         }
     }
 
@@ -182,6 +191,12 @@ impl Backend {
                 Ok(Backend::File(FileBackend::from_config(config)?))
             }
             "null" => Ok(Backend::Null(NullBackend)),
+            "rest" => {
+                let config = config.ok_or_else(|| BackendError::MissingConfig {
+                    name: name.to_string(),
+                })?;
+                Ok(Backend::Rest(RestBackend::from_config(config)?))
+            }
             "redb" => {
                 let config = config.ok_or_else(|| BackendError::MissingConfig {
                     name: name.to_string(),
@@ -200,6 +215,7 @@ impl Backend {
             Backend::File(backend) => backend.load(),
             Backend::Null(backend) => backend.load(),
             Backend::Redb(backend) => backend.directory_data(),
+            Backend::Rest(backend) => backend.load().await,
         }
     }
 
@@ -208,6 +224,7 @@ impl Backend {
             Backend::File(backend) => backend.update(change),
             Backend::Null(backend) => backend.update(change),
             Backend::Redb(backend) => backend.apply(std::slice::from_ref(change)),
+            Backend::Rest(backend) => backend.update(change).await,
         }
     }
 
@@ -225,12 +242,20 @@ impl Backend {
             }
             Backend::Null(backend) => backend.update(&changes[0]),
             Backend::Redb(backend) => backend.apply(changes),
+            Backend::Rest(backend) => {
+                // One request per object: HTTP has no change set, and the service's own
+                // transaction boundaries are the service's.
+                for change in changes {
+                    backend.update(change).await?;
+                }
+                Ok(())
+            }
         }
     }
 }
 
 /// Backends compiled into the binary, in the order they are reported.
-pub const KNOWN_BACKENDS: [&str; 3] = ["file", "null", "redb"];
+pub const KNOWN_BACKENDS: [&str; 4] = ["file", "null", "redb", "rest"];
 
 #[cfg(test)]
 mod tests {
@@ -242,7 +267,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "unknown backend 'postgres', known backends: file, null, redb"
+            "unknown backend 'postgres', known backends: file, null, redb, rest"
         );
     }
 

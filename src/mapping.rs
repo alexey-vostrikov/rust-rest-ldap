@@ -27,6 +27,16 @@ pub enum MappingError {
     MissingDn,
     #[error("entry dn '{0}' is empty")]
     EmptyDn(String),
+    #[error("entry has no 'cn', so the object it describes has no name")]
+    MissingCn,
+    #[error("'{attribute}' of '{dn}' is '{value}', which is not a number")]
+    NotANumber {
+        dn: String,
+        attribute: String,
+        value: String,
+    },
+    #[error("'{dn}' carries '{attribute}' more than once, and the object model has one of it")]
+    Repeated { dn: String, attribute: String },
 }
 
 /// gorestldap JSON: users and groups with a fixed field list.
@@ -142,6 +152,118 @@ pub mod gorestldap {
                 .push(Attribute::single(ATTR_HAS_SUBORDINATES, has_subordinates).operational());
         }
         attributes
+    }
+}
+
+/// The user an entry describes.
+///
+/// The reverse of [`user_entry`], and it exists because the backend needs it: the REST
+/// service stores users and groups as objects with fixed fields, while this server's
+/// directory holds arbitrary entries. A change arrives as a whole entry, so writing it back
+/// means reading the object out of it.
+///
+/// Fields the object model does not have are dropped, and that is the honest behaviour for
+/// a backend whose model is smaller than the directory's: silently keeping them in the
+/// service is impossible, and refusing every write that carries one would make the backend
+/// unusable for the directory it describes.
+pub fn user_from_entry(entry: &Entry) -> Result<User, MappingError> {
+    let cn = single(entry, "cn")?.ok_or(MappingError::MissingCn)?;
+
+    Ok(User {
+        ldap_admin: entry
+            .attributes()
+            .internal(ATTR_LDAP_ADMIN)
+            .is_some_and(|attribute| attribute.values.iter().any(|value| value == "true")),
+        entry_uuid: single(entry, ATTR_ENTRY_UUID)?,
+        has_subordinates: single(entry, ATTR_HAS_SUBORDINATES)?,
+        object_class: many(entry, ATTR_OBJECT_CLASS),
+        cn,
+        uid_number: number(entry, "uidNumber")?,
+        user_password: single(entry, "userPassword")?,
+        gid_number: number(entry, "gidNumber")?,
+        uid: single(entry, "uid")?,
+        display_name: single(entry, "displayName")?,
+        given_name: single(entry, "givenName")?,
+        sn: single(entry, "sn")?,
+        mail: single(entry, "mail")?,
+        home_directory: single(entry, "homeDirectory")?,
+        login_shell: single(entry, "loginShell")?,
+        member_of: many(entry, "memberOf"),
+    })
+}
+
+/// The group an entry describes; the reverse of [`group_entry`].
+pub fn group_from_entry(entry: &Entry) -> Result<Group, MappingError> {
+    let cn = single(entry, "cn")?.ok_or(MappingError::MissingCn)?;
+
+    Ok(Group {
+        entry_uuid: single(entry, ATTR_ENTRY_UUID)?,
+        has_subordinates: single(entry, ATTR_HAS_SUBORDINATES)?,
+        object_class: many(entry, ATTR_OBJECT_CLASS),
+        cn,
+        gid_number: number(entry, "gidNumber")?,
+        description: single(entry, "description")?,
+        member_uid: many(entry, "memberUid"),
+    })
+}
+
+/// True when this entry describes a group rather than a user.
+///
+/// By object class, because that is what the directory itself uses to tell them apart: the
+/// backend is not told which branch it is reading, and a DN test would need the OU names
+/// that belong to the server, not to the backend.
+pub fn is_group(entry: &Entry) -> bool {
+    const GROUP_CLASSES: [&str; 4] = [
+        "posixgroup",
+        "groupofnames",
+        "groupofuniquenames",
+        "groupofentries",
+    ];
+
+    many(entry, ATTR_OBJECT_CLASS)
+        .iter()
+        .any(|class| GROUP_CLASSES.contains(&class.to_lowercase().as_str()))
+}
+
+/// One value of an attribute, or `None` when the entry does not carry it.
+fn single(entry: &Entry, name: &str) -> Result<Option<String>, MappingError> {
+    let Some(attribute) = entry.attributes().get(name) else {
+        return Ok(None);
+    };
+
+    match attribute.values.as_ref() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        // A single-valued field of the object model cannot hold two: taking the first would
+        // write one of them away without saying so.
+        _ => Err(MappingError::Repeated {
+            dn: entry.dn().to_string(),
+            attribute: name.to_string(),
+        }),
+    }
+}
+
+/// Every value of an attribute, in the order the entry holds them.
+fn many(entry: &Entry, name: &str) -> Vec<String> {
+    entry
+        .attributes()
+        .get(name)
+        .map(|attribute| attribute.values.to_vec())
+        .unwrap_or_default()
+}
+
+/// A numeric attribute, refused with the text that was not a number.
+fn number(entry: &Entry, name: &str) -> Result<Option<u32>, MappingError> {
+    match single(entry, name)? {
+        None => Ok(None),
+        Some(text) => text
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| MappingError::NotANumber {
+                dn: entry.dn().to_string(),
+                attribute: name.to_string(),
+                value: text,
+            }),
     }
 }
 
