@@ -16,6 +16,7 @@ pub mod search;
 pub mod session;
 pub mod sort;
 pub mod starttls;
+pub mod sync;
 pub mod write;
 
 use rasn_ldap::{LdapMessage, ProtocolOp, ResultCode};
