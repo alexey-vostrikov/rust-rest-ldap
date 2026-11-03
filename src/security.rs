@@ -198,12 +198,20 @@ pub struct Security {
     /// for one subtree. What it is used for belongs to the protocol layer, not to security -
     /// the field is a carrier, and a reader looking for the access rules should look at `acl`.
     pub config_document: Option<crate::config::Document>,
+    /// Whether a password-hash upgrade can be persisted at all.
+    ///
+    /// The file backend stores a fixed user/group document and refuses a whole entry, so an
+    /// upgrade it cannot keep was being attempted on every successful bind and refused every
+    /// time - a line on stderr per bind, forever. Deciding once, here, is what makes it a
+    /// startup statement instead of a per-request one.
+    pub can_upgrade_password_hashes: bool,
 }
 
 impl Default for Security {
     fn default() -> Self {
         Self {
             respect_control_criticality: true,
+            can_upgrade_password_hashes: true,
             passwords: PasswordPolicy::strict(),
             acl: Acl::default(),
             // Off, like the configuration default: a test or a caller that wants a
@@ -233,6 +241,7 @@ impl PartialEq for Security {
             && self.ldaps == other.ldaps
             && self.starttls == other.starttls
             && self.integrity == other.integrity
+            && self.can_upgrade_password_hashes == other.can_upgrade_password_hashes
             && current_schema(&self.schema) == current_schema(&other.schema)
             && self.schema_mode == other.schema_mode
     }
@@ -255,6 +264,10 @@ impl Security {
             schema: shared_schema(config.schema.clone()),
             schema_mode: config.schema_mode,
             config_document: config.document.clone(),
+            // Left true and corrected by the server once it has a backend in hand: the
+            // configuration does not know which backend was chosen, and `Security::from_config`
+            // is also what tests and the protocol layer build from a bare configuration.
+            can_upgrade_password_hashes: true,
         }
     }
 
@@ -265,6 +278,12 @@ impl Security {
     /// that answers questions about the schema.
     pub fn with_schema(mut self, schema: SharedSchema) -> Self {
         self.schema = schema;
+        self
+    }
+
+    /// The same policy, knowing whether a hash upgrade can be stored at all.
+    pub fn with_password_upgrade(mut self, possible: bool) -> Self {
+        self.can_upgrade_password_hashes = possible;
         self
     }
 

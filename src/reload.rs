@@ -144,6 +144,14 @@ impl Source {
         Arc::clone(&directory)
     }
 
+    /// Whether a password-hash upgrade could be persisted by this backend.
+    ///
+    /// Asked by the server once, at startup, so that a bind does not attempt a write the
+    /// backend will refuse and print a line about it on every successful login.
+    pub fn accepts_entry_upserts(&self) -> bool {
+        self.backend.accepts_entry_upserts()
+    }
+
     /// How many times the store has been read in full since the process started.
     ///
     /// One at startup, then one per full reload. A write that is applied in place does not move
