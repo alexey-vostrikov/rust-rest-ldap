@@ -98,6 +98,46 @@ pub fn first_value(entry: &str) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+/// Whether `entry` is `ancestor` itself or lies below it.
+///
+/// Both are expected normalized. The part before the ancestor must end with a comma, so
+/// `dc=notexample,dc=com` is not treated as living under `dc=example,dc=com`: the two share a
+/// suffix of characters and nothing else.
+pub fn is_descendant_or_self(ancestor: &str, entry: &str) -> bool {
+    entry == ancestor
+        || entry
+            .strip_suffix(ancestor)
+            .and_then(|head| head.strip_suffix(','))
+            .is_some()
+}
+
+/// How many RDNs a DN has: its depth in the tree.
+///
+/// Used to pick the most specific of several subtrees that cover the same DN. A count of RDNs is
+/// not a count of commas: an escaped comma inside a value is part of that value.
+pub fn depth(entry: &str) -> usize {
+    if entry.is_empty() {
+        return 0;
+    }
+
+    let mut depth = 1;
+    let mut escaped = false;
+
+    for character in entry.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            ',' => depth += 1,
+            _ => {}
+        }
+    }
+
+    depth
+}
+
 /// Checks that every RDN of the entry uses a supported attribute type and has
 /// the `attribute=value` shape.
 pub fn is_valid(entry: &str) -> bool {

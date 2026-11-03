@@ -205,6 +205,8 @@ pub struct Security {
     /// time - a line on stderr per bind, forever. Deciding once, here, is what makes it a
     /// startup statement instead of a per-request one.
     pub can_upgrade_password_hashes: bool,
+    /// Subtrees this server does not hold, and where the client is sent for them.
+    pub referrals: crate::referral::Referrals,
 }
 
 impl Default for Security {
@@ -212,6 +214,7 @@ impl Default for Security {
         Self {
             respect_control_criticality: true,
             can_upgrade_password_hashes: true,
+            referrals: crate::referral::Referrals::default(),
             passwords: PasswordPolicy::strict(),
             acl: Acl::default(),
             // Off, like the configuration default: a test or a caller that wants a
@@ -242,6 +245,7 @@ impl PartialEq for Security {
             && self.starttls == other.starttls
             && self.integrity == other.integrity
             && self.can_upgrade_password_hashes == other.can_upgrade_password_hashes
+            && self.referrals == other.referrals
             && current_schema(&self.schema) == current_schema(&other.schema)
             && self.schema_mode == other.schema_mode
     }
@@ -268,6 +272,7 @@ impl Security {
             // configuration does not know which backend was chosen, and `Security::from_config`
             // is also what tests and the protocol layer build from a bare configuration.
             can_upgrade_password_hashes: true,
+            referrals: config.referrals.clone(),
         }
     }
 

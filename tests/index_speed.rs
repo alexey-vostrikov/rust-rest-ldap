@@ -122,6 +122,29 @@ fn the_index_pays_for_itself_on_a_large_directory() {
     );
 }
 
+/// The time of the fastest of `runs` executions.
+///
+/// A single measurement on a loaded machine is the sum of the work and whatever else the
+/// scheduler had to do; the minimum is the closest thing to the work alone. `cargo test` runs the
+/// tests of one binary in parallel by default, so the single-measurement version of these
+/// assertions failed under load while the code was unchanged - a flaky test is worse than none.
+fn best_of<T>(runs: usize, mut body: impl FnMut() -> T) -> (T, std::time::Duration) {
+    let mut best = std::time::Duration::MAX;
+    let mut result = None;
+
+    for _ in 0..runs {
+        let started = std::time::Instant::now();
+        let value = body();
+        let elapsed = started.elapsed();
+        if elapsed < best {
+            best = elapsed;
+            result = Some(value);
+        }
+    }
+
+    (result.expect("at least one run"), best)
+}
+
 #[test]
 fn a_broad_filter_is_not_slower_with_an_index() {
     let plain = Directory::from_entries(BASE, "users", "groups", entries(ENTRIES));
@@ -129,13 +152,8 @@ fn a_broad_filter_is_not_slower_with_an_index() {
 
     let filter = Filter::Present(AttributeDescription::from("objectClass"));
 
-    let start = Instant::now();
-    let plain_matches = count(&plain, filter.clone());
-    let plain_time = start.elapsed();
-
-    let start = Instant::now();
-    let indexed_matches = count(&indexed, filter);
-    let indexed_time = start.elapsed();
+    let (plain_matches, plain_time) = best_of(5, || count(&plain, filter.clone()));
+    let (indexed_matches, indexed_time) = best_of(5, || count(&indexed, filter.clone()));
 
     println!("filter (objectClass=*): scan {plain_time:?}, indexed {indexed_time:?}");
 

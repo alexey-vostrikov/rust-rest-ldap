@@ -98,6 +98,10 @@ impl ConfigError {
         let mut owned: Vec<(String, String)> = Vec::new();
 
         match self {
+            Self::Referral(detail) => {
+                key = "config.referral";
+                owned.push(("detail".to_string(), detail.clone()));
+            }
             Self::MissingTlsMaterial => key = "config.tls_material",
             Self::UnknownBackend { name, known } => {
                 key = "config.unknown_backend";
@@ -269,6 +273,11 @@ pub struct Config {
     pub locale: (crate::i18n::Locale, crate::i18n::Source),
     /// Translation file, when one is configured.
     pub locale_file: Option<PathBuf>,
+    /// Subtrees held elsewhere, and where a client is sent for them.
+    ///
+    /// Empty means the server answers `noSuchObject` for anything outside its own tree, which is
+    /// what it did before this existed.
+    pub referrals: crate::referral::Referrals,
     /// The configuration document the settings above were read from, if there was one.
     ///
     /// `cn=config` publishes this text, so a server started from flags alone has none and says
@@ -297,6 +306,8 @@ pub enum ConfigError {
         #[source]
         source: humantime::DurationError,
     },
+    #[error("invalid referrals: {0}")]
+    Referral(String),
     #[error("use_tls is enabled, but server_cert and server_key are not both set")]
     MissingTlsMaterial,
     #[error("unknown backend '{name}', known backends: {}", known.join(", "))]
@@ -363,6 +374,9 @@ pub enum ConfigError {
 struct FileConfig {
     #[serde(default)]
     integrity: IntegrityConfig,
+    /// Subtrees held elsewhere: `- dn: dc=remote,dc=com` with the URL a client should ask.
+    #[serde(default)]
+    referrals: Vec<ReferralConfig>,
     #[serde(default)]
     observability: ObservabilityConfig,
     /// Language for operator-facing diagnostics: `ru`, `en`. Empty means "ask the
@@ -442,6 +456,15 @@ pub struct SchemaConfig {
     pub mode: Option<String>,
     /// Extra `.schema` files, read after the built-in definitions.
     pub files: Vec<PathBuf>,
+}
+
+/// One `referrals:` entry: a subtree this server does not hold, and where it lives.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReferralConfig {
+    /// The DN of the subtree, for example `dc=remote,dc=com`.
+    pub dn: String,
+    /// An `ldap://` or `ldaps://` URL a client should ask instead.
+    pub url: String,
 }
 
 /// `observability:` section of the configuration file.
@@ -635,6 +658,17 @@ pub fn resolve(
         });
     }
 
+    let referrals = crate::referral::Referrals::new(
+        file.referrals
+            .iter()
+            .map(|entry| crate::referral::Referral {
+                dn: super::dn::normalize(&entry.dn),
+                url: entry.url.clone(),
+            })
+            .collect(),
+    )
+    .map_err(|err| ConfigError::Referral(err.to_string()))?;
+
     let config = Config {
         backend,
         base_dn: super::dn::normalize(
@@ -735,6 +769,7 @@ pub fn resolve(
             file.indexes.resolve()?;
             file.indexes
         },
+        referrals,
         acl: crate::acl::from_config(file.access.as_deref())?,
         allow_unencrypted_bind: file.bind.allow_unencrypted_bind.is_on(),
         bootstrap: match file.bootstrap {

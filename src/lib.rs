@@ -35,6 +35,7 @@ pub mod model;
 pub mod mutate;
 pub mod operational;
 pub mod password;
+pub mod referral;
 pub mod reload;
 pub mod schema;
 pub mod security;
