@@ -419,7 +419,10 @@ fn cursor_cookie(cursor: Cursor) -> Vec<u8> {
 
 fn parse_cookie(cookie: &[u8], snapshot: u64) -> Result<Cursor, String> {
     if cookie.is_empty() {
-        return Ok(Cursor { offset: 0, snapshot });
+        return Ok(Cursor {
+            offset: 0,
+            snapshot,
+        });
     }
 
     let text = std::str::from_utf8(cookie).map_err(|_| {

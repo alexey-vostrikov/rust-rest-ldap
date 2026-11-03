@@ -68,7 +68,7 @@ async fn main() {
 
     let config = match config::load(args) {
         Ok(config) => config,
-        Err(err) => fatal(&config_message(&err)),
+        Err(err) => fatal(&err.message()),
     };
 
     // Now the file has spoken: its `locale:` overrides the environment.
@@ -737,39 +737,30 @@ fn install_language(
     args: &config::Args,
     from_config: Option<(i18n::Locale, i18n::Source, Option<std::path::PathBuf>)>,
 ) {
-    let (locale, source, file) = match from_config {
-        Some((locale, source, file)) => (locale, source, file),
-        None => {
-            // The raw text, when there is a file to read: a `locale:` inside it should
-            // already govern the complaints about it.
-            let env = |name: &str| std::env::var(name).ok();
-            let (locale, source) = i18n::from_env(&env);
+    // The file text is read here because the file is here; what to do with it is decided in
+    // `i18n::resolve_language`, which takes the text and a probe instead of opening things.
+    let config_text = args
+        .config
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path).ok());
 
-            let scanned = args
-                .config
-                .as_ref()
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .and_then(|text| i18n::prescan_locale(&text));
-
-            match scanned {
-                Some(locale) if !locale.is_english() => (locale, i18n::Source::Config, None),
-                _ => (locale, source, None),
+    let (locale, source, file) = i18n::resolve_language(
+        from_config,
+        config_text.as_deref(),
+        &|name| std::env::var(name).ok(),
+        // `locale/<tag>.yaml` next to the working directory, then next to the executable.
+        |tag| {
+            let name = format!("locale/{tag}.yaml");
+            let local = std::path::PathBuf::from(&name);
+            if local.is_file() {
+                return Some(local);
             }
-        }
-    };
-
-    // `locale/<tag>.yaml` next to the working directory, then next to the executable.
-    let file = file.or_else(|| {
-        let name = format!("locale/{}.yaml", locale.as_str());
-        let local = std::path::PathBuf::from(&name);
-        if local.is_file() {
-            return Some(local);
-        }
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join(&name)))
-            .filter(|path| path.is_file())
-    });
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join(&name)))
+                .filter(|path| path.is_file())
+        },
+    );
 
     match i18n::catalog_for(locale, source, file.as_deref()) {
         Ok(catalog) => i18n::install(catalog),
@@ -884,108 +875,4 @@ fn run_store_command(
         }
         Err(detail) => fatal(&i18n::t("error.store", &[("detail", &detail)])),
     }
-}
-
-fn config_message(err: &config::ConfigError) -> String {
-    let english = err.to_string();
-
-    // The translated text borrows its arguments, so they are built first and kept alive
-    // in `owned` until the call is done.
-    let key: &str;
-    let mut owned: Vec<(String, String)> = Vec::new();
-
-    match err {
-        config::ConfigError::MissingTlsMaterial => key = "config.tls_material",
-        config::ConfigError::UnknownBackend { name, known } => {
-            key = "config.unknown_backend";
-            owned.push(("name".to_string(), name.clone()));
-            owned.push(("known".to_string(), known.join(", ")));
-        }
-        config::ConfigError::SchemaMode(value) => {
-            key = "config.schema_mode";
-            owned.push(("value".to_string(), value.clone()));
-        }
-        config::ConfigError::Locale { value } => {
-            key = "config.locale";
-            owned.push(("value".to_string(), value.clone()));
-            owned.push(("path".to_string(), format!("locale/{value}.yaml")));
-        }
-        config::ConfigError::StoreEmpty { path } => {
-            key = "config.store_empty";
-            owned.push(("path".to_string(), path.display().to_string()));
-        }
-        config::ConfigError::Store { path, detail } => {
-            key = "config.store";
-            owned.push(("path".to_string(), path.display().to_string()));
-            owned.push(("detail".to_string(), detail.clone()));
-        }
-        config::ConfigError::BootstrapPasswordMissing => {
-            key = "config.bootstrap_password_missing";
-        }
-        config::ConfigError::BootstrapPasswordAmbiguous => {
-            key = "config.bootstrap_password_ambiguous";
-        }
-        config::ConfigError::DangerousSettingsNotAcknowledged { settings } => {
-            key = "config.dangerous";
-            owned.push(("settings".to_string(), settings.clone()));
-        }
-        config::ConfigError::PlainHttpNotAcknowledged { address } => {
-            key = "config.plain_http";
-            owned.push(("address".to_string(), address.clone()));
-        }
-        config::ConfigError::SchemaRead { path, source } => {
-            key = "config.schema_read";
-            owned.push(("path".to_string(), path.clone()));
-            owned.push(("detail".to_string(), source.to_string()));
-        }
-        config::ConfigError::Schema { path, source } => {
-            key = "config.schema";
-            owned.push(("path".to_string(), path.clone()));
-            owned.push(("detail".to_string(), source.to_string()));
-        }
-        config::ConfigError::Interval { value, source } => {
-            key = "config.interval";
-            owned.push(("value".to_string(), value.clone()));
-            owned.push(("detail".to_string(), source.to_string()));
-        }
-        config::ConfigError::Parse { path, source } => {
-            key = "config.parse";
-            owned.push(("path".to_string(), path.display().to_string()));
-            owned.push(("detail".to_string(), source.to_string()));
-        }
-        config::ConfigError::Read { path, source } => {
-            key = "config.parse";
-            owned.push(("path".to_string(), path.display().to_string()));
-            owned.push(("detail".to_string(), source.to_string()));
-        }
-        config::ConfigError::Index(err) => {
-            key = "config.index";
-            owned.push(("detail".to_string(), err.to_string()));
-        }
-        config::ConfigError::Password(err) => {
-            key = "config.password";
-            owned.push(("detail".to_string(), err.to_string()));
-        }
-        config::ConfigError::Access(err) => {
-            key = "config.access";
-            owned.push(("detail".to_string(), err.to_string()));
-        }
-    }
-
-    let args: Vec<(&str, &str)> = owned
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect();
-    let translated = i18n::t(key, &args);
-
-    // `t` returns the key itself when the catalogue has no text for it. That is the one
-    // case where the translated line is useless, and the English message is the answer.
-    if translated == key {
-        return english;
-    }
-
-    // Otherwise the translated line carries everything the English one did — including the
-    // parser position or the file name, through `{detail}`. Two lines saying the same
-    // thing in two languages is noise, not help.
-    translated
 }
