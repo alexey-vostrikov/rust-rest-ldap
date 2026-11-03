@@ -509,22 +509,28 @@ async fn main() {
             println!("{}", i18n::plain("start.journal_stdout"));
             Arc::new(rust_rest_ldap::metrics::Journal::stdout())
         }
-        (false, Some(path)) => match rust_rest_ldap::metrics::Journal::file(&path) {
-            Ok(journal) => {
-                println!(
-                    "{}",
-                    i18n::t("start.journal", &[("path", &path.display().to_string())])
-                );
-                Arc::new(journal)
+        (false, Some(path)) => {
+            let limit = config
+                .observability
+                .journal_max_bytes
+                .unwrap_or(rust_rest_ldap::metrics::JOURNAL_MAX_BYTES);
+            match rust_rest_ldap::metrics::Journal::file_with_limit(&path, limit) {
+                Ok(journal) => {
+                    println!(
+                        "{}",
+                        i18n::t("start.journal", &[("path", &path.display().to_string())])
+                    );
+                    Arc::new(journal)
+                }
+                // A journal the operator asked for and the server cannot write is a startup
+                // error: silently running without it would leave "who deleted it" unanswerable
+                // for as long as nobody notices.
+                Err(err) => fatal(&i18n::t(
+                    "error.journal",
+                    &[("detail", &format!("'{}': {err}", path.display()))],
+                )),
             }
-            // A journal the operator asked for and the server cannot write is a startup
-            // error: silently running without it would leave "who deleted it" unanswerable
-            // for as long as nobody notices.
-            Err(err) => fatal(&i18n::t(
-                "error.journal",
-                &[("detail", &format!("'{}': {err}", path.display()))],
-            )),
-        },
+        }
         (false, None) => Arc::new(rust_rest_ldap::metrics::Journal::off()),
     };
 

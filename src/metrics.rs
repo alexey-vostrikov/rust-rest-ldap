@@ -450,9 +450,95 @@ enum Sink {
     Off,
     /// Standard output, for a container that collects it.
     Stdout,
-    /// A file, appended to and flushed per line.
-    File(Mutex<std::fs::File>),
+    /// A file, appended to and flushed per line, rotated when it reaches its limit.
+    File(Append),
 }
+
+/// An open journal file and what is needed to rotate it.
+struct Append {
+    file: Mutex<std::fs::File>,
+    path: std::path::PathBuf,
+    /// Bytes in the file as far as this process knows.
+    ///
+    /// Counted rather than asked of the filesystem per line: a `stat` before every write is a
+    /// syscall per change for a number that only moves when this process writes.
+    size: std::sync::atomic::AtomicU64,
+    /// Above this the file is rotated. Zero means never.
+    limit: u64,
+}
+
+impl Append {
+    fn open(path: &std::path::Path, limit: u64) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+
+        Ok(Self {
+            file: Mutex::new(file),
+            path: path.to_path_buf(),
+            size: std::sync::atomic::AtomicU64::new(size),
+            limit,
+        })
+    }
+
+    /// Appends one line, rotating first if it would cross the limit.
+    fn write(&self, line: &str) -> std::io::Result<()> {
+        let needed = line.len() as u64 + 1;
+
+        if self.limit > 0 && self.size.load(Ordering::Relaxed) + needed > self.limit {
+            self.rotate()?;
+        }
+
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        writeln!(file, "{line}")?;
+        file.flush()?;
+        self.size.fetch_add(needed, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Moves the journal aside and starts a new one.
+    ///
+    /// One backup, `<path>.1`, replaced: the question a journal answers is "what happened
+    /// around then", and a chain of ten rotated files answers it no better than one while
+    /// making the disk usage harder to reason about. The rename is atomic, so a reader tailing
+    /// the path loses nothing - it keeps the old inode until it reopens.
+    fn rotate(&self) -> std::io::Result<()> {
+        let backup = self.path.with_extension(format!(
+            "{}.1",
+            self.path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("journal")
+        ));
+
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        std::fs::rename(&self.path, &backup)?;
+        *file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.size.store(0, Ordering::Relaxed);
+
+        Ok(())
+    }
+}
+
+/// How large the journal may grow before it rotates, when the configuration says nothing.
+///
+/// Sixty-four megabytes is months of a busy directory's changes and small enough that a full
+/// disk is a deliberate act rather than an accident. Not unlimited: an unlimited default is an
+/// outage scheduled for whenever the disk fills.
+pub const JOURNAL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The change journal.
 ///
@@ -482,15 +568,18 @@ impl Journal {
         }
     }
 
-    /// A journal appending to `path`, created when absent.
+    /// A journal appending to `path`, created when absent, rotated at the default size.
     pub fn file(path: &std::path::Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        Self::file_with_limit(path, JOURNAL_MAX_BYTES)
+    }
 
+    /// A journal appending to `path`, rotated when it would cross `limit` bytes.
+    ///
+    /// A limit of zero turns rotation off, for a journal that is collected by something else and
+    /// must not be moved aside.
+    pub fn file_with_limit(path: &std::path::Path, limit: u64) -> std::io::Result<Self> {
         Ok(Self {
-            sink: Sink::File(Mutex::new(file)),
+            sink: Sink::File(Append::open(path, limit)?),
             written: AtomicU64::new(0),
         })
     }
@@ -517,9 +606,7 @@ impl Journal {
                 Ok(())
             }
             Sink::File(file) => {
-                let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                writeln!(file, "{line}")?;
-                file.flush()?;
+                file.write(&line)?;
                 self.written.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -818,6 +905,136 @@ mod tests {
         assert!(
             journal.is_err(),
             "the caller has to learn the journal is unusable"
+        );
+    }
+
+    // ---- the journal this exists to keep bounded ----
+
+    fn change(n: usize) -> Change {
+        Change {
+            kind: ChangeKind::Modify,
+            dn: format!("cn=u{n},dc=example,dc=com"),
+            new_dn: None,
+            actor: format!("cn=a{n},dc=example,dc=com"),
+            peer: "127.0.0.1:1".to_string(),
+            result: 0,
+        }
+    }
+
+    #[test]
+    fn a_journal_rotates_instead_of_growing_without_end() {
+        // The defect: an unlimited journal fills the disk, and the first symptom is every write
+        // failing for a reason that has nothing to do with the directory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("changes.jsonl");
+        let journal = Journal::file_with_limit(&path, 400).expect("journal");
+
+        for n in 0..40 {
+            journal.record(&change(n)).expect("write");
+        }
+
+        let current = std::fs::read_to_string(&path).expect("the journal in force");
+        let backup = std::fs::read_to_string(dir.path().join("changes.jsonl.1"))
+            .expect("the rotated journal");
+
+        assert!(
+            current.len() as u64 <= 400,
+            "the journal in force must stay under its limit, is {}",
+            current.len()
+        );
+        assert!(
+            backup.len() as u64 <= 400,
+            "and so must the backup, is {}",
+            backup.len()
+        );
+        assert!(
+            !current.is_empty(),
+            "rotation must not lose the newest lines"
+        );
+        assert!(
+            journal.written() == 40,
+            "every line was written, to one file or the other"
+        );
+
+        // One backup, so older generations are gone on purpose: the two files hold the newest
+        // run of changes, and nothing is missing *inside* that run - no line dropped between the
+        // rotated file and the current one, and none out of order.
+        let mut together = backup;
+        together.push_str(&current);
+        let dns: Vec<String> = together
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).expect("json");
+                value["dn"].as_str().expect("dn").to_string()
+            })
+            .collect();
+        let numbers: Vec<usize> = dns
+            .iter()
+            .map(|dn| {
+                dn.trim_start_matches("cn=u")
+                    .trim_end_matches(",dc=example,dc=com")
+                    .parse()
+                    .expect("the number in the DN")
+            })
+            .collect();
+        assert!(
+            numbers.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "the surviving lines must be contiguous and in order: {:?}",
+            numbers
+        );
+        assert_eq!(
+            *numbers.last().expect("at least one line"),
+            39,
+            "and the newest change is the last line of the journal in force"
+        );
+    }
+
+    #[test]
+    fn a_limit_of_zero_turns_rotation_off() {
+        // For a journal that something else collects and must not be moved aside.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("changes.jsonl");
+        let journal = Journal::file_with_limit(&path, 0).expect("journal");
+
+        for n in 0..40 {
+            journal.record(&change(n)).expect("write");
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("journal")
+                .lines()
+                .count(),
+            40
+        );
+        assert!(
+            !dir.path().join("changes.jsonl.1").exists(),
+            "nothing is rotated when the limit is zero"
+        );
+    }
+
+    #[test]
+    fn a_journal_that_already_exists_is_rotated_at_its_real_size() {
+        // The size is taken from the file on open, not assumed to be zero: a server restarted
+        // into a full journal must rotate on the next line, not after another limit's worth.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("changes.jsonl");
+        std::fs::write(&path, "x".repeat(500)).expect("a journal at its limit");
+
+        let journal = Journal::file_with_limit(&path, 400).expect("journal");
+        journal.record(&change(1)).expect("write");
+
+        assert!(
+            dir.path().join("changes.jsonl.1").exists(),
+            "the file that was already too large is rotated away"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("journal")
+                .lines()
+                .count(),
+            1,
+            "and the new one holds just the new line"
         );
     }
 }

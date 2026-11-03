@@ -456,6 +456,13 @@ pub struct ObservabilityConfig {
     /// Write the journal to standard output instead of a file, for a container that
     /// collects it.
     pub journal_stdout: bool,
+    /// How large the journal may grow before it is rotated, in bytes.
+    ///
+    /// Absent means `JOURNAL_MAX_BYTES` (64 MiB). There was a default of *unlimited*, which is
+    /// not a default but a delayed outage: a directory that is written to fills the disk at a
+    /// rate nobody watches, and the first symptom is every write failing for a reason that has
+    /// nothing to do with the directory.
+    pub journal_max_bytes: Option<u64>,
 }
 
 /// `bootstrap:` section of the configuration file.
