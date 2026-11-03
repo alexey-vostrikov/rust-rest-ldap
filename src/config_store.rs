@@ -53,7 +53,14 @@ const LOCK: &str = ".commit.lock";
 /// A commit is a few file operations; a second is generous. Waiting for ever would turn one
 /// stuck writer into a directory nobody can configure, which is the failure mode a lock is
 /// supposed to prevent and not to cause.
-const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a commit waits for another writer before refusing.
+///
+/// Two seconds was too short and said so in a flaky test: eight writers committing at once on a
+/// loaded machine queue behind each other, and a legitimate commit was refused as a stuck lock.
+/// A configuration commit is written by a human or a deploy script, so waiting half a minute is
+/// cheap; waiting forever is not, because a lock file left by a killed process would then hang
+/// the next commit silently.
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How many generations are kept by default.
 ///
@@ -155,6 +162,9 @@ impl Generation {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    /// How long `commit` waits for another writer. Not configuration: it exists so that a test
+    /// can watch the refusal without waiting the real timeout out.
+    lock_timeout: std::time::Duration,
 }
 
 impl Store {
@@ -164,7 +174,17 @@ impl Store {
     /// store that has never been written to is a server whose configuration is still the file
     /// it was started with.
     pub fn open(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            lock_timeout: LOCK_TIMEOUT,
+        }
+    }
+
+    /// The same store with a shorter wait, for the test that proves the wait is bounded.
+    #[cfg(test)]
+    fn with_lock_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
     }
 
     /// Whether `path` is a generation store rather than a configuration file.
@@ -422,7 +442,7 @@ impl Store {
     /// names the file and says what to do about it rather than waiting silently.
     fn lock(&self) -> Result<Lock, Error> {
         let path = self.root.join(LOCK);
-        let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+        let deadline = std::time::Instant::now() + self.lock_timeout;
 
         loop {
             match std::fs::OpenOptions::new()
@@ -440,7 +460,7 @@ impl Store {
                     if std::time::Instant::now() >= deadline {
                         return Err(Error::Locked {
                             path,
-                            waited: LOCK_TIMEOUT,
+                            waited: self.lock_timeout,
                         });
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1012,7 +1032,9 @@ mod tests {
         // A process killed between taking the lock and releasing it leaves the file behind.
         // Waiting for ever would turn one stuck writer into a directory nobody can configure.
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = store(dir.path());
+        // The wait is the store's, not a constant, so this test takes milliseconds instead of
+        // the real timeout. It still proves the wait ends.
+        let store = store(dir.path()).with_lock_timeout(std::time::Duration::from_millis(50));
         store.commit(CONFIG, "cli", "first").expect("first");
 
         std::fs::write(store.root.join(LOCK), "999999\n").expect("hold the lock");
@@ -1024,7 +1046,7 @@ mod tests {
 
         assert!(matches!(err, Error::Locked { .. }), "{err}");
         assert!(
-            started.elapsed() < LOCK_TIMEOUT + std::time::Duration::from_secs(1),
+            started.elapsed() < std::time::Duration::from_secs(1),
             "the wait must be bounded by the timeout"
         );
         assert!(

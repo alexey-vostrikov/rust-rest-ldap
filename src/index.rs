@@ -186,6 +186,25 @@ pub struct Index {
     built: BTreeMap<Arc<str>, BTreeSet<Kind>>,
 }
 
+/// Whether `touch` is adding an entry's postings or taking them away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Touch {
+    Add,
+    Remove,
+}
+
+/// Adds or removes one id in a posting list.
+fn mark(bitmap: &mut RoaringBitmap, id: u32, how: Touch) {
+    match how {
+        Touch::Add => {
+            bitmap.insert(id);
+        }
+        Touch::Remove => {
+            bitmap.remove(id);
+        }
+    }
+}
+
 impl Index {
     /// Builds every index the configuration asks for.
     ///
@@ -211,120 +230,201 @@ impl Index {
         };
 
         for (position, entry) in entries.iter().enumerate() {
-            let id = position as u32;
-
-            for attribute in entry.attributes().values() {
-                // Keys are lowercase because the filter lowercases attribute descriptions
-                // before building a query (RFC 4512 makes the name case-insensitive). Storing
-                // the name as written meant `uidNumber` and `objectClass` - that is, most of
-                // the attributes a directory actually has - were never found, and the index
-                // silently narrowed nothing while every test that only compared answers still
-                // passed.
-                let name: Arc<str> = crate::model::attribute_name(&attribute.name.to_lowercase());
-                if attribute.flags.case_sensitive {
-                    index.case_sensitive.insert(Arc::clone(&name));
-                }
-                let kinds = index
-                    .kinds_for(&name, &per_attribute)
-                    .cloned()
-                    .unwrap_or_default();
-
-                if kinds.contains(&Kind::Pres) {
-                    index
-                        .presence
-                        .entry(Arc::clone(&name))
-                        .or_default()
-                        .insert(id);
-                    index
-                        .built
-                        .entry(Arc::clone(&name))
-                        .or_default()
-                        .insert(Kind::Pres);
-                }
-
-                if kinds.contains(&Kind::Eq) || kinds.contains(&Kind::Ord) {
-                    let case_sensitive = attribute.flags.case_sensitive;
-                    for value in attribute.values.iter() {
-                        let key = fold(value, case_sensitive);
-
-                        if kinds.contains(&Kind::Eq) {
-                            index
-                                .equality
-                                .entry(Arc::clone(&name))
-                                .or_default()
-                                .entry(key.clone())
-                                .or_default()
-                                .insert(id);
-                        }
-
-                        if kinds.contains(&Kind::Ord) {
-                            // The attribute's numeric-ness is decided by its values, so a
-                            // mixed one is remembered as such and left to the scan.
-                            match key.parse::<i64>() {
-                                Ok(number) => {
-                                    index
-                                        .ordered
-                                        .entry(Arc::clone(&name))
-                                        .or_default()
-                                        .entry(OrderKey::Num(number))
-                                        .or_default()
-                                        .insert(id);
-                                    index.ordered_numeric.insert(Arc::clone(&name));
-                                }
-                                Err(_) => {
-                                    index
-                                        .ordered
-                                        .entry(Arc::clone(&name))
-                                        .or_default()
-                                        .entry(OrderKey::Text(key.clone()))
-                                        .or_default()
-                                        .insert(id);
-                                    index.ordered_mixed.insert(Arc::clone(&name));
-                                }
-                            }
-                        }
-                    }
-
-                    if kinds.contains(&Kind::Eq) {
-                        index
-                            .built
-                            .entry(Arc::clone(&name))
-                            .or_default()
-                            .insert(Kind::Eq);
-                    }
-                    if kinds.contains(&Kind::Ord) {
-                        index
-                            .built
-                            .entry(Arc::clone(&name))
-                            .or_default()
-                            .insert(Kind::Ord);
-                    }
-                }
-
-                if kinds.contains(&Kind::Sub) {
-                    let case_sensitive = attribute.flags.case_sensitive;
-                    for value in attribute.values.iter() {
-                        // The value is indexed between its boundaries: `^` and `$` are what
-                        // an anchored part of a pattern looks up.
-                        let padded = format!("^{}$", fold(value, case_sensitive));
-                        for trigram in trigrams(&padded) {
-                            index
-                                .substrings
-                                .entry(Arc::clone(&name))
-                                .or_default()
-                                .entry(trigram)
-                                .or_default()
-                                .insert(id);
-                        }
-                    }
-                    index.built.entry(name).or_default().insert(Kind::Sub);
-                }
-            }
+            index.touch(position as u32, entry, &per_attribute, Touch::Add);
         }
 
         Ok(index)
     }
 
+    /// Adds or removes one entry's ids from every posting list, without touching the rest.
+    ///
+    /// One function for both directions on purpose: an index that adds a value in one place and
+    /// forgets it in another stops narrowing correctly and the defect shows up as a missing
+    /// search result, which is the hardest kind of bug to notice. `how` is the only difference.
+    ///
+    /// `built` and the numeric/mixed/case flags only ever grow: they describe what the index is
+    /// able to answer, and forgetting that an attribute was numeric because the last numeric
+    /// entry left would silently downgrade matching for the entries that remain.
+    fn touch(
+        &mut self,
+        id: u32,
+        entry: &Entry,
+        per_attribute: &BTreeMap<String, BTreeSet<Kind>>,
+        how: Touch,
+    ) {
+        for attribute in entry.attributes().values() {
+            // Keys are lowercase because the filter lowercases attribute descriptions before
+            // building a query (RFC 4512 makes the name case-insensitive).
+            let name: Arc<str> = crate::model::attribute_name(&attribute.name.to_lowercase());
+            if attribute.flags.case_sensitive {
+                self.case_sensitive.insert(Arc::clone(&name));
+            }
+            let kinds = self
+                .kinds_for(&name, per_attribute)
+                .cloned()
+                .unwrap_or_default();
+
+            if kinds.contains(&Kind::Pres) {
+                mark(self.presence.entry(Arc::clone(&name)).or_default(), id, how);
+                if how == Touch::Add {
+                    self.built
+                        .entry(Arc::clone(&name))
+                        .or_default()
+                        .insert(Kind::Pres);
+                }
+            }
+
+            if kinds.contains(&Kind::Eq) || kinds.contains(&Kind::Ord) {
+                let case_sensitive = attribute.flags.case_sensitive;
+                for value in attribute.values.iter() {
+                    let key = fold(value, case_sensitive);
+
+                    if kinds.contains(&Kind::Eq) {
+                        mark(
+                            self.equality
+                                .entry(Arc::clone(&name))
+                                .or_default()
+                                .entry(key.clone())
+                                .or_default(),
+                            id,
+                            how,
+                        );
+                    }
+
+                    if kinds.contains(&Kind::Ord) {
+                        // The attribute's numeric-ness is decided by its values, so a mixed one
+                        // is remembered as such and left to the scan.
+                        match key.parse::<i64>() {
+                            Ok(number) => {
+                                mark(
+                                    self.ordered
+                                        .entry(Arc::clone(&name))
+                                        .or_default()
+                                        .entry(OrderKey::Num(number))
+                                        .or_default(),
+                                    id,
+                                    how,
+                                );
+                                self.ordered_numeric.insert(Arc::clone(&name));
+                            }
+                            Err(_) => {
+                                mark(
+                                    self.ordered
+                                        .entry(Arc::clone(&name))
+                                        .or_default()
+                                        .entry(OrderKey::Text(key.clone()))
+                                        .or_default(),
+                                    id,
+                                    how,
+                                );
+                                self.ordered_mixed.insert(Arc::clone(&name));
+                            }
+                        }
+                    }
+                }
+
+                if how == Touch::Add {
+                    if kinds.contains(&Kind::Eq) {
+                        self.built
+                            .entry(Arc::clone(&name))
+                            .or_default()
+                            .insert(Kind::Eq);
+                    }
+                    if kinds.contains(&Kind::Ord) {
+                        self.built
+                            .entry(Arc::clone(&name))
+                            .or_default()
+                            .insert(Kind::Ord);
+                    }
+                }
+            }
+
+            if kinds.contains(&Kind::Sub) {
+                let case_sensitive = attribute.flags.case_sensitive;
+                for value in attribute.values.iter() {
+                    // The value is indexed between its boundaries: `^` and `$` are what an
+                    // anchored part of a pattern looks up.
+                    let padded = format!("^{}$", fold(value, case_sensitive));
+                    for trigram in trigrams(&padded) {
+                        mark(
+                            self.substrings
+                                .entry(Arc::clone(&name))
+                                .or_default()
+                                .entry(trigram)
+                                .or_default(),
+                            id,
+                            how,
+                        );
+                    }
+                }
+                if how == Touch::Add {
+                    self.built.entry(name).or_default().insert(Kind::Sub);
+                }
+            }
+        }
+    }
+
+    /// Drops the postings of one attribute that no longer hold any id.
+    fn prune(&mut self, name: &Arc<str>) {
+        if self
+            .presence
+            .get(name)
+            .is_some_and(|bitmap| bitmap.is_empty())
+        {
+            self.presence.remove(name);
+        }
+        if let Some(values) = self.equality.get_mut(name) {
+            values.retain(|_, bitmap| !bitmap.is_empty());
+            if values.is_empty() {
+                self.equality.remove(name);
+            }
+        }
+        if let Some(trigrams_by_value) = self.substrings.get_mut(name) {
+            trigrams_by_value.retain(|_, bitmap| !bitmap.is_empty());
+            if trigrams_by_value.is_empty() {
+                self.substrings.remove(name);
+            }
+        }
+        if let Some(values) = self.ordered.get_mut(name) {
+            values.retain(|_, bitmap| !bitmap.is_empty());
+            if values.is_empty() {
+                self.ordered.remove(name);
+            }
+        }
+    }
+
+    /// Replaces one entry in the index in place: its id stays, its postings change.
+    ///
+    /// This is what makes a `modify` cost the entry instead of the directory. It is correct only
+    /// when the id is the same before and after, which is true for a replace: the position in
+    /// canonical order depends on the DN, and a modify does not change the DN. Adding or
+    /// deleting an entry moves every id after it, and that still rebuilds the whole index.
+    pub fn replace(
+        &mut self,
+        id: u32,
+        old: &Entry,
+        new: &Entry,
+        config: &IndexConfig,
+    ) -> Result<(), IndexError> {
+        let plan = config.resolve()?;
+        let per_attribute: BTreeMap<String, BTreeSet<Kind>> = plan
+            .into_iter()
+            .filter(|(attribute, _)| !attribute.is_empty())
+            .collect();
+
+        self.touch(id, old, &per_attribute, Touch::Remove);
+        self.touch(id, new, &per_attribute, Touch::Add);
+
+        // A posting list that lost its last id is removed rather than left empty: a server that
+        // is written to for months would otherwise keep one empty bitmap per value it has ever
+        // seen, and the memory would grow with the history instead of with the data.
+        for attribute in old.attributes().values() {
+            let name: Arc<str> = crate::model::attribute_name(&attribute.name.to_lowercase());
+            self.prune(&name);
+        }
+
+        Ok(())
+    }
     fn kinds_for<'a>(
         &'a self,
         name: &Arc<str>,
@@ -1226,5 +1326,95 @@ mod tests {
         // And a typo is still a startup error that lists what exists.
         let err = parse_kind("substring").expect_err("must refuse");
         assert!(err.to_string().contains("sub"), "{err}");
+    }
+
+    // ---- an in-place replace must equal a rebuild ----
+    //
+    // This is the safety net for the incremental path: if `replace` and `build` can disagree,
+    // the index narrows to the wrong set after a write and a search silently loses an entry.
+
+    #[test]
+    fn replacing_a_value_in_place_matches_a_full_rebuild() {
+        let config = config(
+            &[("cn", &["pres", "eq", "sub", "ord"]), ("mail", &["sub"])],
+            &[],
+        );
+        let entries = directory();
+        let mut index = Index::build(&entries, &config).expect("build");
+
+        let old = &entries[0];
+        let new = entry(
+            "cn=ann,ou=users,dc=example,dc=com",
+            &[
+                ("objectClass", &["top", "inetOrgPerson"]),
+                ("cn", &["Anna"]),
+                ("mail", &["anna@example.org"]),
+            ],
+        );
+
+        index.replace(0, old, &new, &config).expect("replace");
+
+        let mut expected_entries = entries.clone();
+        expected_entries[0] = new.clone();
+        let expected = Index::build(&expected_entries, &config).expect("build");
+
+        assert_eq!(
+            index, expected,
+            "an in-place replace must leave the index where a rebuild would"
+        );
+    }
+
+    #[test]
+    fn removing_a_value_in_place_stops_finding_the_entry_by_it() {
+        // The equality posting list is the one that decides whether a filter narrows at all: a
+        // stale id here answers `(mail=ann@example.com)` with an entry that no longer has it.
+        let config = config(&[], &["eq", "pres"]);
+        let entries = directory();
+        let mut index = Index::build(&entries, &config).expect("build");
+
+        let old = &entries[0];
+        let new = entry(
+            "cn=ann,ou=users,dc=example,dc=com",
+            &[("objectClass", &["top", "inetOrgPerson"]), ("cn", &["Ann"])],
+        );
+        index.replace(0, old, &new, &config).expect("replace");
+
+        let query = Query::Equality {
+            attribute: "mail".into(),
+            value: "ann@example.com".to_string(),
+        };
+        let candidates = index.candidates(&query).expect("the index answers this");
+        assert!(
+            !candidates.contains(0),
+            "the entry no longer holds that mail, so the index must not name it"
+        );
+    }
+
+    #[test]
+    fn an_attribute_that_went_from_numeric_to_text_keeps_the_index_usable() {
+        // `ordered_numeric` and `ordered_mixed` only ever grow, so a value that stops being a
+        // number must not make a range query answer from the wrong structure. What must hold is
+        // that the index still returns the same set a rebuild would.
+        let config = config(&[("uidNumber", &["ord"])], &[]);
+        let entries = vec![
+            entry("cn=a,dc=example,dc=com", &[("uidNumber", &["7"])]),
+            entry("cn=b,dc=example,dc=com", &[("uidNumber", &["8"])]),
+        ];
+        let mut index = Index::build(&entries, &config).expect("build");
+
+        let new = entry("cn=a,dc=example,dc=com", &[("uidNumber", &["seven"])]);
+        index
+            .replace(0, &entries[0], &new, &config)
+            .expect("replace");
+
+        let mut expected_entries = entries.clone();
+        expected_entries[0] = new;
+        let expected = Index::build(&expected_entries, &config).expect("build");
+
+        assert_eq!(index.ordered, expected.ordered);
+        assert_eq!(index.ordered_mixed, expected.ordered_mixed);
+        // The one difference allowed: `ordered_numeric` may stay set, because forgetting it
+        // would downgrade the entries that are still numeric.
+        assert!(index.ordered_numeric.is_superset(&expected.ordered_numeric));
     }
 }

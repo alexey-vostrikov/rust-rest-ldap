@@ -13,6 +13,7 @@ use crate::backend::{Backend, BackendError, EntryChange};
 use crate::config::Config;
 use crate::directory::Directory;
 use crate::index::IndexConfig;
+use crate::model::Entry;
 use crate::schema::{Mode as SchemaMode, Schema};
 
 /// Holds the current directory snapshot and knows how to rebuild it.
@@ -29,6 +30,12 @@ pub struct Source {
     schema_files: Vec<std::path::PathBuf>,
     schema_mode: SchemaMode,
     indexes: IndexConfig,
+    /// How many times the store has been read in full.
+    ///
+    /// An operator number - it says what the write path costs - and the thing a test can look at
+    /// to tell an incremental write from a reload, which look the same from the outside because
+    /// both answer the same.
+    store_reads: std::sync::atomic::AtomicU64,
 }
 
 impl Source {
@@ -62,6 +69,7 @@ impl Source {
             schema: crate::security::shared_schema(config.schema.clone()),
             schema_files: config.schema_files.clone(),
             schema_mode: config.schema_mode,
+            store_reads: std::sync::atomic::AtomicU64::new(1),
         });
 
         Ok((source, directory))
@@ -136,20 +144,113 @@ impl Source {
         Arc::clone(&directory)
     }
 
+    /// How many times the store has been read in full since the process started.
+    ///
+    /// One at startup, then one per full reload. A write that is applied in place does not move
+    /// it, which is the observable difference between an incremental write and a reload.
+    pub fn store_reads(&self) -> u64 {
+        self.store_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Number of successful reloads so far, for logging and tests.
     pub async fn generation(&self) -> u64 {
         *self.generation.read().await
     }
 
-    /// Persists a change set, then rebuilds the snapshot from the store.
+    /// Persists a change set and makes it visible, incrementally where that is honest.
     ///
-    /// Memory is never patched in place: the directory is derived from what the
-    /// backend returned, so a store that accepted the change and a snapshot that
-    /// shows it cannot drift apart. The cost is a full reload per write; that is the
-    /// price of a single source of truth until an incremental path is measured.
+    /// A change that replaces an entry with one the store keeps verbatim is applied to the
+    /// snapshot in place: the entry takes the place of the old one, its postings are updated,
+    /// and the rest of the directory is not touched. Everything else - an add, a delete, a fixed
+    /// user/group change, a backend that rewrites its document whole - falls back to a full
+    /// reload, because those move the ids of other entries or leave the store free to store
+    /// something other than what was sent.
+    ///
+    /// Until this existed every write cost a store read and an index rebuild: 51 ms at ten
+    /// thousand entries and growing linearly, so a hundred thousand entries would have made a
+    /// single `modify` take about half a second while the directory was being read by everyone
+    /// else.
     pub async fn apply(&self, changes: &[EntryChange]) -> Result<usize, BackendError> {
         self.backend.apply(changes).await?;
+
+        if let Some(entries) = self.apply_in_place(changes).await? {
+            return Ok(entries);
+        }
+
         self.reload().await
+    }
+
+    /// Applies a change set to the snapshot without reading the store, or reports that it cannot.
+    ///
+    /// `None` means "not this way": the caller reloads. The order matters and is the point of
+    /// this function:
+    ///
+    /// 1. everything that can refuse does so before anything is touched - a change set that turns
+    ///    out not to fit leaves the snapshot exactly as it was;
+    /// 2. the snapshot is patched in place when no reader holds it, which is what makes a write
+    ///    cost the entry rather than the directory; when a reader does hold it, the snapshot is
+    ///    copied first, because a reader must never watch its own view change under it.
+    async fn apply_in_place(&self, changes: &[EntryChange]) -> Result<Option<usize>, BackendError> {
+        if !self.backend.keeps_entries_verbatim() || changes.is_empty() {
+            return Ok(None);
+        }
+
+        // Only a replace keeps the ids of the other entries. An add or a delete shifts every id
+        // after it, and every posting list would have to move with them.
+        let mut replacements = Vec::with_capacity(changes.len());
+        for change in changes {
+            let EntryChange::Upsert { entry } = change else {
+                return Ok(None);
+            };
+            replacements.push(entry);
+        }
+
+        // The check a reload would make, over the entries that changed. Every other entry was
+        // checked when it was read; checking them again would make a write cost the directory
+        // again, which is the whole cost this path exists to remove.
+        let changed: Vec<Entry> = replacements.iter().map(|entry| (*entry).clone()).collect();
+        for problem in check_entries_collect(&changed, &self.schema(), self.schema_mode)? {
+            eprintln!("{}", crate::i18n::t("warn.schema", &[("detail", &problem)]));
+        }
+
+        // The snapshot moves even though the store was not read again: a paged search that is
+        // half way through must notice that the directory changed under it.
+        let snapshot = {
+            let mut generation = self.generation.write().await;
+            *generation += 1;
+            *generation
+        };
+
+        let mut current = self.current.write().await;
+
+        // Every DN must already be there before anything is touched: an upsert of a new entry is
+        // an add, and an add moves the ids after it. Checking first is what lets the loop below
+        // be unconditional, so a refusal cannot leave the snapshot half written.
+        for entry in &replacements {
+            if current.position(entry.dn()).is_none() {
+                return Ok(None);
+            }
+        }
+
+        // Unique means no reader holds this snapshot, so patching it is invisible to everyone
+        // else - there is nobody else. Shared means a search is running against it, and the copy
+        // is then the price of not changing what that search sees.
+        if Arc::get_mut(&mut current).is_none() {
+            let copy = (**current).clone();
+            *current = Arc::new(copy);
+        }
+        let directory: &mut Directory = Arc::get_mut(&mut current).expect("made unique above");
+
+        for entry in replacements {
+            directory.replace_entry_in_place(entry.clone(), &self.indexes)?;
+        }
+
+        directory.set_snapshot(snapshot);
+        let entries = directory
+            .entries(&self.base_dn, crate::directory::Scope::Subtree)
+            .len();
+
+        Ok(Some(entries))
     }
 
     /// Rebuilds the indexes over the snapshot already in memory.
@@ -185,6 +286,8 @@ impl Source {
     /// On error the previous snapshot stays in place: a backend hiccup must not
     /// empty the directory that clients are using.
     pub async fn reload(&self) -> Result<usize, BackendError> {
+        self.store_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let data = self.backend.load().await?;
         let directory = data
             .into_directory(&self.base_dn, &self.users_ou_name, &self.groups_ou_name)
@@ -262,12 +365,26 @@ fn check_schema_collect(
     schema: &crate::schema::Schema,
     mode: SchemaMode,
 ) -> Result<Vec<String>, BackendError> {
+    check_entries_collect(directory.all(), schema, mode)
+}
+
+/// The same check over a set of entries rather than the whole directory.
+///
+/// The incremental write path needs this: the rest of the directory was validated when it was
+/// read, and re-validating ten thousand entries to make sure one of them is still fine is most of
+/// the cost of a write. What it must not become is a weaker check - the entry that changed is
+/// checked exactly as a reload would check it.
+fn check_entries_collect(
+    entries: &[Entry],
+    schema: &crate::schema::Schema,
+    mode: SchemaMode,
+) -> Result<Vec<String>, BackendError> {
     if mode == SchemaMode::Off {
         return Ok(Vec::new());
     }
 
     let mut problems = Vec::new();
-    for entry in directory.all() {
+    for entry in entries {
         if let Err(violations) = schema.check(entry) {
             for violation in violations {
                 problems.push(format!(

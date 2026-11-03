@@ -116,6 +116,11 @@ impl Directory {
     }
 
     /// The snapshot this directory is.
+    /// Sets the snapshot number on a directory that is being patched in place.
+    pub fn set_snapshot(&mut self, snapshot: u64) {
+        self.snapshot = snapshot;
+    }
+
     pub fn snapshot(&self) -> u64 {
         self.snapshot
     }
@@ -250,6 +255,31 @@ impl Directory {
             cn.to_lowercase(),
             self.ou_dn(&self.groups_ou_name)
         )
+    }
+
+    /// Replaces one entry in this directory, in place, and returns whether it was there.
+    ///
+    /// Nothing is copied, so the cost of a write stops depending on the size of the directory at
+    /// all - which is the whole reason this exists. The caller is responsible for knowing that no
+    /// reader holds this snapshot: a reader must never watch its view change, so the source makes
+    /// the snapshot unique before calling this.
+    pub fn replace_entry_in_place(
+        &mut self,
+        entry: Entry,
+        config: &crate::index::IndexConfig,
+    ) -> Result<bool, crate::index::IndexError> {
+        let Some(id) = self.position(entry.dn()) else {
+            return Ok(false);
+        };
+
+        let old = std::mem::replace(&mut self.entries[id], entry.clone());
+
+        // The index is already an `Arc`: when this snapshot is unique it is patched in place, and
+        // when a reader copied it earlier the copy costs microseconds rather than the directory.
+        let index = Arc::make_mut(&mut self.index);
+        index.replace(id as u32, &old, &entry, config)?;
+
+        Ok(true)
     }
 
     /// Every entry, in canonical order.
