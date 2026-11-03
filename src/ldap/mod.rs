@@ -66,7 +66,7 @@ fn entry_dn_of(changes: &[EntryChange]) -> String {
         .first()
         .map(|change| match change {
             EntryChange::Upsert { entry } => entry.dn().to_string(),
-            EntryChange::Delete { dn } => dn.clone(),
+            EntryChange::Delete { dn, .. } => dn.clone(),
             _ => String::new(),
         })
         .unwrap_or_default()

@@ -266,7 +266,7 @@ impl RedbBackend {
                                 reason: source.to_string(),
                             })?;
                     }
-                    EntryChange::Delete { dn } => {
+                    EntryChange::Delete { dn, .. } => {
                         entries
                             .remove(dn.as_str())
                             .map_err(|source| BackendError::Redb {
@@ -417,6 +417,7 @@ mod tests {
         backend
             .apply(&[EntryChange::Delete {
                 dn: "cn=a,ou=users,dc=example,dc=com".to_string(),
+                kind: None,
             }])
             .expect("delete");
 

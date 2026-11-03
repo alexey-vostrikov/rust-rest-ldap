@@ -189,6 +189,7 @@ fn a_refused_change_set_leaves_the_store_untouched() {
         },
         EntryChange::Delete {
             dn: "cn=ghost,ou=users,dc=example,dc=com".to_string(),
+            kind: None,
         },
     ]));
     assert!(outcome.is_ok(), "a delete is a valid entry-level change");

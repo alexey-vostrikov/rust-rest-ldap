@@ -74,6 +74,23 @@ class Handler(BaseHTTPRequestHandler):
             log.write(f"PUT {self.path} body={body}\n")
         self._reply({})
 
+    def do_DELETE(self):
+        # The endpoint the backend sends when `allow_delete: true` is configured. The real
+        # service is not part of this project, so what this proves is the request's shape and
+        # that the flag is what decides whether it is sent at all.
+        with open(LOG, "a") as log:
+            log.write(f"DELETE {self.path}\n")
+
+        if self.headers.get("Authorization") != "Token s3cret-token":
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
 
 if __name__ == "__main__":
     port = int(sys.argv[1])

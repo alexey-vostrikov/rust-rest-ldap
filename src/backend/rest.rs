@@ -26,7 +26,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::http::{Client, Endpoint};
-use super::{BackendError, DirectoryData, EntryChange};
+use super::{BackendError, DirectoryData, EntryChange, ObjectKind};
 use crate::client::Trust;
 use crate::model::{Group, User};
 
@@ -50,6 +50,15 @@ pub struct RestBackendConfig {
     pub http_request_timeout: Option<String>,
     /// Certificate authority for an `https` service, when it is not a public one.
     pub ca_file: Option<PathBuf>,
+    /// Allow `DELETE <collection>/<name>` for entries removed from the directory.
+    ///
+    /// Off by default, and deliberately: the deletion endpoint is not part of the protocol
+    /// gorestldap defined, so this is this server's guess at the service's shape. A service that
+    /// does not implement it answers 404 or 405 and nothing is lost, but a service that
+    /// implements it *differently* - a soft delete, say - should be found out by the operator
+    /// turning this on, not by a directory that started deleting rows on its own.
+    #[serde(default)]
+    pub allow_delete: bool,
 }
 
 fn default_users_path() -> String {
@@ -66,6 +75,7 @@ pub struct RestBackend {
     client: Client,
     users_path: String,
     groups_path: String,
+    allow_delete: bool,
 }
 
 impl RestBackend {
@@ -104,6 +114,7 @@ impl RestBackend {
             client: Client::new(endpoint, config.auth_token, timeout, trust),
             users_path: config.users_path,
             groups_path: config.groups_path,
+            allow_delete: config.allow_delete,
         })
     }
 
@@ -172,13 +183,48 @@ impl RestBackend {
                     self.write(&self.users_path, &user.cn, &user).await
                 }
             }
-            // Deleting through the service is a different operation with a different endpoint,
-            // and guessing its shape would send a request nobody asked for.
-            EntryChange::Delete { dn } => Err(BackendError::InvalidConfig(format!(
-                "'{dn}' cannot be deleted through the REST backend: the service's delete \
-                 endpoint is not part of this protocol; delete it there, or use the redb backend"
-            ))),
+            EntryChange::Delete { dn, kind } => self.delete(dn, *kind).await,
         }
+    }
+
+    /// Removes the object the change names from the collection its kind belongs to.
+    ///
+    /// The kind comes from the caller, not from the DN: the DN's parent OU is this server's
+    /// naming, which the backend is never told, and a service with separate user and group
+    /// collections would otherwise get a DELETE aimed at the wrong one - deleting a group
+    /// because a user of the same name was removed.
+    async fn delete(&self, dn: &str, kind: Option<ObjectKind>) -> Result<(), BackendError> {
+        if !self.allow_delete {
+            return Err(BackendError::InvalidConfig(format!(
+                "'{dn}' cannot be deleted through the REST backend: the service's delete \
+                 endpoint is not part of the protocol this backend speaks. Set \
+                 `allow_delete: true` if the service does implement `DELETE <collection>/<name>`,\
+                 or delete it there; the redb backend deletes locally"
+            )));
+        }
+
+        let Some(kind) = kind else {
+            return Err(BackendError::InvalidConfig(format!(
+                "'{dn}' cannot be deleted through the REST backend: which collection holds it \
+                 was not established, and asking both would be a request nobody made"
+            )));
+        };
+
+        let collection = match kind {
+            ObjectKind::User => &self.users_path,
+            ObjectKind::Group => &self.groups_path,
+        };
+
+        let name = name_of_dn(dn).ok_or_else(|| {
+            BackendError::InvalidConfig(format!("'{dn}' has no name to address in the service"))
+        })?;
+
+        self.client
+            .delete(&object_path(collection, &name))
+            .await
+            .map_err(|err| self.failure(err))?;
+
+        Ok(())
     }
 
     async fn write<T: serde::Serialize>(
@@ -224,6 +270,14 @@ fn path_segment(name: &str) -> String {
 }
 
 /// The path of one object: the collection as written, and the name encoded.
+/// The name a DN carries: the value of its first RDN.
+///
+/// `cn=Doe\, John,ou=users,dc=example,dc=com` gives `Doe, John`. Handing the whole RDN to the
+/// service would address an object named `cn=Doe, John`, which is not what the DN means.
+fn name_of_dn(dn: &str) -> Option<String> {
+    crate::dn::first_value(dn).map(|value| crate::dn::unescape(&value))
+}
+
 fn object_path(collection: &str, name: &str) -> String {
     format!(
         "{}/{}",
