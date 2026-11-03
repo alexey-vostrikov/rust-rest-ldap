@@ -1,0 +1,4 @@
+dn: cn=alice,dc=example,dc=com
+objectClass: person
+cn: alice
+

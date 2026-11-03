@@ -16,3 +16,9 @@ ldapmodrdn
 ldapcompare
 ldapwhoami
 ldappasswd
+# Fuzzing: the corpus is generated (tens of megabytes in minutes) and the artifacts are crash
+# inputs, kept only while one is being investigated. What is committed is fuzz/seeds.
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/target
+/fuzz/Cargo.lock
