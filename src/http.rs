@@ -207,6 +207,7 @@ mod tests {
             schema_mode: crate::schema::Mode::Strict,
             schema_files: Vec::new(),
             indexes: crate::index::IndexConfig::default(),
+            referrals: Default::default(),
             acl: Default::default(),
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),

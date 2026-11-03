@@ -14,6 +14,9 @@ use rasn_ldap::{Controls, LdapMessage, MessageId, ResultCode, SearchRequest};
 
 use super::filter;
 use super::paged::{self, PAGED_RESULTS_OID, Page};
+
+/// `manageDsaIT` (RFC 3296 §2): "do not redirect me, treat special objects as entries".
+pub const MANAGEDSAIT_OID: &str = "2.16.840.1.113730.3.4.2";
 use super::responses::{self, search_done_with_controls, search_result_entry};
 use super::session::Session;
 use super::sort;
@@ -58,6 +61,7 @@ pub fn handle_search(
     let mut sort_request: Option<sort::SortRequest> = None;
     let mut sort_critical = false;
     let mut virtual_list: Option<sort::VirtualList> = None;
+    let mut manage_dsa_it = false;
     for control in controls.into_iter().flatten() {
         if control.control_type.as_ref() == PAGED_RESULTS_OID.as_bytes() {
             has_paged_control = true;
@@ -125,6 +129,13 @@ pub fn handle_search(
                     )];
                 }
             }
+        } else if control.control_type.as_ref() == MANAGEDSAIT_OID.as_bytes() {
+            // RFC 3296: "treat referral and other special objects as ordinary entries". This
+            // server has no referral *entries* - its subtrees are configured, not stored - so
+            // what the control means here is the part that matters to a client: do not redirect
+            // me, answer for this DN yourself. Recognising it is also what keeps a critical
+            // ManageDsaIT from being refused as an unknown extension.
+            manage_dsa_it = true;
         } else if control.criticality && security.respect_control_criticality {
             return vec![responses::search_done(
                 message_id,
@@ -172,6 +183,21 @@ pub fn handle_search(
     // The naming context itself, the units and every entry are all in `directory`; only a
     // base outside the tree is missing from it.
     if directory.find(&base_object).is_none() {
+        // A subtree this server does not hold, but knows where it lives: RFC 4511 §4.5.3 says
+        // answer with a reference and then a successful done, so the client can ask the server
+        // that does hold it. Anything else - a base nobody covers - is still `noSuchObject`.
+        //
+        // Not when the client sent ManageDsaIT: it asked not to be redirected.
+        if !manage_dsa_it {
+            let uris = security.referrals.uris(&base_object);
+            if !uris.is_empty() {
+                return vec![
+                    responses::search_reference(message_id, uris),
+                    responses::search_done(message_id, ResultCode::Success, ""),
+                ];
+            }
+        }
+
         return vec![responses::search_done(
             message_id,
             ResultCode::NoSuchObject,

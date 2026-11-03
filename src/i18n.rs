@@ -544,6 +544,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("warn.schema", "schema warning: {detail}"),
     // Configuration diagnostics, one per variant an operator can hit
+    ("config.referral", "invalid referrals: {detail}"),
     (
         "config.tls_material",
         "use_tls is enabled, but server_cert and server_key are not both set",
