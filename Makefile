@@ -1,6 +1,6 @@
 CARGO ?= ./scripts/cargo.sh
 
-.PHONY: build test lint fmt fmt-check check all install miri fuzz fuzz-all metrics dup mutate
+.PHONY: build test lint fmt fmt-check check all install miri fuzz fuzz-all metrics coverage-html dup mutate
 
 build:
 	$(CARGO) build --release
@@ -70,6 +70,17 @@ install: build
 metrics:
 	./scripts/metrics.sh cargo llvm-cov --lcov --output-path /w/target/coverage/lcov.info --no-cfg-coverage
 	./scripts/metrics.sh crapper --root /w -s /w/src --use-existing-coverage
+
+# The same coverage as a browsable report. Not part of `metrics`: writing a directory of HTML on
+# every run is noise, and the numbers live in crap.edn. This target is for reading line by line -
+# which lines of a function the tests never reached.
+#
+# `--output-dir` appends `html/` itself: given target/coverage it writes target/coverage/html, and
+# given target/coverage/html it writes target/coverage/html/html. Hence the shorter argument, and
+# the echo prints the path that exists rather than the one that looks right.
+coverage-html:
+	./scripts/metrics.sh cargo llvm-cov --html --output-dir /w/target/coverage --no-cfg-coverage --remap-path-prefix
+	@echo "отчёт: $$PWD/target/coverage/html/index.html"
 
 # Duplicates only: no coverage needed, so this is the cheap one and the one worth running often.
 dup:
