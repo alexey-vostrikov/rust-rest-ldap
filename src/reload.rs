@@ -195,8 +195,16 @@ impl Source {
 
         check_schema(&directory, &self.schema(), self.schema_mode)?;
 
+        // The snapshot number is what a paged search uses to notice that the directory moved
+        // under it; it is taken with the swap, so the number and the contents cannot disagree.
+        let snapshot = {
+            let mut generation = self.generation.write().await;
+            *generation += 1;
+            *generation
+        };
+        let directory = directory.at_snapshot(snapshot);
+
         *self.current.write().await = Arc::new(directory);
-        *self.generation.write().await += 1;
 
         Ok(entries)
     }

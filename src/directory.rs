@@ -45,6 +45,14 @@ pub struct Directory {
     by_dn: HashMap<String, usize>,
     /// Search indexes over the same id numbering. Empty unless `with_indexes` ran.
     index: Arc<Index>,
+    /// Which snapshot of the directory this is.
+    ///
+    /// A paged search hands the client a cookie that says where the next page starts. An offset
+    /// alone is not enough to continue safely: if the directory changed between pages, the same
+    /// offset points at a different entry, and the client silently skips or repeats records.
+    /// The cookie carries this number too, so a page that continues a snapshot which no longer
+    /// exists is refused instead of answered wrongly.
+    snapshot: u64,
 }
 
 impl Directory {
@@ -100,6 +108,18 @@ impl Directory {
     ///
     /// Entries below the users or groups OU are placed in the canonical position;
     /// everything else keeps DN order after them.
+    /// The same directory, marked as snapshot `snapshot`.
+    #[must_use]
+    pub fn at_snapshot(mut self, snapshot: u64) -> Self {
+        self.snapshot = snapshot;
+        self
+    }
+
+    /// The snapshot this directory is.
+    pub fn snapshot(&self) -> u64 {
+        self.snapshot
+    }
+
     pub fn from_entries(
         base_dn: &str,
         users_ou_name: &str,
@@ -183,6 +203,9 @@ impl Directory {
             users,
             groups,
             by_dn,
+            // Zero until the source that built it says which snapshot this is: a directory
+            // built by hand in a test has no history to be inconsistent with.
+            snapshot: 0,
             index: Arc::new(Index::default()),
         }
     }

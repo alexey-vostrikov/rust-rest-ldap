@@ -285,8 +285,8 @@ pub fn handle_search(
 
     // Paging: the cookie is the offset of the first entry of this page.
     let offset = if has_paged_control {
-        match parse_cookie(&page.cookie) {
-            Ok(offset) => offset,
+        match parse_cookie(&page.cookie, directory.snapshot()) {
+            Ok(cursor) => cursor.offset,
             Err(offset_err) => {
                 return vec![responses::search_done(
                     message_id,
@@ -366,7 +366,10 @@ pub fn handle_search(
     }
     if has_paged_control && window.is_none() {
         let cookie = if page_end < matched.len() {
-            page_end.to_string().into_bytes()
+            cursor_cookie(Cursor {
+                offset: page_end,
+                snapshot: directory.snapshot(),
+            })
         } else {
             Vec::new()
         };
@@ -395,19 +398,57 @@ fn without_values(attribute: crate::model::Attribute) -> crate::model::Attribute
     }
 }
 
-fn parse_cookie(cookie: &[u8]) -> Result<usize, String> {
+/// Where a page continues, and which snapshot it continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    offset: usize,
+    /// The directory snapshot the previous page was cut from.
+    snapshot: u64,
+}
+
+/// The cookie a page hands back: `<offset>:<snapshot>`.
+///
+/// Two numbers because one is not enough. The offset says where to continue; the snapshot says
+/// what the offset was an offset *into*. Between two pages the directory can be reloaded, or
+/// another client can add and delete entries, and then the same offset lands on a different
+/// entry - the client silently skips records or sees the same one twice. RFC 2696 leaves the
+/// cookie opaque, so this is a legal use of it.
+fn cursor_cookie(cursor: Cursor) -> Vec<u8> {
+    format!("{}:{}", cursor.offset, cursor.snapshot).into_bytes()
+}
+
+fn parse_cookie(cookie: &[u8], snapshot: u64) -> Result<Cursor, String> {
     if cookie.is_empty() {
-        return Ok(0);
+        return Ok(Cursor { offset: 0, snapshot });
     }
-    std::str::from_utf8(cookie)
-        .ok()
-        .and_then(|text| text.parse::<usize>().ok())
-        .ok_or_else(|| {
-            format!(
-                "paged results cookie '{}' is not a position",
-                String::from_utf8_lossy(cookie)
-            )
-        })
+
+    let text = std::str::from_utf8(cookie).map_err(|_| {
+        format!(
+            "paged results cookie '{}' is not readable",
+            String::from_utf8_lossy(cookie)
+        )
+    })?;
+
+    // A cookie without a snapshot is from a client that stored one before this server recorded
+    // it: continuing it would be guessing, so it is refused as an unknown cursor.
+    let (offset, found) = text.split_once(':').ok_or_else(|| {
+        format!("paged results cookie '{text}' is not a cursor this server issued")
+    })?;
+
+    let offset: usize = offset
+        .parse()
+        .map_err(|_| format!("paged results cookie '{text}' has no position"))?;
+    let found: u64 = found
+        .parse()
+        .map_err(|_| format!("paged results cookie '{text}' has no snapshot"))?;
+
+    if found != snapshot {
+        return Err(format!(
+            "the directory changed while this search was paged (snapshot {found} → {snapshot}), so the offset no longer points where it did; start the search again without a cookie"
+        ));
+    }
+
+    Ok(Cursor { offset, snapshot })
 }
 
 pub fn scope_of(request: &SearchRequest) -> crate::directory::Scope {
@@ -943,7 +984,11 @@ mod tests {
         let messages = search(&session, &request, Some(&controls));
 
         assert_eq!(dns(&messages), vec![BASE, "ou=users,dc=example,dc=com"]);
-        assert_eq!(returned_cookie(&messages), b"2".to_vec());
+        assert_eq!(
+            returned_cookie(&messages),
+            b"2:0".to_vec(),
+            "the offset, and the snapshot it is an offset into"
+        );
         assert_eq!(result_code(&messages), ResultCode::Success);
     }
 
@@ -1018,7 +1063,92 @@ mod tests {
         assert_eq!(result_code(&messages), ResultCode::UnwillingToPerform);
         assert_eq!(
             diagnostic(&messages),
-            "paged results cookie 'nonsense' is not a position"
+            "paged results cookie 'nonsense' is not a cursor this server issued"
+        );
+    }
+
+    #[test]
+    fn a_page_continued_after_the_directory_changed_is_refused_not_answered_wrongly() {
+        // The defect this closes: the cookie was a bare offset, so a reload or another client's
+        // write between two pages made the offset point at a different entry - the client
+        // silently skipped records or saw one twice, and nothing said so.
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        // The first page, cut from snapshot 1.
+        let first = handle_search(
+            &session,
+            &directory().at_snapshot(1),
+            1,
+            &request,
+            Some(&paged_control(2, b"")),
+            &security(),
+        );
+        let cookie = returned_cookie(&first);
+        assert_eq!(cookie, b"2:1".to_vec(), "the cookie carries snapshot 1");
+
+        // The directory was reloaded since: same entries, different snapshot.
+        let second = handle_search(
+            &session,
+            &directory().at_snapshot(2),
+            2,
+            &request,
+            Some(&paged_control(2, &cookie)),
+            &security(),
+        );
+
+        assert!(
+            dns(&second).is_empty(),
+            "no entry is served from a snapshot this page does not belong to"
+        );
+        assert_eq!(result_code(&second), ResultCode::UnwillingToPerform);
+        assert_eq!(
+            diagnostic(&second),
+            "the directory changed while this search was paged (snapshot 1 → 2), so the offset no longer points where it did; start the search again without a cookie"
+        );
+    }
+
+    #[test]
+    fn a_page_continued_within_the_same_snapshot_is_served() {
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let first = handle_search(
+            &session,
+            &directory().at_snapshot(7),
+            1,
+            &request,
+            Some(&paged_control(2, b"")),
+            &security(),
+        );
+        let cookie = returned_cookie(&first);
+        assert_eq!(cookie, b"2:7".to_vec());
+
+        let second = handle_search(
+            &session,
+            &directory().at_snapshot(7),
+            2,
+            &request,
+            Some(&paged_control(2, &cookie)),
+            &security(),
+        );
+
+        assert_eq!(result_code(&second), ResultCode::Success);
+        assert!(
+            !dns(&second).is_empty(),
+            "the next page is served while the snapshot stands"
         );
     }
 
@@ -1033,7 +1163,7 @@ mod tests {
             &[],
         );
 
-        let messages = search(&session, &request, Some(&paged_control(2, b"99")));
+        let messages = search(&session, &request, Some(&paged_control(2, b"99:0")));
 
         assert!(dns(&messages).is_empty());
         assert_eq!(result_code(&messages), ResultCode::UnwillingToPerform);
