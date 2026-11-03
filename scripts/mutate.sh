@@ -24,6 +24,12 @@ cargo_cache="${RR_LDAP_CARGO_CACHE:-$HOME/.cache/rrl/cargo}"
 rustup_cache="${RR_LDAP_RUSTUP_CACHE:-$HOME/.cache/rrl/rustup}"
 target_cache="${RR_LDAP_TARGET_CACHE:-$HOME/.cache/rrl/target}"
 
+grammars="${TS_CACHE:-$HOME/.cache/tree-sitter-language-pack}"
+[ -d "$grammars" ] || {
+  echo "нет кэша грамматик tree-sitter в '$grammars': запустите crapper на хосте один раз" >&2
+  exit 1
+}
+
 if [ ! -f "$repo/target/coverage/lcov.info" ]; then
   echo "нет покрытия: соберите его (make metrics) — без него mutator запускает ноль мутантов" >&2
   exit 1
@@ -35,6 +41,7 @@ for name in "$@"; do
   echo "=== $name"
   docker run --rm \
     -v "$repo:/w" \
+    -v "$grammars:/opt/cache/tree-sitter-language-pack:ro" \
     -v "$cargo_cache:/cargo" \
     -v "$rustup_cache:/rustup" \
     -v "$target_cache:/target" \
