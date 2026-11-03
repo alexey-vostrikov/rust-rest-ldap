@@ -55,6 +55,13 @@ impl DirectoryData {
     }
 }
 
+/// Whether an entry is a user or a group, for backends that keep them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    User,
+    Group,
+}
+
 /// A change the server asks the backend to persist.
 ///
 /// gorestldap passed two `interface{}` values and found the entry by deep
@@ -75,10 +82,26 @@ pub enum EntryChange {
     },
     Delete {
         dn: String,
+        /// What kind of object the DN named, when the caller knows.
+        ///
+        /// The DN alone is not enough for a backend whose store has separate collections: its
+        /// parent OU says "users" or "groups" in *this server's* naming, which the backend is
+        /// not told. `None` means the caller did not know - the redb store does not care, and
+        /// the REST backend refuses rather than guessing a collection and deleting a
+        /// same-named object of the other kind.
+        kind: Option<ObjectKind>,
     },
 }
 
 impl EntryChange {
+    /// A delete, with the kind of object it removes.
+    pub fn delete(dn: impl Into<String>, kind: Option<ObjectKind>) -> Self {
+        EntryChange::Delete {
+            dn: dn.into(),
+            kind,
+        }
+    }
+
     /// Names the variant, for error messages that must say what was refused.
     pub fn kind(&self) -> &'static str {
         match self {

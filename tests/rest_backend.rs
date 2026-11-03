@@ -12,7 +12,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use rust_rest_ldap::backend::{Backend, EntryChange};
+use rust_rest_ldap::backend::{Backend, EntryChange, ObjectKind};
 use rust_rest_ldap::model::User;
 
 /// One request as the mock service saw it.
@@ -428,13 +428,26 @@ async fn a_group_entry_goes_to_the_groups_collection() {
     assert_eq!(sent["memberUid"][0], "alice");
 }
 
+/// The same backend with `allow_delete` on.
+fn backend_allow_delete(url: &str) -> Backend {
+    let config = serde_json::json!({
+        "url": url,
+        "users_path": "/ldap/user",
+        "groups_path": "/ldap/group",
+        "allow_delete": true,
+    });
+
+    Backend::from_config("rest", Some(&config)).expect("backend")
+}
+
 #[tokio::test]
-async fn a_delete_is_refused_because_the_endpoint_is_not_part_of_this_protocol() {
+async fn a_delete_is_refused_by_default_because_the_endpoint_is_not_part_of_this_protocol() {
     let (url, seen) = service(200, |_| "{}".to_string(), None).await;
 
     let error = backend(&url, None, None)
         .update(&EntryChange::Delete {
             dn: "cn=alice,ou=users,dc=example,dc=com".to_string(),
+            kind: Some(ObjectKind::User),
         })
         .await
         .expect_err("must refuse");
@@ -446,5 +459,83 @@ async fn a_delete_is_refused_because_the_endpoint_is_not_part_of_this_protocol()
     assert!(
         seen.lock().expect("lock").is_empty(),
         "nothing was sent: guessing a delete endpoint would send a request nobody asked for"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_with_the_flag_on_goes_to_the_users_collection() {
+    // `allow_delete` is the operator saying the service does implement DELETE
+    // <collection>/<name>. With it on, the request is the shape the write path already uses.
+    let (url, seen) = service(200, |_| String::new(), None).await;
+
+    backend_allow_delete(&url)
+        .update(&EntryChange::Delete {
+            dn: "cn=alice,ou=users,dc=example,dc=com".to_string(),
+            kind: Some(ObjectKind::User),
+        })
+        .await
+        .expect("delete");
+
+    let seen = seen.lock().expect("lock");
+    assert_eq!(seen.len(), 1, "one request");
+    assert_eq!(seen[0].method, "DELETE");
+    assert_eq!(
+        seen[0].path, "/ldap/user/alice",
+        "the user collection, named by the DN's first value"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_of_a_group_goes_to_the_group_collection() {
+    let (url, seen) = service(200, |_| String::new(), None).await;
+
+    backend_allow_delete(&url)
+        .update(&EntryChange::Delete {
+            dn: "cn=admins,ou=groups,dc=example,dc=com".to_string(),
+            kind: Some(ObjectKind::Group),
+        })
+        .await
+        .expect("delete");
+
+    assert_eq!(seen.lock().expect("lock")[0].path, "/ldap/group/admins");
+}
+
+#[tokio::test]
+async fn a_delete_without_a_known_kind_is_refused_rather_than_aimed_at_both_collections() {
+    // The DN's parent OU is this server's naming, which the backend is not told. Asking both
+    // collections would be two requests, one of which nobody made - and the wrong one could
+    // remove a same-named object of the other kind.
+    let (url, seen) = service(200, |_| String::new(), None).await;
+
+    let error = backend_allow_delete(&url)
+        .update(&EntryChange::Delete {
+            dn: "cn=alice,ou=users,dc=example,dc=com".to_string(),
+            kind: None,
+        })
+        .await
+        .expect_err("must refuse");
+
+    assert!(error.to_string().contains("which collection"), "{error}");
+    assert!(seen.lock().expect("lock").is_empty(), "nothing was sent");
+}
+
+#[tokio::test]
+async fn a_deleted_name_with_a_comma_addresses_one_object_and_not_two() {
+    // `cn=Doe, John` is a legal DN. Unencoded it addresses `/ldap/user/Doe, John`, which some
+    // services read as a path with an extra segment - the request that looks like it worked.
+    let (url, seen) = service(200, |_| String::new(), None).await;
+
+    backend_allow_delete(&url)
+        .update(&EntryChange::Delete {
+            dn: "cn=Doe\\, John,ou=users,dc=example,dc=com".to_string(),
+            kind: Some(ObjectKind::User),
+        })
+        .await
+        .expect("delete");
+
+    let path = seen.lock().expect("lock")[0].path.clone();
+    assert_eq!(
+        path, "/ldap/user/Doe%2C%20John",
+        "the name is one path segment, escaped"
     );
 }

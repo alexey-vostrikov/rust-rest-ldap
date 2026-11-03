@@ -228,6 +228,14 @@ impl Client {
         self.send(hyper::Method::PUT, path, Some(body)).await
     }
 
+    /// `DELETE path`, returning the body of a 200 answer.
+    ///
+    /// Idempotent by the method's own definition, which is what lets the caller repeat it after a
+    /// timeout without wondering whether the object is gone once or twice.
+    pub async fn delete(&self, path: &str) -> Result<Bytes, Error> {
+        self.send(hyper::Method::DELETE, path, None).await
+    }
+
     async fn send(
         &self,
         method: hyper::Method,
@@ -354,7 +362,11 @@ impl Client {
         drop(sender);
         driving.abort();
 
-        if status != hyper::StatusCode::OK {
+        // Any 2xx is success. `200 OK` was the only answer this accepted, which turned a
+        // perfectly ordinary `204 No Content` - what a service returns to a DELETE that has
+        // nothing to say - into a refusal, so the directory reported a deletion it had already
+        // performed as failed.
+        if !status.is_success() {
             return Err(Error::Status {
                 target: target.to_string(),
                 status: status.as_u16(),

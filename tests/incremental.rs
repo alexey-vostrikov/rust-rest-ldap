@@ -210,6 +210,7 @@ async fn a_delete_still_reloads() {
     source
         .apply(&[EntryChange::Delete {
             dn: "cn=u4,ou=users,dc=example,dc=com".to_string(),
+            kind: None,
         }])
         .await
         .expect("apply");

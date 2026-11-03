@@ -29,7 +29,12 @@ pub fn normalize(entry: &str) -> String {
 /// The input is expected to be normalized already; the suffix is empty when the
 /// entry has a single RDN.
 pub fn split_first_rdn(entry: &str) -> (String, String, String) {
-    let (rdn, suffix) = match entry.split_once(',') {
+    // The split is on an unescaped comma: RFC 4514 lets a value carry one as `\,`, and
+    // `cn=Doe\, John,ou=...` is a single RDN whose value holds a comma. Splitting at the first
+    // comma turned that value into `Doe\` and left the rest of the name as the parent - a
+    // defect that only shows up on entries whose names have a comma in them, which is exactly
+    // why it survived this long.
+    let (rdn, suffix) = match split_unescaped(entry, ',') {
         Some((rdn, suffix)) => (rdn, suffix),
         None => (entry, ""),
     };
@@ -38,6 +43,53 @@ pub fn split_first_rdn(entry: &str) -> (String, String, String) {
         None => (rdn, ""),
     };
     (attribute.to_string(), value.to_string(), suffix.to_string())
+}
+
+/// Splits at the first occurrence of `separator` that is not escaped with a backslash.
+fn split_unescaped(text: &str, separator: char) -> Option<(&str, &str)> {
+    let mut escaped = false;
+
+    for (index, character) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            _ if character == separator => return Some((&text[..index], &text[index + 1..])),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// The value with its RFC 4514 escapes removed: `Doe\, John` gives `Doe, John`.
+///
+/// For handing a name to something outside the directory - a REST service addresses an object
+/// by name, and the name it stores does not carry the directory's escapes.
+pub fn unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut characters = value.chars();
+
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            match characters.next() {
+                // A hex pair is the other escape form RFC 4514 allows; both bytes are kept as
+                // written, because turning them into a character could split a multibyte one.
+                Some(hex) if hex.is_ascii_hexdigit() => {
+                    out.push('\\');
+                    out.push(hex);
+                }
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(character);
+        }
+    }
+
+    out
 }
 
 /// Value of the first RDN, e.g. `dc=example,dc=com` gives `example`.

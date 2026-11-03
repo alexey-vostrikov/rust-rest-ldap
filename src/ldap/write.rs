@@ -102,7 +102,7 @@ fn schema_verdict(
 /// the new name. Everything between them is the subtree and the groups following the move.
 pub fn renamed_dn(changes: &[EntryChange]) -> Option<(String, String)> {
     let old = match changes.first()? {
-        EntryChange::Delete { dn } => dn.clone(),
+        EntryChange::Delete { dn, .. } => dn.clone(),
         _ => return None,
     };
     let new = match changes.last()? {
@@ -341,17 +341,28 @@ pub fn handle_delete(
         ));
     }
 
+    // Which kind of object this is, decided here because here is where the object still
+    // exists: a backend that keeps users and groups in separate collections cannot tell from
+    // the DN alone (its parent OU is this server's naming, not the backend's), and guessing
+    // would delete a same-named object of the other kind.
+    let removed = directory.find(&entry_dn);
+    let kind = removed.map(|entry| {
+        if crate::mapping::is_group(entry) {
+            crate::backend::ObjectKind::Group
+        } else {
+            crate::backend::ObjectKind::User
+        }
+    });
+
     // A group that lists this user keeps a name that no longer resolves, and nothing
     // says so: the membership looks like a person and is not one. The cleanup belongs
     // here, in the same change set, so the delete and the cleanup cannot half-happen.
     let mut changes = vec![EntryChange::Delete {
         dn: entry_dn.clone(),
+        kind,
     }];
 
-    if let Some(entry) = directory
-        .find(&entry_dn)
-        .filter(|_| security.integrity.referential_integrity)
-    {
+    if let Some(entry) = removed.filter(|_| security.integrity.referential_integrity) {
         for group in crate::integrity::changes_for_removed(directory, entry) {
             changes.push(EntryChange::Upsert { entry: group });
         }
@@ -474,6 +485,7 @@ pub fn handle_modify_dn(
 
     let mut changes = vec![EntryChange::Delete {
         dn: real_dn.clone(),
+        kind: None,
     }];
 
     // The subtree, if any: every descendant gets the new parent in one change set.
@@ -495,6 +507,7 @@ pub fn handle_modify_dn(
 
         changes.push(EntryChange::Delete {
             dn: descendant.dn().to_string(),
+            kind: None,
         });
         changes.push(EntryChange::Upsert { entry: moved });
     }
