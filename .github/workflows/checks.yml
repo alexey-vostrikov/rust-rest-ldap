@@ -1,0 +1,90 @@
+name: checks
+
+# The gates exist as make targets and nobody runs them on commit: this file is what puts them on
+# the path. Three jobs, deliberately of different cost:
+#
+#   check  - every push and pull request, a few minutes. Formatting, lints, the test suite.
+#   load   - the same tree in release, because the load tests compile to nothing in debug (their
+#            numbers are meaningless there) but their assertions still matter.
+#   miri   - nightly only. Fourteen minutes on ten modules; too slow for a pull request and
+#            pointless to skip entirely.
+#
+# What is NOT here yet: fuzzing (make fuzz-all needs the tree-sitter grammars, which cannot be
+# downloaded on a runner without network) and mutation (six hours over the tree, and per-file
+# selection does not work - D16 in docs/plan.md).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 03:17 on Mondays: the slow jobs, off the working day, once a week.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A hanging test is a failed test: the suite takes minutes, so half an hour means something
+  # waits forever rather than being slow.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # No toolchain input: the action reads rust-toolchain.toml, so the version here is the one
+      # the project pins, not a second place to keep in step.
+      - uses: dtolnay/rust-toolchain@master
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: formatting
+        run: cargo fmt --all -- --check
+
+      - name: lints
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: tests
+        run: cargo test --all-targets
+
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A different profile builds different artefacts; sharing the key would evict the
+          # debug cache on every alternating run.
+          key: release
+
+      # Ten thousand entries, paged reads and concurrent clients. The file compiles to nothing
+      # without --release, so this job is the only place its assertions run.
+      - name: load tests
+        run: cargo test --release --test load -- --nocapture --test-threads=1
+
+  miri:
+    # Only on the schedule: ten modules take about fourteen minutes under the interpreter, and a
+    # pull request should not wait for that.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+
+      # The module list lives in the Makefile, so this file does not keep a second copy that
+      # drifts. Modules with system calls are absent on purpose: Miri cannot run sockets or files.
+      - name: miri
+        run: make miri CARGO=cargo
