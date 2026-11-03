@@ -1,6 +1,8 @@
 CARGO ?= ./scripts/cargo.sh
+CRAPPER ?= $(HOME)/DevOps/3part/crapper/.venv/bin/python -m crapper
+DRYER ?= $(HOME)/DevOps/3part/dryer/.venv/bin/python -m dryer
 
-.PHONY: build test lint fmt fmt-check check all install miri fuzz fuzz-all
+.PHONY: build test lint fmt fmt-check check all install miri fuzz fuzz-all metrics dup mutate
 
 build:
 	$(CARGO) build --release
@@ -63,3 +65,22 @@ install: build
 	for tool in ldapdelete ldapmodrdn ldapcompare ldapwhoami ldappasswd; do \
 		ln -sf ldaputil "/usr/local/bin/$$tool"; \
 	done
+
+# Coverage, then the complexity report over it. crapper only looks for lcov under
+# target/coverage/**, so the report is copied there; and it must be fresh, or the numbers
+# describe a tree that no longer exists.
+metrics:
+	./scripts/metrics.sh llvm-cov --lcov --output-path /w/.metrics/lcov.info --no-cfg-coverage
+	sed -i 's|^SF:/w/|SF:'"$$PWD"'/|' .metrics/lcov.info
+	mkdir -p target/coverage
+	cp .metrics/lcov.info target/coverage/lcov.info
+	$(CRAPPER) --root . -s ./src --use-existing-coverage
+
+# Duplicates only: no coverage needed, so this is the cheap one and the one worth running often.
+dup:
+	$(DRYER) --root . -s ./src
+
+# Mutation over a list of files. See the limitation in scripts/mutate-files.sh: today the numbers
+# come out wrong because the test command runs in a container that cannot see the overlay.
+mutate:
+	./scripts/mutate-files.sh $(FILES)
