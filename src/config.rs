@@ -83,6 +83,117 @@ pub struct Args {
 /// is in force, and a later writer can change a value without inventing the 40 settings that
 /// were only defaults.
 ///
+impl ConfigError {
+    /// The error as an operator should read it: in the configured language, or in English when the
+    /// catalogue has no text for this variant.
+    ///
+    /// It lives on the error and not in `main` because it is the error's own business how it is
+    /// described - and because a private function in a binary cannot be reached by a test.
+    pub fn message(&self) -> String {
+        let english = self.to_string();
+
+        // The translated text borrows its arguments, so they are built first and kept alive
+        // in `owned` until the call is done.
+        let key: &str;
+        let mut owned: Vec<(String, String)> = Vec::new();
+
+        match self {
+            Self::MissingTlsMaterial => key = "config.tls_material",
+            Self::UnknownBackend { name, known } => {
+                key = "config.unknown_backend";
+                owned.push(("name".to_string(), name.clone()));
+                owned.push(("known".to_string(), known.join(", ")));
+            }
+            Self::SchemaMode(value) => {
+                key = "config.schema_mode";
+                owned.push(("value".to_string(), value.clone()));
+            }
+            Self::Locale { value } => {
+                key = "config.locale";
+                owned.push(("value".to_string(), value.clone()));
+                owned.push(("path".to_string(), format!("locale/{value}.yaml")));
+            }
+            Self::StoreEmpty { path } => {
+                key = "config.store_empty";
+                owned.push(("path".to_string(), path.display().to_string()));
+            }
+            Self::Store { path, detail } => {
+                key = "config.store";
+                owned.push(("path".to_string(), path.display().to_string()));
+                owned.push(("detail".to_string(), detail.clone()));
+            }
+            Self::BootstrapPasswordMissing => {
+                key = "config.bootstrap_password_missing";
+            }
+            Self::BootstrapPasswordAmbiguous => {
+                key = "config.bootstrap_password_ambiguous";
+            }
+            Self::DangerousSettingsNotAcknowledged { settings } => {
+                key = "config.dangerous";
+                owned.push(("settings".to_string(), settings.clone()));
+            }
+            Self::PlainHttpNotAcknowledged { address } => {
+                key = "config.plain_http";
+                owned.push(("address".to_string(), address.clone()));
+            }
+            Self::SchemaRead { path, source } => {
+                key = "config.schema_read";
+                owned.push(("path".to_string(), path.clone()));
+                owned.push(("detail".to_string(), source.to_string()));
+            }
+            Self::Schema { path, source } => {
+                key = "config.schema";
+                owned.push(("path".to_string(), path.clone()));
+                owned.push(("detail".to_string(), source.to_string()));
+            }
+            Self::Interval { value, source } => {
+                key = "config.interval";
+                owned.push(("value".to_string(), value.clone()));
+                owned.push(("detail".to_string(), source.to_string()));
+            }
+            Self::Parse { path, source } => {
+                key = "config.parse";
+                owned.push(("path".to_string(), path.display().to_string()));
+                owned.push(("detail".to_string(), source.to_string()));
+            }
+            Self::Read { path, source } => {
+                key = "config.parse";
+                owned.push(("path".to_string(), path.display().to_string()));
+                owned.push(("detail".to_string(), source.to_string()));
+            }
+            Self::Index(err) => {
+                key = "config.index";
+                owned.push(("detail".to_string(), err.to_string()));
+            }
+            Self::Password(err) => {
+                key = "config.password";
+                owned.push(("detail".to_string(), err.to_string()));
+            }
+            Self::Access(err) => {
+                key = "config.access";
+                owned.push(("detail".to_string(), err.to_string()));
+            }
+        }
+
+        let args: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let translated = crate::i18n::t(key, &args);
+
+        // `t` returns the key itself when the catalogue has no text for it. That is the one
+        // case where the translated line is useless, and the English message is the answer.
+        if translated == key {
+            return english;
+        }
+
+        // Otherwise the translated line carries everything the English one did — including the
+        // parser position or the file name, through `{detail}`. Two lines saying the same
+        // thing in two languages is noise, not help.
+        translated
+    }
+}
+
 /// The text is attached by [`load`], the only place that knows both the text and its origin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {

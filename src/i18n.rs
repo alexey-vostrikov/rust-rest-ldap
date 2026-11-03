@@ -308,6 +308,45 @@ pub fn from_env(env: &impl Fn(&str) -> Option<String>) -> (Locale, Source) {
 /// English instead would hide the mistake. When it came from `LANG`, a missing file is
 /// not an error — a host may well be set to a language this server does not ship, and
 /// falling back to English is the reasonable answer.
+/// Which language to speak, and where the answer came from.
+///
+/// The decision, separated from the reading it needs. `install_language` in `main` used to mix
+/// the two: it read the environment, opened the configuration file, probed the filesystem for a
+/// catalogue and installed the result in one function, so none of the ordering rules could be
+/// tested - and they have an order.
+///
+/// The rules, in force order:
+///
+/// 1. a configuration file that already loaded decides (the operator wrote `locale:` and meant it);
+/// 2. otherwise a `locale:` scanned out of the file text, before the file's own errors are
+///    reported - a complaint about the file should already be in the language the file asks for;
+/// 3. otherwise the environment;
+/// 4. otherwise English.
+///
+/// `candidate` is the catalogue file for a tag, or `None` when there is none to read: the caller
+/// owns the filesystem, the decision owns the order.
+pub fn resolve_language(
+    from_config: Option<(Locale, Source, Option<std::path::PathBuf>)>,
+    config_text: Option<&str>,
+    env: &impl Fn(&str) -> Option<String>,
+    candidate: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> (Locale, Source, Option<std::path::PathBuf>) {
+    if let Some(resolved) = from_config {
+        return resolved;
+    }
+
+    let (locale, source) = from_env(env);
+
+    let scanned = config_text.and_then(prescan_locale);
+    let (locale, source) = match scanned {
+        Some(locale) if !locale.is_english() => (locale, Source::Config),
+        _ => (locale, source),
+    };
+
+    let file = candidate(locale.as_str());
+    (locale, source, file)
+}
+
 pub fn catalog_for(
     locale: Locale,
     source: Source,
