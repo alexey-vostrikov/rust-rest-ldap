@@ -169,6 +169,19 @@ impl Backend {
     }
 
     /// The name this backend is configured under.
+    /// Whether an accepted change is in the store exactly as it was handed over.
+    ///
+    /// True for the redb store, which writes the entry as one key and reads it back unchanged.
+    /// False for the file backend (a fixed user/group document, rewritten whole), for REST (the
+    /// remote service decides what it keeps) and for null (nothing is kept).
+    ///
+    /// The reload path does not need this: it reads the store back, so it is right whatever the
+    /// store did. The incremental write path does - it patches memory with the entry it sent,
+    /// which is only honest when the store kept that entry as given.
+    pub fn keeps_entries_verbatim(&self) -> bool {
+        matches!(self, Backend::Redb(_))
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Backend::File(_) => "file",
