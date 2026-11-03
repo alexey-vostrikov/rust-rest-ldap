@@ -18,7 +18,6 @@ use crate::ldap::session::Session;
 use crate::ldap::{Action, codec};
 use crate::metrics::{Metrics, Operation};
 use crate::reload::Source;
-use crate::security::Security;
 
 /// What one connection did, for logging and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +168,7 @@ pub async fn serve_connection(
     stream: Stream,
     acceptor: Option<TlsAcceptor>,
     source: Arc<Source>,
-    security: Arc<Security>,
+    security: crate::security::Shared,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Hangup, codec::CodecError> {
     serve_connection_as(
@@ -189,7 +188,7 @@ pub async fn serve_connection_as(
     mut stream: Stream,
     acceptor: Option<TlsAcceptor>,
     source: Arc<Source>,
-    security: Arc<Security>,
+    security: crate::security::Shared,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     observers: Observers,
     peer: String,
@@ -231,13 +230,15 @@ pub async fn serve_connection_as(
         };
 
         // One snapshot per message: a reload or another client's write is visible
-        // immediately, while a single operation still sees one consistent directory.
+        // immediately, while a single operation still sees one consistent directory. The
+        // policy is taken the same way, so an operation cannot meet two sets of rules.
         let directory = source.directory().await;
+        let policy = security.current();
 
         let operation = operation_of(&message.protocol_op);
         let started = std::time::Instant::now();
 
-        match crate::ldap::handle(&mut session, &directory, &security, message) {
+        match crate::ldap::handle(&mut session, &directory, &policy, message) {
             Action::Reply(messages) => {
                 let returned = messages
                     .iter()
@@ -321,6 +322,25 @@ pub async fn serve_connection_as(
                     );
                 }
             }
+            Action::ConfigCommitted(committed) => {
+                let crate::ldap::ConfigCommitted {
+                    generation,
+                    document,
+                    response,
+                    message_id,
+                } = *committed;
+
+                let adopted = adopt_configuration(&security, &document);
+
+                // Rebuilt, never mutated: `response` carries the message id of the request.
+                let answer = crate::ldap::FailureResponse::Modify.message(
+                    message_id,
+                    rasn_ldap::ResultCode::Success,
+                    &adopted,
+                );
+                let _ = (generation, response);
+                codec::write_message(&mut stream, &answer).await?;
+            }
             Action::Silent => {}
             Action::StartTls(message_id) => {
                 if acceptor.is_none() {
@@ -382,7 +402,7 @@ pub async fn serve(
     acceptor: Option<TlsAcceptor>,
     ldaps: bool,
     source: Arc<Source>,
-    security: Arc<Security>,
+    security: crate::security::Shared,
     shutdown: tokio::sync::watch::Receiver<bool>,
     grace: std::time::Duration,
 ) -> Result<(), std::io::Error> {
@@ -400,6 +420,48 @@ pub async fn serve(
         Observers::default(),
     )
     .await
+}
+
+/// Adopts a committed configuration document, returning the diagnostic for the client.
+///
+/// Three things happen, in this order: the document is resolved (the handler already did that
+/// once, and a document that reached the store is a document that parsed - resolving again is
+/// what proves the two agree), the policy is swapped, and the answer says what took effect and
+/// what has to wait for a restart.
+///
+/// A failure here does not undo the commit: the generation is on disk, the running server keeps
+/// the policy it has, and the answer says so. Undoing a committed generation would mean the
+/// store and the history disagree about what happened.
+fn adopt_configuration(security: &crate::security::Shared, document: &str) -> String {
+    let config =
+        match crate::config::resolve(crate::config::Args::default(), Some(document), |name| {
+            std::env::var(name).ok()
+        }) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    crate::i18n::t("error.config_apply", &[("detail", &err.to_string())])
+                );
+                return crate::i18n::t(
+                    "config.committed_not_applied",
+                    &[("detail", &err.to_string())],
+                );
+            }
+        };
+
+    let applied = security.apply(&config);
+
+    // Two messages rather than one with a placeholder that has to be filled with "yes" or
+    // "no": the wording differs, and a translator should see both.
+    if applied.needs_restart.is_empty() {
+        crate::i18n::t("config.committed", &[])
+    } else {
+        crate::i18n::t(
+            "config.committed_needs_restart",
+            &[("settings", &applied.needs_restart.join(", "))],
+        )
+    }
 }
 
 /// What the server reports to: counters and the change journal.
@@ -439,7 +501,7 @@ pub async fn serve_with(
     listener: TcpListener,
     settings: Listener,
     source: Arc<Source>,
-    security: Arc<Security>,
+    security: crate::security::Shared,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     observers: Observers,
 ) -> Result<(), std::io::Error> {
@@ -564,6 +626,7 @@ pub async fn serve_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::Security;
     use rasn_ldap::{
         AuthenticationChoice, BindRequest, LdapDn, LdapMessage, ProtocolOp, ResultCode,
         UnbindRequest,
@@ -650,11 +713,11 @@ mod tests {
     /// They speak LDAP over a plain TCP socket on purpose - a TLS handshake is a
     /// different test - so the unencrypted bind has to be on, exactly as a lab server
     /// would have it in its configuration.
-    fn default_security() -> Arc<Security> {
-        Arc::new(Security {
+    fn default_security() -> Security {
+        Security {
             allow_unencrypted_bind: true,
             ..Security::default()
-        })
+        }
     }
 
     fn bind_message(message_id: u32, password: &[u8]) -> LdapMessage {
@@ -723,22 +786,27 @@ mod tests {
         }
     }
 
-    async fn start(acceptor: Option<TlsAcceptor>, ldaps: bool, security: Arc<Security>) -> Running {
+    async fn start(acceptor: Option<TlsAcceptor>, ldaps: bool, security: Security) -> Running {
         start_with_grace(acceptor, ldaps, security, std::time::Duration::from_secs(5)).await
     }
 
     async fn start_with_grace(
         acceptor: Option<TlsAcceptor>,
         ldaps: bool,
-        security: Arc<Security>,
+        security: Security,
         grace: std::time::Duration,
     ) -> Running {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (shutdown, rx) = tokio::sync::watch::channel(false);
         let source = test_source().await;
+        // The live handle carries the configuration the "process" started with. These tests do
+        // not change settings, so the defaults stand in for it.
+        let running = crate::config::resolve(crate::config::Args::default(), None, |_| None)
+            .expect("the default configuration resolves");
+        let live = crate::security::live(running, security);
         let task = tokio::spawn(async move {
-            let _ = serve(listener, acceptor, ldaps, source, security, rx, grace).await;
+            let _ = serve(listener, acceptor, ldaps, source, live, rx, grace).await;
         });
         let client = TcpStream::connect(addr).await.expect("connect");
         Running {
@@ -952,10 +1020,10 @@ mod tests {
 
     #[tokio::test]
     async fn plaintext_bind_is_refused_when_encryption_is_required() {
-        let security = Arc::new(Security {
+        let security = Security {
             allow_unencrypted_bind: false,
             ..Security::default()
-        });
+        };
         let mut running = start(None, false, security).await;
 
         write(running.client(), &bind_message(1, b"admin-secret")).await;
@@ -1038,10 +1106,10 @@ mod tests {
     #[tokio::test]
     async fn starttls_then_bind_is_allowed_when_plaintext_is_refused() {
         let (acceptor, anchor) = test_acceptor();
-        let security = Arc::new(Security {
+        let security = Security {
             allow_unencrypted_bind: false,
             ..Security::default()
-        });
+        };
         let mut running = start(Some(acceptor), false, security).await;
 
         write(running.client(), &starttls_message(1)).await;

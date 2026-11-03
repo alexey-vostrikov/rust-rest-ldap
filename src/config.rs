@@ -19,7 +19,13 @@ use crate::password::PasswordPolicy;
 use crate::password::policy::{PasswordConfig, PolicyError};
 use crate::schema::{Mode as SchemaMode, Schema, SchemaError};
 
-pub const DEFAULT_BACKEND: &str = "rest";
+/// The backend a server runs when nothing says otherwise.
+///
+/// `null` and not `rest`: the REST backend gorestldap defaulted to is not in this build, and a
+/// default that names a backend the binary does not have is a server that cannot start at all.
+/// An empty read-only directory is a working server - the banner says "backend 'null'" and how
+/// many users it holds - so it is the honest default for "I just want to look".
+pub const DEFAULT_BACKEND: &str = "null";
 pub const DEFAULT_BASE_DN: &str = "dc=example,dc=com";
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:389";
 pub const DEFAULT_UPDATE_INTERVAL: &str = "300s";
@@ -182,6 +188,11 @@ pub enum ConfigError {
     },
     #[error("use_tls is enabled, but server_cert and server_key are not both set")]
     MissingTlsMaterial,
+    #[error("unknown backend '{name}', known backends: {}", known.join(", "))]
+    UnknownBackend {
+        name: String,
+        known: Vec<&'static str>,
+    },
     #[error(transparent)]
     Password(#[from] PolicyError),
     #[error(transparent)]
@@ -261,6 +272,13 @@ struct FileConfig {
         alias = "allow_dangerous_settings"
     )]
     allow_dangerous_settings: Danger,
+    /// How often the directory is re-read from the backend, when the file says.
+    ///
+    /// Accepted from the file as well as from `-i` and the environment: a setting that a
+    /// configuration document publishes over `cn=config` has to be a setting the document can
+    /// actually carry, or the subtree would offer a knob that does nothing.
+    #[serde(default, alias = "interval")]
+    update_interval: Option<String>,
     #[serde(default)]
     log_timestamp: bool,
     #[serde(default)]
@@ -460,8 +478,12 @@ pub fn resolve(
         },
     };
 
-    let interval_text = pick(args.interval, env(ENV_UPDATE_INTERVAL), None)
-        .unwrap_or_else(|| DEFAULT_UPDATE_INTERVAL.to_string());
+    let interval_text = pick(
+        args.interval,
+        env(ENV_UPDATE_INTERVAL),
+        file.update_interval,
+    )
+    .unwrap_or_else(|| DEFAULT_UPDATE_INTERVAL.to_string());
     let update_interval =
         humantime::parse_duration(&interval_text).map_err(|source| ConfigError::Interval {
             value: interval_text.clone(),
@@ -481,9 +503,22 @@ pub fn resolve(
         .trim()
         .to_lowercase();
 
+    let backend = pick(args.backend, env(ENV_BACKEND), file.backend)
+        .unwrap_or_else(|| DEFAULT_BACKEND.to_string());
+
+    // Known before the server opens a socket, not after: a configuration that names a backend
+    // this build does not have cannot start, and a document committed through `cn=config` has
+    // to be a configuration the server could start from. Without this the check happened in
+    // `Backend::from_config`, which is later than the promise.
+    if !crate::backend::KNOWN_BACKENDS.contains(&backend.as_str()) {
+        return Err(ConfigError::UnknownBackend {
+            name: backend,
+            known: crate::backend::KNOWN_BACKENDS.to_vec(),
+        });
+    }
+
     let config = Config {
-        backend: pick(args.backend, env(ENV_BACKEND), file.backend)
-            .unwrap_or_else(|| DEFAULT_BACKEND.to_string()),
+        backend,
         base_dn: super::dn::normalize(
             &pick(args.base_dn, env(ENV_BASE_DN), file.base_dn)
                 .unwrap_or_else(|| DEFAULT_BASE_DN.to_string()),
@@ -661,7 +696,10 @@ mod tests {
     fn defaults_apply_without_any_source() {
         let cfg = resolve(Args::default(), None, no_env).expect("defaults");
 
-        assert_eq!(cfg.backend, "rest");
+        assert_eq!(
+            cfg.backend, "null",
+            "the default has to be a backend this build has"
+        );
         assert_eq!(cfg.base_dn, "dc=example,dc=com");
         assert_eq!(cfg.listen_addr, "0.0.0.0:389");
         assert_eq!(cfg.update_interval, Duration::from_secs(300));
@@ -738,7 +776,7 @@ backends:
 
         let cfg = resolve(Args::default(), None, env).expect("env config");
 
-        assert_eq!(cfg.backend, "rest");
+        assert_eq!(cfg.backend, "null");
     }
 
     #[test]
@@ -875,6 +913,24 @@ bootstrap:
     }
 
     #[test]
+    fn the_file_sets_the_update_interval_too() {
+        // It used to be accepted only from `-i` and the environment, and silently ignored in the
+        // file - which `cn=config` then published as a setting that changed nothing.
+        let cfg =
+            resolve(Args::default(), Some("update_interval: 45s\n"), |_| None).expect("config");
+        assert_eq!(cfg.update_interval, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn the_environment_still_wins_over_the_file_for_the_interval() {
+        let cfg = resolve(Args::default(), Some("update_interval: 45s\n"), |name| {
+            (name == ENV_UPDATE_INTERVAL).then(|| "90s".to_string())
+        })
+        .expect("config");
+        assert_eq!(cfg.update_interval, Duration::from_secs(90));
+    }
+
+    #[test]
     fn invalid_interval_is_rejected_with_the_offending_value() {
         let args = Args {
             interval: Some("300 seconds later".to_string()),
@@ -922,7 +978,11 @@ server_cert: server.crt
         assert_eq!(cfg.groups_ou_name, "groups");
         assert_eq!(cfg.http_listen_addr.as_deref(), Some("localhost:8080"));
         assert!(cfg.backends.contains_key("file"));
-        assert!(cfg.backends.contains_key("rest"));
+        assert!(cfg.backends.contains_key("redb"));
+        assert!(
+            !cfg.backends.contains_key("rest"),
+            "the shipped example must not offer the backend this build does not have"
+        );
         assert!(!cfg.use_tls);
     }
 

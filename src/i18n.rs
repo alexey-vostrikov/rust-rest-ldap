@@ -433,6 +433,26 @@ const ENGLISH: &[(&str, &str)] = &[
         "'{path}' is not a directory; the generation store is a directory, and a plain file is a configuration",
     ),
     ("error.store", "configuration store: {detail}"),
+    (
+        "config.committed",
+        "committed; the running server adopts the new rules now",
+    ),
+    (
+        "config.committed_needs_restart",
+        "committed; the running server adopts the new rules now, but these settings take effect only after a restart: {settings}",
+    ),
+    (
+        "config.committed_not_applied",
+        "committed, but the running server could not adopt it and keeps the rules it has: {detail}",
+    ),
+    (
+        "config.unknown_backend",
+        "unknown backend '{name}'; known backends: {known}",
+    ),
+    (
+        "error.config_apply",
+        "adopting the committed configuration failed: {detail}",
+    ),
     ("store.done", "committed as {what}"),
     ("store.collected", "collected generations {numbers}"),
     (

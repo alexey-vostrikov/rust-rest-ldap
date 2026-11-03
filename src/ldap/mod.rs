@@ -50,6 +50,12 @@ pub enum Action {
         messages: Vec<LdapMessage>,
         changes: Vec<EntryChange>,
     },
+    /// A change to `cn=config` was committed.
+    ///
+    /// The protocol layer decided what the change means and wrote the document; the server
+    /// decides whether the running process can adopt it, because that needs the configuration
+    /// it started with and the policy handle - neither of which a handler holds.
+    ConfigCommitted(Box<ConfigCommitted>),
     /// Close the connection (unbind, protocol violation).
     Close,
 }
@@ -129,15 +135,23 @@ fn config_change(
     };
 
     match config_entry::change(document, session, request) {
-        Ok(committed) => Action::Reply(vec![response.message(
+        Ok(committed) if committed.keys.is_empty() => Action::Reply(vec![response.message(
             message_id,
             ResultCode::Success,
             &format!(
-                "committed as generation {}; the running server keeps the settings it started \
-                 with until it is restarted",
+                "nothing to change: every setting already has that value, and generation {} \
+                 stays in force",
                 committed.generation
             ),
         )]),
+        Ok(committed) => Action::ConfigCommitted(Box::new(ConfigCommitted {
+            generation: committed.generation,
+            document: committed.document,
+            // `success` now and the diagnostic filled in by the server: whether the settings
+            // took effect is the server's answer, not the handler's guess.
+            response: response.message(message_id, ResultCode::Success, ""),
+            message_id,
+        })),
         Err(refusal) => Action::Reply(vec![response.message(
             message_id,
             refusal.code,
@@ -164,6 +178,18 @@ fn config_write_target(op: &ProtocolOp) -> Option<(FailureResponse, String)> {
         }
         _ => None,
     }
+}
+
+/// A committed configuration change, waiting for the server to adopt it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigCommitted {
+    /// The generation the changed document was committed as.
+    pub generation: u64,
+    /// The document in force, as committed.
+    pub document: String,
+    /// The response to send, once the server has decided what it could adopt.
+    pub response: LdapMessage,
+    pub message_id: rasn_ldap::MessageId,
 }
 
 /// Response to send when a write does not reach the store.
