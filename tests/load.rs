@@ -19,7 +19,14 @@
 //! figure belongs.
 //!
 //! Run with `--release -- --nocapture` to see the numbers; in a debug build they are three to
-//! ten times larger and mean nothing.
+//! ten times larger and mean nothing. For that reason the file compiles to nothing without
+//! `--release`: a measurement that is known to be meaningless still costs minutes of every
+//! `cargo test`, and a suite that is slow for no reason is a suite people stop running.
+//!
+//! What is lost: the assertions below are not checked by a debug run. They are checked by
+//! `cargo test --release --test load`, which is what the nightly job runs.
+
+#![cfg(not(debug_assertions))]
 
 use std::time::{Duration, Instant};
 
