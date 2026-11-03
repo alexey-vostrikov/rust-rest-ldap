@@ -581,7 +581,9 @@ async fn main() {
             grace: std::time::Duration::from_secs(10),
         },
         Arc::clone(&source),
-        Arc::new(security),
+        // The live policy remembers the configuration this process started with: that is
+        // what lets a later change say which of its settings still wait for a restart.
+        rust_rest_ldap::security::live(config.clone(), security),
         shutdown_rx,
         observers,
     ));
@@ -894,6 +896,11 @@ fn config_message(err: &config::ConfigError) -> String {
 
     match err {
         config::ConfigError::MissingTlsMaterial => key = "config.tls_material",
+        config::ConfigError::UnknownBackend { name, known } => {
+            key = "config.unknown_backend";
+            owned.push(("name".to_string(), name.clone()));
+            owned.push(("known".to_string(), known.join(", ")));
+        }
         config::ConfigError::SchemaMode(value) => {
             key = "config.schema_mode";
             owned.push(("value".to_string(), value.clone()));

@@ -6,7 +6,6 @@
 //! silence, a connection that dies in the middle of a result, and an answer larger than the
 //! client is willing to hold.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use rasn::types::OctetString;
@@ -20,6 +19,14 @@ use rust_rest_ldap::directory::Directory;
 use rust_rest_ldap::model::{Attribute, Attributes, Entry};
 use rust_rest_ldap::reload::Source;
 use rust_rest_ldap::security::Security;
+
+/// The live handle the server takes, starting from `security`.
+fn live_security(security: Security) -> rust_rest_ldap::security::Shared {
+    let running =
+        rust_rest_ldap::config::resolve(rust_rest_ldap::config::Args::default(), None, |_| None)
+            .expect("the default configuration resolves");
+    rust_rest_ldap::security::live(running, security)
+}
 
 const BASE: &str = "dc=example,dc=com";
 const ALICE_DN: &str = "cn=alice,ou=users,dc=example,dc=com";
@@ -111,7 +118,7 @@ async fn server() -> (String, tokio::task::JoinHandle<()>) {
             None,
             false,
             source,
-            Arc::new(security),
+            live_security(security),
             shutdown,
             Duration::from_secs(2),
         )
@@ -593,7 +600,7 @@ async fn tls_server(ldaps: bool) -> (String, std::path::PathBuf, tokio::task::Jo
             // `ldaps` decides whether the first byte is a TLS record or an LDAP message.
             ldaps,
             source,
-            Arc::new(security),
+            live_security(security),
             tokio::sync::watch::channel(false).1,
             Duration::from_secs(2),
         )

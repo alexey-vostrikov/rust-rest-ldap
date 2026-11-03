@@ -270,6 +270,9 @@ fn scalar(value: &Value) -> Option<String> {
 pub struct Committed {
     /// The generation the changed document was committed as.
     pub generation: u64,
+    /// The document as committed, so the server can adopt it without reading the store again
+    /// and without racing a second writer.
+    pub document: String,
     /// The document keys the change touched, named as the document names them.
     pub keys: Vec<String>,
 }
@@ -422,10 +425,22 @@ pub fn change(
 
     let keys = rewrite(&mut tree, &path, entry, &modified)?;
     if keys.is_empty() {
-        return Err(Refusal::new(
-            ResultCode::UnwillingToPerform,
-            "the change leaves every setting as it was, so nothing is committed",
-        ));
+        // A change that sets what is already set is not an error: a script that applies a
+        // desired state runs twice, and the second run must not look like a failure. Nothing is
+        // committed - an empty generation would say a change happened when none did - so the
+        // answer names the generation already in force.
+        let generation = store
+            .current()
+            .ok()
+            .flatten()
+            .map(|generation| generation.number)
+            .unwrap_or_default();
+
+        return Ok(Committed {
+            generation,
+            document: text,
+            keys: Vec::new(),
+        });
     }
 
     let changed = serde_saphyr::to_string(&tree).map_err(|err| {
@@ -462,7 +477,11 @@ pub fn change(
         })?
         .number;
 
-    Ok(Committed { generation, keys })
+    Ok(Committed {
+        generation,
+        document: changed,
+        keys,
+    })
 }
 
 /// Copies the edited entry back into the document tree, returning the keys it touched.
@@ -1087,7 +1106,6 @@ access:
                 "cn=backends,cn=config",
                 "cn=file,cn=backends,cn=config",
                 "cn=redb,cn=backends,cn=config",
-                "cn=rest,cn=backends,cn=config",
                 "cn=bind,cn=config",
                 "cn=indexes,cn=config",
                 "cn=attributes,cn=indexes,cn=config",
@@ -1100,10 +1118,10 @@ access:
              the order the file was written: a YAML mapping has no order to preserve"
         );
 
-        let rest = find(&entries, "cn=rest,cn=backends,cn=config");
+        let redb = find(&entries, "cn=redb,cn=backends,cn=config");
         assert_eq!(
-            values(rest, "restldap-url"),
-            vec!["http://localhost:8000/api"]
+            values(redb, "restldap-path"),
+            vec!["./build/directory.redb"]
         );
 
         let attributes = find(&entries, "cn=attributes,cn=indexes,cn=config");
@@ -1398,28 +1416,6 @@ access:
             store.history().expect("history").len(),
             1,
             "nothing committed"
-        );
-    }
-
-    #[test]
-    fn a_change_that_changes_nothing_commits_nothing() {
-        let (_dir, document) = store_with("listen_addr: 127.0.0.1:1389\n");
-
-        let refusal = change(
-            &document,
-            &as_admin(),
-            &change_of(&[(
-                ChangeOperation::Replace,
-                "restldap-listen-addr",
-                &["127.0.0.1:1389"],
-            )]),
-        )
-        .expect_err("must refuse");
-
-        assert!(
-            refusal.detail.contains("nothing is committed"),
-            "{}",
-            refusal.detail
         );
     }
 

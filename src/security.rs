@@ -32,6 +32,137 @@ pub fn current_schema(shared: &SharedSchema) -> Arc<Schema> {
     }
 }
 
+/// The policy of a running server: what is in force, and what it started with.
+///
+/// The inner `Arc` is swapped, not mutated, so a connection that read it before the swap keeps
+/// one consistent policy for the length of its operation. The same shape as [`SharedSchema`],
+/// and for the same reason: a `modify` of `cn=config` has to reach every connection at once,
+/// without a window in which two connections enforce different rules.
+///
+/// The starting configuration is kept because it is the only thing that can say which settings
+/// a `modify` changed that this process cannot adopt. Comparing the new document with the one in
+/// force is not enough: after two changes both documents say `listen_addr: <new>`, and nothing
+/// remembers that the socket is still bound to the old address.
+pub struct Live {
+    running: Config,
+    current: std::sync::RwLock<Arc<Security>>,
+}
+
+/// The handles the server passes around: one clone per connection.
+pub type Shared = Arc<Live>;
+
+/// A live policy for a server that started with `running`.
+pub fn live(running: Config, security: Security) -> Shared {
+    Arc::new(Live {
+        running,
+        current: std::sync::RwLock::new(Arc::new(security)),
+    })
+}
+
+impl Live {
+    /// The policy in force, as it stands right now.
+    ///
+    /// A poisoned lock is not a reason to fail a search: the value is replaced wholesale and
+    /// never half-written, so what is inside is still a policy somebody finished building.
+    pub fn current(&self) -> Arc<Security> {
+        match self.current.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// The configuration the process started with.
+    pub fn running(&self) -> &Config {
+        &self.running
+    }
+
+    /// Adopts `config` as the policy in force, keeping the schema handle.
+    ///
+    /// The schema is not taken from the configuration: a schema reload through the `Source` is
+    /// the only thing that replaces it, and building a new handle here would cut a running
+    /// server off from that reload - the write path would then enforce a schema the server had
+    /// already stopped publishing.
+    pub fn apply(&self, config: &Config) -> Applied {
+        let before = self.current();
+        let schema = Arc::clone(&before.schema);
+
+        let after = Security::from_config(config).with_schema(schema);
+        let policy_changed = *before != after;
+        let needs_restart = needs_restart(&self.running, config);
+
+        // Applied even when something else needs a restart: the policy has no socket and no
+        // certificate, so a change to `acl` next to a change to `listen_addr` takes effect now
+        // rather than being held back by the neighbour.
+        if policy_changed {
+            let mut guard = match self.current.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *guard = Arc::new(after);
+        }
+
+        Applied {
+            changed: policy_changed || !needs_restart.is_empty(),
+            needs_restart,
+            policy_changed,
+        }
+    }
+}
+
+/// What replacing the policy did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Applied {
+    /// True when the document differs from what is in force in any way this server cares about.
+    pub changed: bool,
+    /// Settings the document changed that this process cannot adopt. Empty when a restart
+    /// would change nothing.
+    pub needs_restart: Vec<&'static str>,
+    /// True when the change made the policy say something different from what it said before:
+    /// the rules a client meets are now different.
+    pub policy_changed: bool,
+}
+
+/// The settings a running server cannot adopt, named.
+///
+/// A list rather than a bool: the answer to the operator says which of the settings they just
+/// changed is waiting for a restart, and a bare "restart required" leaves them checking all of
+/// them. The order is fixed so the message reads the same way twice.
+///
+/// What is here is here for one of two reasons: it is bound to a socket that is already
+/// listening (the addresses, the certificates), or it decides the shape of the directory and
+/// therefore what the entries loaded at startup mean (`base_dn`, the two OU names, the backend).
+pub fn needs_restart(before: &Config, after: &Config) -> Vec<&'static str> {
+    let mut waiting = Vec::new();
+
+    if before.listen_addr != after.listen_addr {
+        waiting.push("listen_addr");
+    }
+    if before.use_tls != after.use_tls
+        || before.server_cert != after.server_cert
+        || before.server_key != after.server_key
+    {
+        waiting.push("tls");
+    }
+    if before.http_listen_addr != after.http_listen_addr {
+        waiting.push("http_listen_addr");
+    }
+    if before.backend != after.backend || before.backends != after.backends {
+        waiting.push("backend");
+    }
+    if before.base_dn != after.base_dn {
+        waiting.push("base_dn");
+    }
+    if before.users_ou_name != after.users_ou_name || before.groups_ou_name != after.groups_ou_name
+    {
+        waiting.push("organizational units");
+    }
+    if before.update_interval != after.update_interval {
+        waiting.push("update_interval");
+    }
+
+    waiting
+}
+
 /// Policy bundle passed to the handlers.
 ///
 /// One value instead of a growing parameter list: every new policy knob lands
@@ -198,5 +329,148 @@ access:
             crate::password::StoreScheme::Pbkdf2Sha512
         );
         assert_eq!(security.acl.rules().len(), 1);
+    }
+    /// A configuration built from a document, so the test says what it means.
+    fn config(text: &str) -> Config {
+        crate::config::resolve(crate::config::Args::default(), Some(text), |_| None)
+            .expect("the document must resolve")
+    }
+
+    fn live_from(text: &str) -> Shared {
+        let config = config(text);
+        let security = Security::from_config(&config);
+        live(config, security)
+    }
+
+    #[test]
+    fn a_change_to_the_rules_is_adopted_without_a_restart() {
+        let shared = live_from("respect_control_criticality: true\n");
+
+        let applied = shared.apply(&config("respect_control_criticality: false\n"));
+
+        assert!(applied.policy_changed, "the rules changed");
+        assert!(
+            applied.needs_restart.is_empty(),
+            "and nothing about it needs a restart: {:?}",
+            applied.needs_restart
+        );
+        assert!(
+            !shared.current().respect_control_criticality,
+            "adopted at once"
+        );
+    }
+
+    #[test]
+    fn an_access_rule_takes_effect_at_once() {
+        // A document that names rules replaces the defaults rather than adding to them: the
+        // rules are what the operator wrote, and a default left behind could grant something
+        // the new document does not.
+        let shared = live_from("listen_addr: 127.0.0.1:1389\n");
+        assert_eq!(shared.current().acl.rules().len(), 3, "the defaults");
+
+        let applied = shared.apply(&config(
+            "listen_addr: 127.0.0.1:1389\naccess:\n  - subject: anonymous\n    attributes: ['*']\n    rights: [read]\n",
+        ));
+
+        assert!(applied.policy_changed);
+        assert_eq!(
+            shared.current().acl.rules().len(),
+            1,
+            "the one rule the document names, and not the defaults"
+        );
+    }
+
+    #[test]
+    fn a_setting_bound_to_a_socket_waits_for_a_restart_and_is_named() {
+        let shared = live_from("listen_addr: 127.0.0.1:1389\n");
+
+        let applied = shared.apply(&config("listen_addr: 0.0.0.0:389\n"));
+
+        assert_eq!(applied.needs_restart, vec!["listen_addr"]);
+        assert!(applied.changed, "the document did change something");
+        assert!(
+            !applied.policy_changed,
+            "but no rule a client meets has changed"
+        );
+    }
+
+    #[test]
+    fn a_change_to_both_is_adopted_where_it_can_be() {
+        // The change that matters: a policy setting next to a socket setting must not be held
+        // back by its neighbour.
+        let shared = live_from("listen_addr: 127.0.0.1:1389\nrespect_control_criticality: true\n");
+
+        let applied = shared.apply(&config(
+            "listen_addr: 0.0.0.0:389\nrespect_control_criticality: false\n",
+        ));
+
+        assert_eq!(applied.needs_restart, vec!["listen_addr"]);
+        assert!(applied.policy_changed);
+        assert!(!shared.current().respect_control_criticality, "taken now");
+    }
+
+    #[test]
+    fn every_setting_that_needs_a_restart_is_named_in_one_list() {
+        let acknowledgement = "AllowDangerousSettings: \"Yes I know this is bad idea\"\n";
+        let base = format!(
+            "{acknowledgement}listen_addr: 127.0.0.1:1389\nhttp_listen_addr: 127.0.0.1:8080\n\
+             AllowPlainHttpRest: \"Yes I know this is bad idea\"\n"
+        );
+        let changed = format!(
+            "{acknowledgement}listen_addr: 0.0.0.0:389\nhttp_listen_addr: 0.0.0.0:8080\n\
+             AllowPlainHttpRest: \"Yes I know this is bad idea\"\nuse_tls: true\n\
+             server_cert: /tmp/c.pem\nserver_key: /tmp/k.pem\nbase_dn: dc=other,dc=com\n\
+             users_ou_name: people\ngroups_ou_name: teams\nupdate_interval: 10m\n"
+        );
+
+        let waiting = needs_restart(&config(&base), &config(&changed));
+
+        assert_eq!(
+            waiting,
+            vec![
+                "listen_addr",
+                "tls",
+                "http_listen_addr",
+                "base_dn",
+                "organizational units",
+                "update_interval"
+            ],
+            "the list names every setting, in a fixed order"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_document_reports_nothing_at_all() {
+        let shared = live_from("listen_addr: 127.0.0.1:1389\nrespect_control_criticality: true\n");
+
+        let applied = shared.apply(&config(
+            "listen_addr: 127.0.0.1:1389\nrespect_control_criticality: true\n",
+        ));
+
+        assert_eq!(
+            applied,
+            Applied {
+                changed: false,
+                needs_restart: Vec::new(),
+                policy_changed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn the_schema_handle_survives_a_policy_change() {
+        // A new handle here would cut the running server off from a schema reload, and the
+        // write path would then enforce a schema the server had stopped publishing.
+        let shared = live_from("listen_addr: 127.0.0.1:1389\n");
+        let schema = Arc::clone(&shared.current().schema);
+
+        shared.apply(&config(
+            "listen_addr: 127.0.0.1:1389\nrespect_control_criticality: false\n",
+        ));
+
+        assert!(
+            Arc::ptr_eq(&schema, &shared.current().schema),
+            "the same handle, not a new one"
+        );
     }
 }
