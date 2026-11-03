@@ -22,7 +22,8 @@ use rasn_ldap::{
     ChangeOperation, LdapDn, LdapMessage, ModifyRequest, ModifyRequestChanges, PartialAttribute,
     ProtocolOp, ResultCode,
 };
-use rust_rest_ldap::client::{Client, Options, Trust};
+use rust_rest_ldap::cli_connection::Connection;
+use rust_rest_ldap::client::{Client, Options};
 use rust_rest_ldap::ldif_read::{self, Change, ChangeRecord, ModOp, Record};
 use rust_rest_ldap::model::Entry;
 
@@ -93,6 +94,23 @@ struct Cli {
     help: Option<bool>,
 }
 
+impl Cli {
+    /// This tool's flags as the shared connection settings.
+    fn connection(&self) -> Connection {
+        Connection {
+            url: self.url.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            bind_dn: self.bind_dn.clone(),
+            password: self.password.clone(),
+            ask_password: self.ask_password,
+            starttls: self.starttls,
+            insecure: self.insecure,
+            ca_cert: self.ca_cert.clone(),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -141,13 +159,14 @@ async fn run(cli: &Cli) -> ExitCode {
         return ExitCode::from(0);
     }
 
+    let connection = cli.connection();
     let options = Options {
         timeout: std::time::Duration::from_secs(cli.timeout),
-        trust: trust_of(cli),
+        trust: connection.trust(),
         ..Options::default()
     };
 
-    let client = match Client::connect(&url_of(cli), options).await {
+    let client = match Client::connect(&connection.url(), options).await {
         Ok(client) => client,
         Err(err) => {
             eprintln!("{}: {err}", program_name());
@@ -155,7 +174,7 @@ async fn run(cli: &Cli) -> ExitCode {
         }
     };
 
-    if let Err(err) = authenticate(cli, &client).await {
+    if let Err(err) = connection.authenticate(&client).await {
         eprintln!("{}: {err}", program_name());
         return ExitCode::FAILURE;
     }
@@ -437,59 +456,11 @@ fn read_input(cli: &Cli) -> Result<String, String> {
     }
 }
 
-async fn authenticate(cli: &Cli, client: &Client) -> Result<(), rust_rest_ldap::client::Error> {
-    if !cli.bind_dn.is_empty() || cli.password.is_some() || cli.ask_password {
-        let password = match &cli.password {
-            Some(password) => password.clone(),
-            None if cli.ask_password => ask_password()?,
-            None => String::new(),
-        };
-        client.bind(&cli.bind_dn, &password).await?;
-    }
-
-    if cli.starttls > 0 {
-        client.starttls().await?;
-    }
-
-    Ok(())
-}
-
-fn ask_password() -> Result<String, rust_rest_ldap::client::Error> {
-    eprint!("Enter LDAP Password: ");
-    let mut password = String::new();
-    std::io::stdin()
-        .read_line(&mut password)
-        .map_err(|err| rust_rest_ldap::client::Error::Io(err.to_string()))?;
-
-    Ok(password.trim_end_matches(['\r', '\n']).to_string())
-}
-
-fn url_of(cli: &Cli) -> String {
-    if let Some(url) = &cli.url {
-        return url.clone();
-    }
-
-    let host = cli.host.clone().unwrap_or_else(|| "localhost".to_string());
-    match cli.port {
-        Some(port) => format!("ldap://{host}:{port}"),
-        None => format!("ldap://{host}"),
-    }
-}
-
-fn trust_of(cli: &Cli) -> Trust {
-    if cli.insecure {
-        return Trust::Insecure;
-    }
-    match &cli.ca_cert {
-        Some(path) => Trust::File(path.clone()),
-        None => Trust::WebPki,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use rust_rest_ldap::client::Trust;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("ldapmodify").chain(args.iter().copied()))
@@ -510,12 +481,15 @@ mod tests {
     }
 
     #[test]
-    fn a_url_is_built_from_host_and_port_when_the_url_is_absent() {
-        assert_eq!(
-            url_of(&parse(&["-h", "ldap.example.com", "-p", "1389"])),
-            "ldap://ldap.example.com:1389"
-        );
-        assert_eq!(url_of(&parse(&[])), "ldap://localhost");
+    fn the_connection_settings_come_from_the_flags() {
+        // The building of a URL and the choice of trust are tested once, in `cli_connection`;
+        // what is this tool's own business is that its flags reach them.
+        let cli = parse(&["-h", "ldap.example.com", "-p", "1389", "--insecure", "-ZZ"]);
+        let connection = cli.connection();
+
+        assert_eq!(connection.url(), "ldap://ldap.example.com:1389");
+        assert_eq!(connection.trust(), Trust::Insecure);
+        assert_eq!(connection.starttls, 2);
     }
 
     #[test]
@@ -532,15 +506,5 @@ mod tests {
         assert_eq!(stem("/usr/local/bin/ldapadd"), "ldapadd");
         assert_eq!(stem("/usr/local/bin/ldapmodify"), "ldapmodify");
         assert_eq!(stem("C:/bin/ldapadd.exe"), "ldapadd");
-    }
-
-    #[test]
-    fn the_trust_policy_follows_the_flags() {
-        assert!(matches!(trust_of(&parse(&[])), Trust::WebPki));
-        assert!(matches!(trust_of(&parse(&["--insecure"])), Trust::Insecure));
-        assert!(matches!(
-            trust_of(&parse(&["--cacert", "/etc/ca.pem"])),
-            Trust::File(_)
-        ));
     }
 }

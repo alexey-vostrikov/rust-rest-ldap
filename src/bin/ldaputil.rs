@@ -24,7 +24,8 @@ use rasn_ldap::{
     LdapMessage, LdapOid, ProtocolOp, RelativeLdapDn, ResultCode, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::client::{Client, Options, Trust};
+use rust_rest_ldap::cli_connection::Connection;
+use rust_rest_ldap::client::{Client, Options};
 use rust_rest_ldap::ldap::{extop, filter_parse};
 
 #[derive(Debug, Parser)]
@@ -155,6 +156,23 @@ impl Tool {
     }
 }
 
+impl Cli {
+    /// This tool's flags as the shared connection settings.
+    fn connection(&self) -> Connection {
+        Connection {
+            url: self.url.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            bind_dn: self.bind_dn.clone(),
+            password: self.password.clone(),
+            ask_password: self.ask_password,
+            starttls: self.starttls,
+            insecure: self.insecure,
+            ca_cert: self.ca_cert.clone(),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -185,18 +203,19 @@ fn main() -> ExitCode {
 }
 
 async fn run(tool: Tool, cli: &Cli) -> ExitCode {
+    let connection = cli.connection();
     let options = Options {
         timeout: std::time::Duration::from_secs(cli.timeout),
-        trust: trust_of(cli),
+        trust: connection.trust(),
         ..Options::default()
     };
 
-    let client = match Client::connect(&url_of(cli), options).await {
+    let client = match Client::connect(&connection.url(), options).await {
         Ok(client) => client,
         Err(err) => return failure(tool, &err),
     };
 
-    if let Err(err) = authenticate(cli, &client).await {
+    if let Err(err) = connection.authenticate(&client).await {
         return failure(tool, &err);
     }
 
@@ -707,54 +726,6 @@ fn code_of(err: &rust_rest_ldap::client::Error) -> ResultCode {
 fn failure(tool: Tool, err: &rust_rest_ldap::client::Error) -> ExitCode {
     eprintln!("{}: {err}", tool.name());
     ExitCode::from(code_of(err) as u8)
-}
-
-async fn authenticate(cli: &Cli, client: &Client) -> Result<(), rust_rest_ldap::client::Error> {
-    if !cli.bind_dn.is_empty() || cli.password.is_some() || cli.ask_password {
-        let password = match &cli.password {
-            Some(password) => password.clone(),
-            None if cli.ask_password => ask_password()?,
-            None => String::new(),
-        };
-        client.bind(&cli.bind_dn, &password).await?;
-    }
-
-    if cli.starttls > 0 {
-        client.starttls().await?;
-    }
-
-    Ok(())
-}
-
-fn ask_password() -> Result<String, rust_rest_ldap::client::Error> {
-    eprint!("Enter LDAP Password: ");
-    let mut password = String::new();
-    std::io::stdin()
-        .read_line(&mut password)
-        .map_err(|err| rust_rest_ldap::client::Error::Io(err.to_string()))?;
-    Ok(password.trim_end_matches(['\r', '\n']).to_string())
-}
-
-fn url_of(cli: &Cli) -> String {
-    if let Some(url) = &cli.url {
-        return url.clone();
-    }
-
-    let host = cli.host.clone().unwrap_or_else(|| "localhost".to_string());
-    match cli.port {
-        Some(port) => format!("ldap://{host}:{port}"),
-        None => format!("ldap://{host}"),
-    }
-}
-
-fn trust_of(cli: &Cli) -> Trust {
-    if cli.insecure {
-        return Trust::Insecure;
-    }
-    match &cli.ca_cert {
-        Some(path) => Trust::File(path.clone()),
-        None => Trust::WebPki,
-    }
 }
 
 #[cfg(test)]
