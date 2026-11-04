@@ -892,6 +892,7 @@ mod tests {
             schema: crate::schema::Schema::core(),
             schema_mode: crate::schema::Mode::Off,
             schema_files: Vec::new(),
+            schema_definitions: Vec::new(),
             indexes: Default::default(),
             referrals: Default::default(),
             server_id: 2,

@@ -57,6 +57,21 @@ pub const BASE_DN: &str = "cn=config";
 /// Prefix of every configuration attribute in this subtree.
 pub const PREFIX: &str = "restldap-";
 
+/// Settings a change may create when the document does not carry the key yet.
+///
+/// A multi-valued setting has no empty form on the wire: an attribute without values is not an
+/// attribute, so an empty list is not published and a client cannot address it until the first
+/// value exists. Without this list the first schema definition could only be added by editing
+/// the document - which is precisely what a writable `cn=schema` exists to avoid.
+///
+/// By name, not by rule. The general form "invent the key from the attribute name" is refused
+/// two hundred lines down because `a-b` and `a_b` publish as the same attribute, so the name
+/// cannot say which key was meant; each entry here is declared, so a mistyped attribute cannot
+/// create a setting that the configuration would then ignore.
+///
+/// The path is the document path a section sits at, joined by commas, as [`path_of`] builds it.
+pub const CREATABLE: [(&str, &str); 1] = [("schema", "definitions")];
+
 /// Where the document came from, as an operational attribute of the base entry.
 pub const ORIGIN_ATTRIBUTE: &str = "restldap-origin";
 
@@ -502,11 +517,26 @@ fn rewrite(
     // value is a section is published as a *child entry*, not as an attribute of this one, so
     // looking it up here would find nothing and read as "the client deleted it" - which once
     // deleted every section from the document on any change to the base entry.
-    let declared: Vec<String> = mapping
+    let mut declared: Vec<String> = mapping
         .iter()
         .filter(|(_, value)| is_setting(value))
         .map(|(key, _)| key.clone())
         .collect();
+
+    // Keys this section may create, and only when the entry already carries them: the value a
+    // client sent is what gets written, so a key it never mentioned is not invented either.
+    let section = path.join(",");
+    let creatable: Vec<String> = CREATABLE
+        .iter()
+        .filter(|(place, _)| *place == section)
+        .map(|(_, key)| (*key).to_string())
+        .filter(|key| {
+            attribute_name(key)
+                .map(|attribute| after.attributes().get(&attribute).is_some())
+                .unwrap_or(false)
+        })
+        .collect();
+    declared.extend(creatable.iter().cloned());
 
     // A setting that is in the entry but not in the document would need a key invented for it.
     for attribute in after.attributes().values() {
@@ -564,7 +594,15 @@ fn rewrite(
                 }
             }
             Some(attribute) => {
-                let value = typed(mapping.get(key), &attribute.values, key)?;
+                // A created key is written as a list whatever the count: a scalar would make the
+                // setting change its own type, and the next commit would read it as one value.
+                let empty = Value::Array(Vec::new());
+                let existing = match mapping.get(key) {
+                    Some(value) => Some(value),
+                    None if creatable.contains(key) => Some(&empty),
+                    None => None,
+                };
+                let value = typed(existing, &attribute.values, key)?;
                 if Some(&value) != mapping.get(key) {
                     touched.push(key.clone());
                 }
@@ -1173,6 +1211,13 @@ access:
         }
     }
 
+    /// The same change, addressed at another entry of the subtree.
+    fn change_at(dn: &str, pairs: &[(ChangeOperation, &str, &[&str])]) -> ModifyRequest {
+        let mut request = change_of(pairs);
+        request.object = LdapDn::from(dn);
+        request
+    }
+
     fn as_admin() -> Session {
         let mut session = Session::new();
         session.set_identity(super::super::session::Identity::new(
@@ -1186,6 +1231,111 @@ access:
     fn in_store(document: &Document) -> String {
         let store = crate::config_store::Store::open(document.store.clone().expect("store"));
         store.read_current().expect("read").expect("generation")
+    }
+
+    /// A definition of an attribute type nobody has yet, in the syntax `.schema` files use.
+    const FAVOURITE_DRINK: &str = "attributeType ( 1.3.6.1.4.1.59999.1.1 NAME 'favouriteDrink' \
+         EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch \
+         SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )";
+
+    #[test]
+    fn the_first_schema_definition_can_be_added_over_the_protocol() {
+        // The document has no `definitions` key at all, which is the normal state of a server
+        // that has never had a definition added: an empty multi-valued attribute cannot be
+        // published, so there is nothing for the client to address until this works.
+        let text = "base_dn: dc=example,dc=com\nschema:\n  mode: strict\n";
+        let (_dir, document) = store_with(text);
+
+        let committed = change(
+            &document,
+            &as_admin(),
+            &change_at(
+                "cn=schema,cn=config",
+                &[(
+                    ChangeOperation::Add,
+                    "restldap-definitions",
+                    &[FAVOURITE_DRINK],
+                )],
+            ),
+        )
+        .expect("the first definition is accepted");
+
+        assert_eq!(
+            committed.keys,
+            vec!["definitions"],
+            "the change is reported under the document key it was written as"
+        );
+
+        let written = in_store(&document);
+        let tree: serde_json::Value =
+            serde_saphyr::from_str(&written).expect("the committed document parses");
+        assert!(
+            tree["schema"]["definitions"].is_array(),
+            "one definition is still written as a list, or the next commit would read the \
+             setting as a single value and the second definition would be refused: {written}"
+        );
+
+        // And the server can start from what was committed, which is the property the whole
+        // subtree rests on.
+        let config =
+            crate::config::resolve(crate::config::Args::default(), Some(&written), |_| None)
+                .expect("the committed document is a valid configuration");
+        assert_eq!(config.schema_definitions.len(), 1);
+        assert!(
+            config.schema.attribute("favouritedrink").is_some(),
+            "the definition is in the schema the server would start with"
+        );
+    }
+
+    #[test]
+    fn a_definition_that_does_not_parse_is_refused_and_nothing_is_committed() {
+        let text = "base_dn: dc=example,dc=com\nschema:\n  mode: strict\n";
+        let (_dir, document) = store_with(text);
+
+        let refusal = change(
+            &document,
+            &as_admin(),
+            &change_at(
+                "cn=schema,cn=config",
+                &[(
+                    ChangeOperation::Add,
+                    "restldap-definitions",
+                    &["attributeType ( NAME 'noOid' SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )"],
+                )],
+            ),
+        )
+        .expect_err("a definition without an OID is not usable");
+
+        assert_eq!(refusal.code, ResultCode::ConstraintViolation);
+        assert!(
+            refusal.detail.contains("cn=schema,cn=config"),
+            "the refusal names where the definition came from: {}",
+            refusal.detail
+        );
+
+        // Nothing committed: a generation that cannot be started from is worse than a refusal.
+        let store = crate::config_store::Store::open(document.store.clone().expect("store"));
+        assert_eq!(
+            store.history().expect("history").len(),
+            1,
+            "the initial generation is still the only one"
+        );
+    }
+
+    #[test]
+    fn a_definition_in_the_document_is_published_on_the_schema_entry() {
+        // The entry a client reads after adding a definition: it has to show what is in force,
+        // or the client cannot tell whether the change took.
+        let text = format!(
+            "base_dn: dc=example,dc=com\nschema:\n  definitions:\n    - {FAVOURITE_DRINK}\n"
+        );
+        let entries = entries(Some(&document(&text))).expect("entries");
+        let schema = find(&entries, "cn=schema,cn=config");
+
+        assert_eq!(
+            values(schema, "restldap-definitions"),
+            vec![FAVOURITE_DRINK]
+        );
     }
 
     #[test]

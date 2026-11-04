@@ -32,8 +32,13 @@ pub struct Source {
     generation: RwLock<u64>,
     /// The published schema, shared with every `Security` the connections hold.
     schema: crate::security::SharedSchema,
-    /// The files the schema was read from, re-read on a reload.
-    schema_files: Vec<std::path::PathBuf>,
+    /// Where the schema comes from, re-read on a reload.
+    ///
+    /// Behind a lock because it changes at run time: a commit through `cn=schema,cn=config` adds
+    /// a definition, and the next reload has to build from the document the server now holds -
+    /// not from the one it started with. One holder rather than two fields, so a reload can never
+    /// read the files of one moment and the definitions of another.
+    schema_sources: std::sync::RwLock<SchemaSources>,
     schema_mode: SchemaMode,
     indexes: IndexConfig,
     /// Where writes are announced, so a persistent search can be told about them.
@@ -86,13 +91,21 @@ impl Source {
             generation: RwLock::new(0),
             indexes: config.indexes.clone(),
             schema: crate::security::shared_schema(config.schema.clone()),
-            schema_files: config.schema_files.clone(),
+            schema_sources: std::sync::RwLock::new(SchemaSources::from_config(config)),
             schema_mode: config.schema_mode,
             store_reads: std::sync::atomic::AtomicU64::new(1),
             notices: tokio::sync::broadcast::channel(NOTICE_BUFFER).0,
         });
 
         Ok((source, directory))
+    }
+
+    /// The sources the schema in force was built from.
+    pub fn schema_sources(&self) -> SchemaSources {
+        match self.schema_sources.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// The schema as it stands now.
@@ -123,22 +136,42 @@ impl Source {
     /// A step that fails leaves the previous schema in force: running yesterday's rules beats
     /// refusing everything because somebody's editor saved half a line.
     pub async fn reload_schema(&self) -> Result<SchemaReloaded, BackendError> {
-        let mut schema = Schema::core();
+        let sources = match self.schema_sources.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
 
-        for path in &self.schema_files {
-            let text =
-                std::fs::read_to_string(path).map_err(|source| BackendError::SchemaRead {
-                    path: path.display().to_string(),
-                    source,
-                })?;
+        self.reload_schema_with(&sources).await
+    }
 
-            schema
-                .extend(&text)
-                .map_err(|source| BackendError::SchemaParse {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
-                })?;
+    /// Adopts the sources a committed document describes, then adopts the schema they build.
+    ///
+    /// The order matters: storing the sources first means a failure below still leaves the next
+    /// reload building from the document in force, rather than from the one that was replaced.
+    pub async fn adopt_schema_sources(
+        &self,
+        sources: SchemaSources,
+    ) -> Result<SchemaReloaded, BackendError> {
+        {
+            let mut guard = match self.schema_sources.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *guard = sources.clone();
         }
+
+        self.reload_schema_with(&sources).await
+    }
+
+    /// Rebuilds the schema from `sources` and puts it in force.
+    async fn reload_schema_with(
+        &self,
+        sources: &SchemaSources,
+    ) -> Result<SchemaReloaded, BackendError> {
+        // The same builder startup uses, so the two cannot drift: a source added for one is a
+        // source for both, and the failure names the file or the definition rather than just
+        // "the schema".
+        let schema = Schema::from_sources(&sources.files, &sources.definitions)?;
 
         let directory = self.directory().await;
         let warnings = check_schema_collect(&directory, &schema, self.schema_mode)?;
@@ -590,6 +623,23 @@ pub async fn reload_on_interval_with(
     }
 }
 
+/// Where the schema is built from: files on disk and definitions the protocol added.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaSources {
+    pub files: Vec<std::path::PathBuf>,
+    pub definitions: Vec<String>,
+}
+
+impl SchemaSources {
+    /// What the configuration file says, before anything is added over the protocol.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            files: config.schema_files.clone(),
+            definitions: config.schema_definitions.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +670,7 @@ mod tests {
             schema: crate::schema::Schema::core(),
             schema_mode: crate::schema::Mode::Strict,
             schema_files: Vec::new(),
+            schema_definitions: Vec::new(),
             indexes: crate::index::IndexConfig::default(),
             referrals: Default::default(),
             server_id: 0,
@@ -652,6 +703,127 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, body).expect("write");
         path
+    }
+
+    /// A definition nobody has yet, in the syntax `.schema` files use.
+    const FAVOURITE_DRINK: &str = "attributeType ( 1.3.6.1.4.1.59999.1.1 NAME 'favouriteDrink' \
+         EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch \
+         SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )";
+
+    #[tokio::test]
+    async fn a_definition_from_the_configuration_reaches_the_schema_a_write_checks() {
+        // The schema a reload builds has to include what the protocol added: a server that
+        // restarted into a document carrying a definition, and then dropped it on the next
+        // reload, would accept writes for a while and then start refusing them - the worst
+        // shape a schema bug can take.
+        let dir = tempdir().expect("tempdir");
+        let users = write(
+            dir.path(),
+            "users.json",
+            r#"[{"cn":"admin","objectClass":["top"]}]"#,
+        );
+        let groups = write(dir.path(), "groups.json", "[]");
+        let mut config = config(
+            users.to_str().expect("path"),
+            groups.to_str().expect("path"),
+        );
+        config.schema_definitions = vec![FAVOURITE_DRINK.to_string()];
+
+        let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");
+        let (source, _) = Source::load(&config, backend).await.expect("load");
+        source
+            .reload_schema()
+            .await
+            .expect("a definition from the configuration is adopted");
+
+        let schema = source.schema();
+        assert!(
+            schema.attribute("favouritedrink").is_some(),
+            "the definition the document carries is in force"
+        );
+        assert!(
+            source
+                .shared_schema()
+                .read()
+                .expect("schema")
+                .attribute("favouritedrink")
+                .is_some(),
+            "and through the handle the connections hold, not a copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definition_that_does_not_parse_leaves_the_previous_schema_in_force() {
+        let dir = tempdir().expect("tempdir");
+        let users = write(
+            dir.path(),
+            "users.json",
+            r#"[{"cn":"admin","objectClass":["top"]}]"#,
+        );
+        let groups = write(dir.path(), "groups.json", "[]");
+        let mut config = config(
+            users.to_str().expect("path"),
+            groups.to_str().expect("path"),
+        );
+        config.schema_definitions = vec!["attributeType ( NAME 'noOid' )".to_string()];
+
+        let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");
+        let (source, _) = Source::load(&config, backend).await.expect("load");
+
+        let refusal = source
+            .reload_schema()
+            .await
+            .expect_err("a definition without an OID is not usable");
+
+        let text = refusal.to_string();
+        assert!(
+            text.contains("cn=schema,cn=config") && text.contains("definition 1"),
+            "the answer says which definition and where it came from: {text}"
+        );
+        assert!(
+            source.schema().attribute("nooid").is_none(),
+            "nothing was adopted"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopted_sources_are_what_the_next_reload_builds_from() {
+        // The defect this guards: a reload that reads the sources the server started with would
+        // quietly drop every definition added over the protocol, and the server would accept
+        // writes against a rule it had just stopped publishing.
+        let dir = tempdir().expect("tempdir");
+        let users = write(
+            dir.path(),
+            "users.json",
+            r#"[{"cn":"admin","objectClass":["top"]}]"#,
+        );
+        let groups = write(dir.path(), "groups.json", "[]");
+        let config = config(
+            users.to_str().expect("path"),
+            groups.to_str().expect("path"),
+        );
+        let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");
+        let (source, _) = Source::load(&config, backend).await.expect("load");
+
+        let adopted = SchemaSources {
+            files: Vec::new(),
+            definitions: vec![FAVOURITE_DRINK.to_string()],
+        };
+        source.adopt_schema_sources(adopted).await.expect("adopted");
+
+        // A plain reload, as the signal and the HTTP route do it: it has to build from what was
+        // adopted, not from what the process started with.
+        source.reload_schema().await.expect("reload");
+
+        assert!(
+            source.schema().attribute("favouritedrink").is_some(),
+            "the definition added at run time survives a reload"
+        );
+        assert_eq!(
+            source.schema_sources().definitions,
+            vec![FAVOURITE_DRINK.to_string()],
+            "and the sources in force are the ones that were adopted"
+        );
     }
 
     #[tokio::test]

@@ -76,6 +76,24 @@ impl Live {
         &self.running
     }
 
+    /// Publishes `document` as the configuration subtree's contents.
+    ///
+    /// Separate from [`Shared::apply`] because it is not a policy change: `Security` compares
+    /// equal when the rules are equal, and a commit that changed one setting would otherwise
+    /// leave the subtree describing the settings before it. The schema handle travels with the
+    /// policy, so replacing one here keeps the other.
+    pub fn publish_document(&self, document: crate::config::Document) {
+        let current = self.current();
+        let mut next = (*current).clone();
+        next.config_document = Some(document);
+
+        let mut guard = match self.current.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Arc::new(next);
+    }
+
     /// Adopts `config` as the policy in force, keeping the schema handle.
     ///
     /// The schema is not taken from the configuration: a schema reload through the `Source` is
@@ -335,6 +353,43 @@ mod tests {
 
     fn config_from(text: &str) -> Config {
         crate::config::resolve(Args::default(), Some(text), |_| None).expect("config")
+    }
+
+    #[test]
+    fn a_published_document_replaces_the_one_the_subtree_shows() {
+        // The defect this guards: `apply` compares policy, and a commit that changed a setting
+        // publishes equal policy, so the subtree would keep describing the settings before it -
+        // a client would read its own change back and not find it.
+        let config = config_from("base_dn: dc=example,dc=com\n");
+        let shared = live(config.clone(), Security::from_config(&config));
+        let schema_before = Arc::as_ptr(&current_schema(&shared.current().schema));
+
+        shared.publish_document(crate::config::Document {
+            text: "base_dn: dc=example,dc=com\nschema:\n  mode: warn\n".to_string(),
+            origin: "store:/etc/rust-rest-ldap/config.d".to_string(),
+            store: Some(std::path::PathBuf::from("/etc/rust-rest-ldap/config.d")),
+        });
+
+        let published = shared
+            .current()
+            .config_document
+            .clone()
+            .expect("the subtree has a document");
+        assert!(
+            published.text.contains("mode: warn"),
+            "the new text is what the subtree publishes"
+        );
+        assert_eq!(
+            published.store.as_deref(),
+            Some(std::path::Path::new("/etc/rust-rest-ldap/config.d")),
+            "and the store travels with it, or the next change would find nothing to commit to"
+        );
+        assert_eq!(
+            Arc::as_ptr(&current_schema(&shared.current().schema)),
+            schema_before,
+            "the schema handle is the same one: a published document must not cut the server \
+             off from the signal that replaces it"
+        );
     }
 
     #[test]
