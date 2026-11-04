@@ -43,6 +43,23 @@ pub struct Directory {
     users: Range<usize>,
     groups: Range<usize>,
     by_dn: HashMap<String, usize>,
+    /// The stable id of each entry, indexed by position.
+    ///
+    /// Two different numbers, and the difference is the point. A position moves whenever an entry
+    /// is added or removed before it; an id does not, once issued. The search index refers to ids,
+    /// because a posting list that shifted under every insert would either have to be rewritten
+    /// whole or answer about the wrong entries - and 389 DS resolves the same problem the same
+    /// way, with `id2entry` and entry ids that are never reused.
+    ///
+    /// Ids are handed out in the order the entries are assembled, so a directory built from a
+    /// store has the same ids every start: the snapshot in the store refers to them.
+    ids: Vec<u32>,
+    /// Where an id sits now. Rebuilt whenever the vector moves, which is what keeps add and
+    /// delete from invalidating the index.
+    by_id: HashMap<u32, usize>,
+    /// The next id to hand out. Never goes back: a reused id would make an old posting, or a
+    /// record in a peer's journal, point at a different entry.
+    next_id: u32,
     /// Search indexes over the same id numbering. Empty unless `with_indexes` ran.
     index: Arc<Index>,
     /// Which snapshot of the directory this is.
@@ -246,6 +263,16 @@ impl Directory {
             by_dn.insert(entry.dn().to_string(), position);
         }
 
+        // Ids assigned in canonical order: the same entries assembled the same way get the same
+        // ids, which is what lets a snapshot taken by one start be read by the next.
+        let ids: Vec<u32> = (0..entries.len() as u32).collect();
+        let by_id: HashMap<u32, usize> = ids
+            .iter()
+            .enumerate()
+            .map(|(position, id)| (*id, position))
+            .collect();
+        let next_id = entries.len() as u32;
+
         Self {
             base_dn,
             users_ou_name,
@@ -254,6 +281,9 @@ impl Directory {
             users,
             groups,
             by_dn,
+            ids,
+            by_id,
+            next_id,
             // Zero until the source that built it says which snapshot this is: a directory
             // built by hand in a test has no history to be inconsistent with.
             snapshot: 0,
@@ -320,12 +350,13 @@ impl Directory {
             return Ok(false);
         };
 
+        let stable = self.ids[id];
         let old = std::mem::replace(&mut self.entries[id], entry.clone());
 
         // The index is already an `Arc`: when this snapshot is unique it is patched in place, and
         // when a reader copied it earlier the copy costs microseconds rather than the directory.
         let index = Arc::make_mut(&mut self.index);
-        index.replace(id as u32, &old, &entry, config)?;
+        index.replace(stable, &old, &entry, config)?;
 
         Ok(true)
     }
@@ -341,8 +372,23 @@ impl Directory {
     /// without a configuration, and so a test can compare an indexed directory with
     /// the same directory unindexed.
     pub fn with_indexes(mut self, config: &IndexConfig) -> Result<Self, IndexError> {
-        self.index = Arc::new(Index::build(&self.entries, config)?);
+        self.index = Arc::new(Index::build_for(&self.entries, &self.ids, config)?);
         Ok(self)
+    }
+
+    /// The stable id of an entry, which is what its postings point at.
+    pub fn id_of(&self, entry_dn: &str) -> Option<u32> {
+        self.position(entry_dn).map(|position| self.ids[position])
+    }
+
+    /// The entry an id names, if it is still here.
+    pub fn entry_by_id(&self, id: u32) -> Option<&Entry> {
+        self.by_id.get(&id).map(|position| &self.entries[*position])
+    }
+
+    /// The ids in canonical order: the pairing between the index's ids and the entries.
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
     }
 
     /// Adopts an index built somewhere else.
