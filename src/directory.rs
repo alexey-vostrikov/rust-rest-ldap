@@ -345,6 +345,22 @@ impl Directory {
         Ok(self)
     }
 
+    /// Adopts an index built somewhere else.
+    ///
+    /// The only caller is a start that found a stored snapshot and checked it against this data.
+    /// It is a separate entry point rather than a parameter of [`Self::with_indexes`] because the
+    /// two answer different questions: one builds, the other trusts - and trusting without the
+    /// fingerprint check would be a missing search result nobody could explain.
+    pub fn with_index(mut self, index: Index) -> Self {
+        self.index = Arc::new(index);
+        self
+    }
+
+    /// The entries in canonical order, which is the order the index ids point at.
+    pub fn entries_in_order(&self) -> &[Entry] {
+        &self.entries
+    }
+
     pub fn index(&self) -> &Index {
         &self.index
     }

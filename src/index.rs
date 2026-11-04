@@ -186,6 +186,254 @@ pub struct Index {
     built: BTreeMap<Arc<str>, BTreeSet<Kind>>,
 }
 
+/// Marks a snapshot written by this format, so a foreign or older blob is refused rather than
+/// misread as postings.
+const MAGIC: &[u8; 4] = b"RRIX";
+
+/// Bumped whenever the layout below changes. An older blob is not upgraded: the index is derived
+/// data and rebuilding it is always correct, while guessing at a layout that changed is not.
+const SNAPSHOT_VERSION: u32 = 1;
+
+/// A fingerprint of everything the index is derived from.
+///
+/// Two things, because either alone misses a change that matters: the entries as the index sees
+/// them - DN and `entryCSN`, in the order that gives them their ids - and the resolved plan, so a
+/// snapshot built with `cn: [eq]` is not reused after somebody adds `sub`.
+///
+/// `entryCSN` is what makes a `modify` invalidate the snapshot: the set of DNs does not change
+/// when a value inside an entry does, and an index built before that change would narrow to the
+/// old value.
+///
+/// FNV-1a: it is a dozen lines, needs no dependency, and its job here is to notice a change, not
+/// to resist an adversary. A hash collision would mean a stale index, which is a wrong answer -
+/// and the alternative is no persistence at all, since a cryptographic hash over three million
+/// entries on every start costs what this feature was meant to save.
+pub fn data_fingerprint(entries: &[Entry], config: &IndexConfig) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+
+    let mut eat = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+
+    eat(&(entries.len() as u64).to_le_bytes());
+
+    for entry in entries {
+        eat(entry.dn().as_bytes());
+        // The separator keeps `ab` + `c` from hashing as `a` + `bc`.
+        eat(&[0xff]);
+        if let Some(csn) = entry.attributes().get(crate::operational::ATTR_ENTRY_CSN) {
+            for value in &csn.values {
+                eat(value.as_bytes());
+            }
+        }
+        eat(&[0xfe]);
+    }
+
+    // The plan, in a stable order: `BTreeMap` iteration already is one.
+    if let Ok(plan) = config.resolve() {
+        for (attribute, kinds) in plan {
+            eat(attribute.as_bytes());
+            for kind in kinds {
+                eat(kind.name().as_bytes());
+            }
+        }
+    }
+
+    // The default kinds are not in the map when the configuration left them empty.
+    for name in &config.default {
+        eat(name.as_bytes());
+    }
+
+    hash
+}
+
+/// The bit for a kind, for the snapshot's flag word.
+fn kinds_bits(kinds: &BTreeSet<Kind>) -> u32 {
+    let mut bits = 0;
+    for kind in kinds {
+        bits |= match kind {
+            Kind::Pres => 1,
+            Kind::Eq => 2,
+            Kind::Sub => 4,
+            Kind::Ord => 8,
+        };
+    }
+    bits
+}
+
+/// The kinds a flag word names, or `None` when it names a bit this build does not know.
+fn bits_kinds(bits: u32) -> Option<BTreeSet<Kind>> {
+    if bits & !0b1111 != 0 {
+        return None;
+    }
+    let mut kinds = BTreeSet::new();
+    if bits & 1 != 0 {
+        kinds.insert(Kind::Pres);
+    }
+    if bits & 2 != 0 {
+        kinds.insert(Kind::Eq);
+    }
+    if bits & 4 != 0 {
+        kinds.insert(Kind::Sub);
+    }
+    if bits & 8 != 0 {
+        kinds.insert(Kind::Ord);
+    }
+    Some(kinds)
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_text(out: &mut Vec<u8>, text: &str) {
+    write_u32(out, text.len() as u32);
+    out.extend_from_slice(text.as_bytes());
+}
+
+fn write_names<'a, I>(out: &mut Vec<u8>, names: I)
+where
+    I: IntoIterator<Item = &'a Arc<str>>,
+{
+    let names: Vec<&Arc<str>> = names.into_iter().collect();
+    write_u32(out, names.len() as u32);
+    for name in names {
+        write_text(out, name);
+    }
+}
+
+fn write_bitmap(out: &mut Vec<u8>, bitmap: &RoaringBitmap) {
+    write_u32(out, bitmap.len() as u32);
+    for id in bitmap {
+        write_u32(out, id);
+    }
+}
+
+fn write_bitmaps(out: &mut Vec<u8>, map: &HashMap<Arc<str>, RoaringBitmap>) {
+    write_u32(out, map.len() as u32);
+    for (name, bitmap) in map {
+        write_text(out, name);
+        write_bitmap(out, bitmap);
+    }
+}
+
+fn write_nested<F>(
+    out: &mut Vec<u8>,
+    map: &HashMap<Arc<str>, HashMap<String, RoaringBitmap>>,
+    key: F,
+) where
+    F: Fn(&mut Vec<u8>, &str),
+{
+    write_u32(out, map.len() as u32);
+    for (name, values) in map {
+        write_text(out, name);
+        write_u32(out, values.len() as u32);
+        for (value, bitmap) in values {
+            key(out, value);
+            write_bitmap(out, bitmap);
+        }
+    }
+}
+
+/// Reads the format [`Index::encode`] writes, refusing anything short or malformed.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    fn finished(&self) -> bool {
+        self.at == self.bytes.len()
+    }
+
+    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(count)?;
+        let slice = self.bytes.get(self.at..end)?;
+        self.at = end;
+        Some(slice)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let bytes = self.take(4)?;
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn i64(&mut self) -> Option<i64> {
+        let bytes = self.take(8)?;
+        let mut array = [0u8; 8];
+        array.copy_from_slice(bytes);
+        Some(i64::from_le_bytes(array))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let bytes = self.take(8)?;
+        let mut array = [0u8; 8];
+        array.copy_from_slice(bytes);
+        Some(u64::from_le_bytes(array))
+    }
+
+    fn text(&mut self) -> Option<Arc<str>> {
+        let length = self.u32()? as usize;
+        let bytes = self.take(length)?;
+        Some(Arc::from(std::str::from_utf8(bytes).ok()?))
+    }
+
+    fn names(&mut self) -> Option<BTreeSet<Arc<str>>> {
+        let count = self.u32()? as usize;
+        let mut names = BTreeSet::new();
+        for _ in 0..count {
+            names.insert(self.text()?);
+        }
+        Some(names)
+    }
+
+    fn bitmap(&mut self) -> Option<RoaringBitmap> {
+        let count = self.u32()? as usize;
+        let mut bitmap = RoaringBitmap::new();
+        for _ in 0..count {
+            bitmap.insert(self.u32()?);
+        }
+        Some(bitmap)
+    }
+
+    fn bitmaps(&mut self) -> Option<HashMap<Arc<str>, RoaringBitmap>> {
+        let count = self.u32()? as usize;
+        let mut map = HashMap::new();
+        for _ in 0..count {
+            let name = self.text()?;
+            map.insert(name, self.bitmap()?);
+        }
+        Some(map)
+    }
+
+    fn nested(&mut self) -> Option<HashMap<Arc<str>, HashMap<String, RoaringBitmap>>> {
+        let count = self.u32()? as usize;
+        let mut map = HashMap::new();
+        for _ in 0..count {
+            let name = self.text()?;
+            let values = self.u32()? as usize;
+            let mut inner = HashMap::new();
+            for _ in 0..values {
+                let value = self.text()?;
+                inner.insert(value.to_string(), self.bitmap()?);
+            }
+            map.insert(name, inner);
+        }
+        Some(map)
+    }
+}
+
 /// Whether `touch` is adding an entry's postings or taking them away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Touch {
@@ -234,6 +482,170 @@ impl Index {
         }
 
         Ok(index)
+    }
+
+    /// The bytes that let the next start skip building this index.
+    ///
+    /// A whole index in one blob rather than a key per posting list. The reason is the reader: a
+    /// start wants all of it at once, and reading a hundred thousand small values to assemble
+    /// something the writer already had assembled costs more than reading one large one. Redb
+    /// holds the blob as a single value and writes it atomically, so a start either sees the whole
+    /// snapshot or none of it - a half-written index would narrow to wrong answers, which is the
+    /// one failure mode this must not have.
+    ///
+    /// `fingerprint` is not a checksum of the bytes: it names the data and the configuration the
+    /// snapshot was built from, and the reader recomputes it before trusting anything here.
+    pub fn encode(&self, fingerprint: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        out.extend_from_slice(&fingerprint.to_le_bytes());
+        out.extend_from_slice(&kinds_bits(&self.default_kinds).to_le_bytes());
+
+        write_names(&mut out, &self.case_sensitive);
+        write_names(&mut out, &self.ordered_numeric);
+        write_names(&mut out, &self.ordered_mixed);
+
+        write_names(&mut out, self.built.keys());
+
+        write_bitmaps(&mut out, &self.presence);
+
+        // The three two-level maps differ only in how a key is spelled, so one pair of helpers
+        // writes and reads all of them.
+        write_nested(&mut out, &self.equality, |out, value| {
+            write_text(out, value)
+        });
+        write_nested(&mut out, &self.substrings, |out, value| {
+            write_text(out, value)
+        });
+
+        out.extend_from_slice(&(self.ordered.len() as u32).to_le_bytes());
+        for (attribute, values) in &self.ordered {
+            write_text(&mut out, attribute);
+            out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            for (key, bitmap) in values {
+                match key {
+                    OrderKey::Num(number) => {
+                        out.push(0);
+                        out.extend_from_slice(&number.to_le_bytes());
+                    }
+                    OrderKey::Text(text) => {
+                        out.push(1);
+                        write_text(&mut out, text);
+                    }
+                }
+                write_bitmap(&mut out, bitmap);
+            }
+        }
+
+        out
+    }
+
+    /// Reads a snapshot, or reports that it cannot be trusted.
+    ///
+    /// Every reason to distrust the bytes answers `None` and the caller builds the index instead:
+    /// a wrong magic, a version from another build, a fingerprint that no longer matches the
+    /// data, or a truncated blob. Rebuilding costs a minute; answering from a snapshot that does
+    /// not match the data costs a missing search result that nobody can explain.
+    pub fn decode(bytes: &[u8], fingerprint: u64) -> Option<Self> {
+        let mut reader = Reader::new(bytes);
+
+        if reader.take(MAGIC.len())? != MAGIC {
+            return None;
+        }
+        if reader.u32()? != SNAPSHOT_VERSION {
+            return None;
+        }
+        if reader.u64()? != fingerprint {
+            return None;
+        }
+
+        let default_kinds = bits_kinds(reader.u32()?)?;
+
+        let case_sensitive = reader.names()?;
+        let ordered_numeric = reader.names()?;
+        let ordered_mixed = reader.names()?;
+        let built_names = reader.names()?;
+
+        let presence = reader.bitmaps()?;
+        let equality = reader.nested()?;
+        let substrings = reader.nested()?;
+
+        let count = reader.u32()? as usize;
+        let mut ordered: HashMap<Arc<str>, BTreeMap<OrderKey, RoaringBitmap>> = HashMap::new();
+        for _ in 0..count {
+            let attribute = reader.text()?;
+            let values = reader.u32()? as usize;
+            let mut map = BTreeMap::new();
+            for _ in 0..values {
+                let key = match reader.u8()? {
+                    0 => OrderKey::Num(reader.i64()?),
+                    1 => OrderKey::Text(reader.text()?.to_string()),
+                    _ => return None,
+                };
+                map.insert(key, reader.bitmap()?);
+            }
+            ordered.insert(attribute, map);
+        }
+
+        if !reader.finished() {
+            return None;
+        }
+
+        // `built` says what the index is able to answer, and it is rebuilt from the same names
+        // it was written with; the kinds each attribute was built for are implied by which maps
+        // hold it, so nothing else needs carrying.
+        let mut built = BTreeMap::new();
+        for name in built_names {
+            built.insert(name, BTreeSet::new());
+        }
+
+        let mut index = Self {
+            presence,
+            equality,
+            substrings,
+            ordered,
+            ordered_numeric,
+            ordered_mixed,
+            case_sensitive,
+            default_kinds,
+            built,
+        };
+        index.fill_built();
+        Some(index)
+    }
+
+    /// Recomputes which kinds each attribute was built for, from the maps that hold it.
+    ///
+    /// Not carried in the snapshot because it is derivable, and a derived value that is stored
+    /// can disagree with what it was derived from - which is the class of bug a snapshot is most
+    /// likely to introduce.
+    fn fill_built(&mut self) {
+        self.built.clear();
+        for name in self.presence.keys() {
+            self.built
+                .entry(Arc::clone(name))
+                .or_default()
+                .insert(Kind::Pres);
+        }
+        for name in self.equality.keys() {
+            self.built
+                .entry(Arc::clone(name))
+                .or_default()
+                .insert(Kind::Eq);
+        }
+        for name in self.substrings.keys() {
+            self.built
+                .entry(Arc::clone(name))
+                .or_default()
+                .insert(Kind::Sub);
+        }
+        for name in self.ordered.keys() {
+            self.built
+                .entry(Arc::clone(name))
+                .or_default()
+                .insert(Kind::Ord);
+        }
     }
 
     /// Adds or removes one entry's ids from every posting list, without touching the rest.
@@ -565,16 +977,48 @@ impl Index {
                 Some(union)
             }
             Query::And(parts) => {
-                let mut narrowed: Option<RoaringBitmap> = None;
+                // Every part is narrowed first, then the intersections run from the smallest
+                // set outwards.
+                //
+                // The order the client wrote the parts in says nothing about which one is
+                // selective, and intersecting in that order costs what the first part costs:
+                // `(&(objectClass=person)(uid=alice))` over a million entries materialises a
+                // million positions before the second part cuts them to one. Starting from the
+                // smallest set means the work follows the answer rather than the request.
+                //
+                // An empty part ends it: a set with nothing in it cannot be intersected into
+                // anything but nothing, so the remaining parts are not narrowed at all. That is
+                // the case a rejected filter usually lands in.
+                let mut narrowed: Vec<RoaringBitmap> = Vec::with_capacity(parts.len());
                 for part in parts {
                     if let Some(bitmap) = self.candidates(part) {
-                        narrowed = Some(match narrowed {
-                            Some(current) => current & bitmap,
-                            None => bitmap,
-                        });
+                        if bitmap.is_empty() {
+                            return Some(bitmap);
+                        }
+                        narrowed.push(bitmap);
                     }
                 }
-                narrowed
+
+                // Fewest entries first. `sort_unstable_by_key` on the length, not on the bitmap:
+                // the order of equal-sized sets does not affect the result, only the cost, and
+                // the cost is the length.
+                narrowed.sort_unstable_by_key(|bitmap| bitmap.len());
+
+                let mut intersections = narrowed.into_iter();
+                let Some(mut current) = intersections.next() else {
+                    // Not one part was indexable, so the index stands aside and the filter
+                    // evaluates every entry the scope holds.
+                    return None;
+                };
+
+                for bitmap in intersections {
+                    current &= bitmap;
+                    if current.is_empty() {
+                        break;
+                    }
+                }
+
+                Some(current)
             }
             Query::Or(parts) => {
                 // Every part has to be indexable: a union over the indexable ones
@@ -698,6 +1142,37 @@ mod tests {
             ));
         }
         Entry::new(dn, attributes)
+    }
+
+    /// `count` users, each with a distinct cn and uid and a stamped `entryCSN`, which is what a
+    /// write through the protocol produces and what the fingerprint tracks.
+    fn people(count: usize) -> Vec<Entry> {
+        (0..count)
+            .map(|index| {
+                let mut built = entry(
+                    &format!("cn=user{index},ou=users,dc=example,dc=com"),
+                    &[
+                        ("objectClass", &["top", "inetOrgPerson"]),
+                        ("cn", &[]),
+                        ("uid", &[]),
+                    ],
+                );
+                let mut attributes = built.attributes().clone();
+                attributes =
+                    attributes.replace(Attribute::new("cn", vec![format!("Person {index}")]));
+                attributes =
+                    attributes.replace(Attribute::new("uid", vec![format!("user{index}")]));
+                attributes = attributes.replace(
+                    Attribute::single(
+                        crate::operational::ATTR_ENTRY_CSN,
+                        "20260101000000.000000Z#000000#001#000000",
+                    )
+                    .operational(),
+                );
+                built = Entry::new(built.dn(), attributes);
+                built
+            })
+            .collect()
     }
 
     fn directory() -> Vec<Entry> {
@@ -851,6 +1326,117 @@ mod tests {
                 value: "1".to_string(),
             }),
             None
+        );
+    }
+
+    // ---- the snapshot a start reads instead of building ----
+
+    #[test]
+    fn a_snapshot_answers_exactly_what_the_index_it_came_from_answers() {
+        // The whole claim of the feature: a reused index is the same index. Checked by running
+        // the same queries through both and comparing the answers, not by comparing bytes - the
+        // bytes are an implementation detail, the answers are what a client sees.
+        let entries = people(60);
+        let config = config(&[("cn", &["eq", "pres", "sub"]), ("uid", &["eq"])], &[]);
+        let index = Index::build(&entries, &config).expect("build");
+        let fingerprint = data_fingerprint(&entries, &config);
+
+        let decoded = Index::decode(&index.encode(fingerprint), fingerprint)
+            .expect("a snapshot of this data is readable");
+
+        for query in [
+            Query::Presence("cn".into()),
+            Query::Equality {
+                attribute: "uid".into(),
+                value: "user7".into(),
+            },
+            Query::Substring {
+                attribute: "cn".into(),
+                initial: None,
+                any: vec!["erson1".to_string()],
+                final_part: None,
+            },
+            Query::And(vec![
+                Query::Presence("cn".into()),
+                Query::Equality {
+                    attribute: "uid".into(),
+                    value: "user9".into(),
+                },
+            ]),
+        ] {
+            assert_eq!(
+                index.candidates(&query),
+                decoded.candidates(&query),
+                "the snapshot answers {query:?} the same way"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_of_other_data_is_refused() {
+        // The one failure this must not have: answering from an index built over other data
+        // narrows to a value that is no longer there, and the client sees a missing entry with
+        // nothing to explain it. The fingerprint is the guard, so a changed `entryCSN` - which is
+        // what a modify produces - has to make it fail.
+        let entries = people(10);
+        let config = config(&[("cn", &["eq"])], &[]);
+        let index = Index::build(&entries, &config).expect("build");
+
+        let built_for = data_fingerprint(&entries, &config);
+        let bytes = index.encode(built_for);
+
+        let mut changed = entries.clone();
+        let mut attributes = changed[3].attributes().clone();
+        attributes = attributes.replace(crate::model::Attribute::single(
+            "entryCSN",
+            "20260101000000.000000Z#000001#001#000000",
+        ));
+        changed[3] = crate::model::Entry::new(changed[3].dn(), attributes);
+        let now = data_fingerprint(&changed, &config);
+
+        assert_ne!(built_for, now, "a modify has to move the fingerprint");
+        assert!(
+            Index::decode(&bytes, now).is_none(),
+            "a snapshot built before the change is not reused"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_is_refused_when_the_index_section_changed() {
+        // The data is the same, but the plan is not: a snapshot built with `cn: [eq]` has no
+        // trigrams, and serving a `sub` query from it would narrow to nothing.
+        let entries = people(10);
+        let before = config(&[("cn", &["eq"])], &[]);
+        let after = config(&[("cn", &["eq", "sub"])], &[]);
+        let index = Index::build(&entries, &before).expect("build");
+
+        let bytes = index.encode(data_fingerprint(&entries, &before));
+
+        assert!(
+            Index::decode(&bytes, data_fingerprint(&entries, &after)).is_none(),
+            "a changed `indexes:` section forces a rebuild"
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_foreign_blob_is_refused_rather_than_misread() {
+        let entries = people(5);
+        let config = config(&[("cn", &["eq"])], &[]);
+        let index = Index::build(&entries, &config).expect("build");
+        let fingerprint = data_fingerprint(&entries, &config);
+        let bytes = index.encode(fingerprint);
+
+        assert!(Index::decode(&bytes[..bytes.len() / 2], fingerprint).is_none());
+
+        let mut foreign = bytes.clone();
+        foreign[0] = b'X';
+        assert!(Index::decode(&foreign, fingerprint).is_none());
+
+        let mut future = bytes.clone();
+        future[4] = 99;
+        assert!(
+            Index::decode(&future, fingerprint).is_none(),
+            "a version from another build is not guessed at"
         );
     }
 

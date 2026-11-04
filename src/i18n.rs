@@ -410,6 +410,19 @@ const ENGLISH: &[(&str, &str)] = &[
         "sasl: accepting Kerberos tickets for realm(s) {realms}",
     ),
     (
+        "start.index_reused",
+        "index: read from the store, the data has not changed since it was built",
+    ),
+    (
+        "start.index_built",
+        "index: built from the data in {seconds}s",
+    ),
+    (
+        "error.index_snapshot",
+        "the index could not be stored for the next start, so that start will build it again: \
+         {detail}",
+    ),
+    (
         "start.journal_pruned",
         "journal: dropped {removed} of the oldest change records, as replication.journal_keep says",
     ),
