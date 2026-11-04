@@ -30,6 +30,7 @@ pub mod integrity;
 pub mod ldap;
 pub mod ldif;
 pub mod ldif_read;
+pub mod limits;
 pub mod mapping;
 pub mod metrics;
 pub mod model;

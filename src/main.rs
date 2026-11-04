@@ -466,6 +466,28 @@ async fn main() {
             )
         );
     }
+    // Said out loud, because a limit nobody knows about is discovered as a bug: an operator who
+    // added it months ago, a client that pages for ever, and nothing on the server to explain it.
+    // One line per limit that is set, so neither sentence has to say "unlimited".
+    if security.limits.size_limit > 0 {
+        println!(
+            "{}",
+            i18n::t(
+                "start.limit_size",
+                &[("size", &security.limits.size_limit.to_string())]
+            )
+        );
+    }
+    if let Some(budget) = security.limits.time_limit {
+        println!(
+            "{}",
+            i18n::t(
+                "start.limit_time",
+                &[("seconds", &budget.as_secs().to_string())]
+            )
+        );
+    }
+
     println!(
         "{}",
         i18n::t(

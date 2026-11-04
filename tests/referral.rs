@@ -69,6 +69,7 @@ async fn serve(
         journal_keep: None,
         conflict_log: None,
         sasl: Default::default(),
+        limits: Default::default(),
         referrals: rust_rest_ldap::referral::Referrals::new(
             referrals
                 .iter()

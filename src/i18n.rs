@@ -401,6 +401,11 @@ const ENGLISH: &[(&str, &str)] = &[
     ("start.shutting_down", "shutting down"),
     ("start.export_done", "exported {entries} entries to {path}"),
     (
+        "start.limit_size",
+        "limits: at most {size} entries per search",
+    ),
+    ("start.limit_time", "limits: at most {seconds}s per search"),
+    (
         "start.gssapi",
         "sasl: accepting Kerberos tickets for realm(s) {realms}",
     ),
