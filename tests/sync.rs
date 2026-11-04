@@ -80,6 +80,7 @@ async fn serve(entries: Vec<Entry>) -> String {
         server_id: 0,
         peers: Vec::new(),
         journal_keep: None,
+        journal_max_age: None,
         conflict_log: None,
         sasl: Default::default(),
         limits: Default::default(),
@@ -169,6 +170,33 @@ fn search() -> SearchRequest {
         rust_rest_ldap::ldap::filter_parse::parse("(objectClass=*)").expect("filter"),
         vec![LdapString::from("cn")],
     )
+}
+
+/// The same search, with the attribute selection the test needs.
+///
+/// `+` is how a client asks for operational attributes, and it is the selection that matters
+/// here: it is the one that brings `entryDN` and `subschemaSubentry` along with the attributes a
+/// replica actually needs.
+fn search_selecting(selection: &[&str]) -> SearchRequest {
+    let mut request = search();
+    request.attributes = selection
+        .iter()
+        .map(|name| LdapString::from(*name))
+        .collect();
+    request
+}
+
+/// Every attribute name the answer carried, whichever entry it came from.
+fn attribute_names(messages: &[rasn_ldap::LdapMessage]) -> Vec<String> {
+    let mut names = Vec::new();
+    for message in messages {
+        if let ProtocolOp::SearchResEntry(entry) = &message.protocol_op {
+            for attribute in entry.attributes.iter() {
+                names.push(attribute.r#type.0.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// The `syncRequest` control with a cookie: a client that already has a copy, asking for what
@@ -360,6 +388,76 @@ fn result_code(messages: &[rasn_ldap::LdapMessage]) -> Option<ResultCode> {
             ProtocolOp::SearchResDone(done) => Some(done.0.result_code),
             _ => None,
         })
+}
+
+#[tokio::test]
+async fn a_replication_stream_leaves_out_what_only_the_answering_server_derived() {
+    // Live two-node replication stopped converging over this: the peer asked for `+`, received
+    // `entryDN` and `subschemaSubentry`, stored them, and failed its own schema check on every
+    // poll. They describe the server that computed them, not the entry.
+    let url = serve(vec![person("alice")]).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (messages, _) = client
+        .search_with(search_selecting(&["cn", "+"]), vec![sync_control(1)])
+        .await
+        .expect("search");
+
+    let names = attribute_names(&messages);
+    assert!(
+        !names.is_empty(),
+        "the answer carries attributes, otherwise nothing is being tested: {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("entryDN")),
+        "a replicated entry must not carry entryDN: {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("subschemaSubentry")),
+        "nor subschemaSubentry, which names this server's schema: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("entryCSN")),
+        "but the operational attributes a replica does need are kept: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_search_still_returns_entrydn_for_plus() {
+    // The other half of the rule, and the one a filter applied too widely broke: RFC 5020 says
+    // `entryDN` comes back when a client asks for `+`, and a tool that renders an entry reads it
+    // from there.
+    let url = serve(vec![person("alice")]).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (messages, _) = client
+        .search_with(search_selecting(&["cn", "+"]), Vec::new())
+        .await
+        .expect("search");
+
+    let names = attribute_names(&messages);
+    assert!(
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("entryDN")),
+        "an ordinary search with + returns entryDN: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("subschemaSubentry")),
+        "and subschemaSubentry, which a client follows to read the schema: {names:?}"
+    );
 }
 
 #[tokio::test]

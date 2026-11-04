@@ -255,6 +255,17 @@ impl Backend {
         }
     }
 
+    /// Drops change records stamped before `cutoff`.
+    pub fn journal_prune_before(
+        &self,
+        cutoff: std::time::SystemTime,
+    ) -> Result<usize, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.journal_prune_before(cutoff),
+            _ => Ok(0),
+        }
+    }
+
     /// Whether this backend can store a whole entry as an upsert.
     ///
     /// Not the same question as `keeps_entries_verbatim`: the REST backend maps an entry onto

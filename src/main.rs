@@ -409,6 +409,25 @@ async fn serve() {
     // Before the directory is built, so the floor the snapshot carries is the floor that is: a
     // snapshot taken before pruning would say the journal reaches further back than it does, and a
     // peer resuming from that stretch would be told nothing was missed.
+    // Age first: a record that is too old is too old whatever the count says, and doing it the
+    // other way round would let a generous count keep a year of tombstones in a quiet directory.
+    if let Some(age) = config.journal_max_age {
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(age)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        match backend.journal_prune_before(cutoff) {
+            Ok(removed) if removed > 0 => println!(
+                "{}",
+                i18n::t(
+                    "start.journal_pruned_age",
+                    &[("removed", &removed.to_string())]
+                )
+            ),
+            Ok(_) => {}
+            Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
+        }
+    }
+
     if let Some(keep) = config.journal_keep {
         match backend.journal_prune(keep) {
             Ok(removed) if removed > 0 => println!(

@@ -68,6 +68,7 @@ async fn serve(
         server_id: 0,
         peers: Vec::new(),
         journal_keep: None,
+        journal_max_age: None,
         conflict_log: None,
         sasl: Default::default(),
         limits: Default::default(),

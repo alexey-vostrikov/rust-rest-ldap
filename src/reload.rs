@@ -100,6 +100,11 @@ impl Source {
         Ok((source, directory))
     }
 
+    /// How strictly this server enforces its schema, for a decision taken outside a reload.
+    pub fn schema_mode(&self) -> SchemaMode {
+        self.schema_mode
+    }
+
     /// The sources the schema in force was built from.
     pub fn schema_sources(&self) -> SchemaSources {
         match self.schema_sources.read() {
@@ -676,6 +681,7 @@ mod tests {
             server_id: 0,
             peers: Vec::new(),
             journal_keep: None,
+            journal_max_age: None,
             conflict_log: None,
             sasl: Default::default(),
             acl: Default::default(),

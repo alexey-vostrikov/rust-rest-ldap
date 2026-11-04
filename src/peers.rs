@@ -640,10 +640,45 @@ pub async fn apply(
 
     match &decision {
         crate::replication::Decision::Apply { .. } => {
+            // Checked here, before the store sees it. The schema is otherwise enforced by the
+            // reload that follows a change, which is too late: a peer could write an entry this
+            // server's own schema refuses, the reload would then refuse the directory, and the
+            // node would stop starting - a remote node deciding whether this one runs.
+            //
+            // `warn` keeps the older behaviour on purpose: an operator who chose to report
+            // violations instead of refusing them reads the report; refusing here would enforce
+            // a policy they turned off.
             let entry_change = match &change.entry {
-                Some(entry) => crate::backend::EntryChange::Upsert {
-                    entry: entry.clone(),
-                },
+                Some(entry) => {
+                    let entry = without_derived(entry);
+
+                    if source.schema_mode() != crate::schema::Mode::Warn
+                        && let Err(violations) = source.schema().check(&entry)
+                    {
+                        let detail = violations
+                            .iter()
+                            .map(|violation| format!("{:?}: {}", violation.code, violation.detail))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+
+                        eprintln!(
+                            "{}",
+                            crate::i18n::t(
+                                "error.peer_schema",
+                                &[("url", &peer.url), ("dn", &change.dn), ("detail", &detail)]
+                            )
+                        );
+
+                        // Skipped rather than failed: one entry this node cannot store must not
+                        // stop the rest of the stream, and the next poll will try again - the
+                        // log line is what an operator acts on.
+                        return Ok(crate::replication::Decision::Ignore {
+                            why: "the peer sent an entry this server's schema refuses",
+                        });
+                    }
+
+                    crate::backend::EntryChange::Upsert { entry }
+                }
                 None => crate::backend::EntryChange::delete(change.dn.clone(), None),
             };
 
@@ -675,6 +710,27 @@ pub async fn apply(
     }
 
     Ok(decision)
+}
+
+/// The entry as data, with the attributes a peer computed about it removed.
+///
+/// A peer that asks for `+` receives `entryDN` and `subschemaSubentry` along with the operational
+/// attributes a replica actually needs (`entryCSN`, `entryUUID`). Those two describe the answering
+/// server, not the entry: storing them here would fail this server's own schema check, and the
+/// failure would repeat on every poll, so replication would never converge - which is exactly what
+/// happened before this was here, with the peer retrying every five seconds for ever.
+///
+/// Stripped on receipt rather than only on sending, because the two ends are upgraded one at a
+/// time: a node running an older build still sends them, and a stream that only the newest build
+/// can accept is not replication.
+fn without_derived(entry: &crate::model::Entry) -> crate::model::Entry {
+    let mut attributes = crate::model::Attributes::new();
+    for attribute in entry.attributes().values() {
+        if !crate::model::is_derived(&attribute.name) {
+            attributes = attributes.push(attribute.clone());
+        }
+    }
+    crate::model::Entry::new(entry.dn(), attributes)
 }
 
 /// The cookie a message carries, if it carries one.
@@ -720,6 +776,65 @@ mod tests {
             bind_dn: None,
             password: None,
         }
+    }
+
+    #[test]
+    fn a_derived_attribute_never_reaches_the_store() {
+        // What a peer computes about an entry describes the peer. Storing it fails this server's
+        // schema check, and the failure repeats on every poll, so replication never converges -
+        // which is what a live two-node run showed before the strip existed.
+        use crate::model::{Attribute, Attributes, Entry};
+
+        let entry = Entry::new(
+            "uid=alice,ou=users,dc=example,dc=com",
+            Attributes::new()
+                .push(Attribute::new(
+                    "objectClass",
+                    vec!["top".to_string(), "person".to_string()],
+                ))
+                .push(Attribute::single("uid", "alice"))
+                .push(
+                    Attribute::single("entryDN", "uid=alice,ou=users,dc=example,dc=com")
+                        .operational(),
+                )
+                .push(Attribute::single("subschemaSubentry", "cn=Subschema").operational())
+                .push(
+                    Attribute::single("entryUUID", "11111111-1111-1111-1111-111111111111")
+                        .operational(),
+                ),
+        );
+
+        let stripped = without_derived(&entry);
+        let names: Vec<String> = stripped
+            .attributes()
+            .values()
+            .iter()
+            .map(|attribute| attribute.name.to_string())
+            .collect();
+
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("entryDN")),
+            "entryDN is the DN spelled again, not data: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("subschemaSubentry")),
+            "subschemaSubentry names the peer's schema, not ours: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("entryUUID")),
+            "and the attributes a replica does need are kept: {names:?}"
+        );
+        assert_eq!(
+            stripped.dn(),
+            entry.dn(),
+            "the DN is the entry's own and survives the strip"
+        );
     }
 
     #[test]
@@ -898,6 +1013,7 @@ mod tests {
             server_id: 2,
             peers: Vec::new(),
             journal_keep: None,
+            journal_max_age: None,
             conflict_log: None,
             sasl: Default::default(),
             acl: Default::default(),
