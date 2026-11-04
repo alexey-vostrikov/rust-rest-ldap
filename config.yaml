@@ -67,6 +67,45 @@ indexes:
     gidNumber: [eq]
     uidNumber: [eq]
 
+# Multi-master, level one: one entry at a time, last writer wins.
+#
+# Two nodes that both accept writes converge only if every change is numbered, the numbers
+# order, and "the order says nothing" has an answer of its own. `server_id` is this node's
+# number and rides in the third field of every change sequence number; `peers` are the nodes
+# it replicates with. Zero means "this node does not replicate", which is what an unconfigured
+# server is - and a node with no id cannot have peers, because it could not tell its own
+# changes from theirs.
+#
+# A peer is an ordinary LDAP server, and the exchange is RFC 4533 refreshAndPersist: a change
+# arrives pushed, including a deletion, which a poll cannot express. A node that has been away
+# resumes from its cookie, and if the journal no longer reaches back that far it is told to do
+# a full refresh rather than silently skip what it missed.
+#
+# `journal_keep` bounds how far back this node can answer: the journal is the only place a
+# deletion is remembered. Omit it and nothing is pruned - the honest default for a node whose
+# peers may be down for a long time, and a slow leak for one nobody reads. Zero is refused:
+# it would discard the only record that a deletion ever happened.
+#server_id: 1
+#replication:
+#  journal_keep: 100000
+#peers:
+#  - url: ldap://node2.example.com:389
+#    server_id: 2                     # checked at the first exchange: two nodes must not share one
+#    bind_dn: cn=replicator,dc=example,dc=com   # read access to the whole naming context
+#    password: <secret>
+
+# Subtrees this server does not hold, and where a client is sent for them.
+#
+# A referral is not an error: the server answers `searchResRef` and the client asks the other
+# server itself. Nothing is copied and nothing is cached, so this closes a gap in the tree
+# without a second copy of it. A base outside every referral and outside this tree is still
+# `noSuchObject` - otherwise a typo in a DN would turn into a redirect.
+#
+# `manageDsaIT` is recognised: a client that asks not to be redirected gets the entry itself.
+#referrals:
+#  - dn: dc=remote,dc=com
+#    url: ldaps://ldap.remote.example.com
+
 # Language of the diagnostics an OPERATOR reads: startup lines, configuration errors,
 # the journal. Client-visible protocol text stays English ASCII, because scripts match on
 # it. Fallback order: this key, then RUST_REST_LDAP_LOCALE, then LC_ALL, then LANG.
