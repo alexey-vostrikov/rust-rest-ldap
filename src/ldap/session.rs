@@ -30,6 +30,13 @@ impl Identity {
 pub struct Session {
     identity: Option<Identity>,
     encrypted: bool,
+    /// A SASL conversation half-way through, if one is.
+    ///
+    /// It lives on the connection because the protocol puts it there: a GSSAPI bind is several
+    /// requests, and the state between them - the ticket session key and what was already agreed -
+    /// belongs to the exchange, not to the directory. Dropped by any new bind and by [`Session::reset`],
+    /// so a failed attempt cannot be resumed.
+    sasl: Option<super::sasl_bind::Exchange>,
 }
 
 impl Session {
@@ -66,8 +73,40 @@ impl Session {
     }
 
     /// Drops the identity: an anonymous session.
+    ///
+    /// Also abandons a SASL exchange in progress, because a conversation that was interrupted
+    /// must not be pickable up again: the next token would be accepted against a state the
+    /// client no longer believes in.
     pub fn reset(&mut self) {
         self.identity = None;
+        self.sasl = None;
+    }
+
+    /// The SASL exchange in progress, if any.
+    pub fn sasl_exchange(&self) -> Option<&super::sasl_bind::Exchange> {
+        self.sasl.as_ref()
+    }
+
+    /// Where that exchange stands.
+    pub fn sasl_stage(&self) -> Option<super::sasl_bind::Stage> {
+        self.sasl.as_ref().map(|exchange| exchange.stage())
+    }
+
+    /// Records the exchange the next round belongs to.
+    pub fn set_sasl(&mut self, exchange: super::sasl_bind::Exchange) {
+        self.sasl = Some(exchange);
+    }
+
+    /// Moves the exchange to its next stage.
+    pub fn set_sasl_stage(&mut self, stage: super::sasl_bind::Stage) {
+        if let Some(exchange) = &mut self.sasl {
+            exchange.set_stage(stage);
+        }
+    }
+
+    /// Ends the exchange, keeping the identity it produced.
+    pub fn clear_sasl(&mut self) {
+        self.sasl = None;
     }
 
     pub fn is_admin(&self) -> bool {
