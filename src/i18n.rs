@@ -443,6 +443,10 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("error.client", "client {peer}: {detail}"),
     (
+        "error.sync_lagged",
+        "connection {peer} fell {missed} changes behind and its persistent searches were dropped",
+    ),
+    (
         "error.panic",
         "connection {peer} ended in an internal error; the listeners are unaffected",
     ),

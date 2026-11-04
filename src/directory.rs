@@ -473,6 +473,15 @@ pub fn entry_uuid(dn: &str) -> String {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, dn.as_bytes()).to_string()
 }
 
+/// Whether `entry_dn` is within `base_object` for this scope.
+///
+/// Public because a persistent search evaluates a change against the same rule a search used: one
+/// implementation, so a pushed entry cannot be in the content when a fresh search would not have
+/// returned it.
+pub fn in_scope_for(entry_dn: &str, base_object: &str, scope: Scope) -> bool {
+    in_scope(entry_dn, base_object, scope)
+}
+
 fn in_scope(entry_dn: &str, base_object: &str, scope: Scope) -> bool {
     match scope {
         Scope::Base => entry_dn == base_object,

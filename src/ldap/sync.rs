@@ -438,6 +438,35 @@ pub fn is_newer(csn: &str, since: &str) -> bool {
     csn > since
 }
 
+/// The `syncInfo` message that ends the refresh stage of a `refreshAndPersist` search.
+///
+/// `syncInfoValue ::= CHOICE { ... refreshPresent [2] SEQUENCE { cookie, refreshDone } }`: the
+/// present phase is what this server produces, and `refreshDone TRUE` is what tells the client the
+/// refresh is over and the persist stage begins. Without it the client waits for a `searchResDone`
+/// that will never come.
+pub fn info_refresh_present(cookie: Option<&[u8]>) -> rasn_ldap::LdapMessage {
+    let mut body = Vec::new();
+    if let Some(cookie) = cookie {
+        body.push(OCTET_STRING_TAG);
+        body.extend(encode_length(cookie.len()));
+        body.extend_from_slice(cookie);
+    }
+    body.extend_from_slice(&[BOOLEAN_TAG, 0x01, 0xff]);
+
+    // `refreshPresent` is `[2]`, context-tagged and constructed.
+    let mut inner = vec![0xa2];
+    inner.extend(encode_length(body.len()));
+    inner.extend_from_slice(&body);
+
+    rasn_ldap::LdapMessage::new(
+        0,
+        rasn_ldap::ProtocolOp::IntermediateResponse(rasn_ldap::IntermediateResponse {
+            response_name: Some(LdapOid::from(SYNC_OID.as_bytes())),
+            response_value: Some(rasn::types::OctetString::from(inner)),
+        }),
+    )
+}
+
 /// The sixteen octets of a `syncUUID`, from the entry's `entryUUID` text.
 ///
 /// `None` when the attribute is missing or is not a UUID: an entry whose identity cannot be stated
@@ -456,6 +485,21 @@ pub fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
     }
 
     Some(out)
+}
+
+/// One change, as a persistent search is told about it.
+///
+/// Deliberately the minimum a subscriber needs: what happened, to which DN, under which identity,
+/// and - for anything but a deletion - the entry as it stands. A subscriber that has to re-read the
+/// directory to answer a notification would be a poll wearing a push's clothes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub kind: crate::backend::redb_store::ChangeKind,
+    pub dn: String,
+    /// The entry's `entryUUID`, or one derived from the DN.
+    pub uuid: String,
+    /// `None` for a deletion.
+    pub entry: Option<crate::model::Entry>,
 }
 
 #[cfg(test)]

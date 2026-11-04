@@ -10,6 +10,12 @@ use tokio::sync::{RwLock, watch};
 use tokio::time::{Duration, MissedTickBehavior};
 
 use crate::backend::{Backend, BackendError, EntryChange};
+
+/// How many notices a slow subscriber may fall behind before it is told it lagged.
+///
+/// A buffer is not a history: the number bounds memory, and the recovery from falling behind is to
+/// re-read the directory, not to receive the backlog.
+pub const NOTICE_BUFFER: usize = 256;
 use crate::config::Config;
 use crate::directory::Directory;
 use crate::index::IndexConfig;
@@ -30,6 +36,14 @@ pub struct Source {
     schema_files: Vec<std::path::PathBuf>,
     schema_mode: SchemaMode,
     indexes: IndexConfig,
+    /// Where writes are announced, so a persistent search can be told about them.
+    ///
+    /// A broadcast channel and not a queue per subscriber: the number of listeners is not known
+    /// when the server starts, and one that falls behind must be told rather than silently
+    /// skipped over. A lagging subscriber gets `Lagged` and re-reads the directory, which is the
+    /// honest recovery - better than a stream of changes with a gap in the middle.
+    notices: tokio::sync::broadcast::Sender<crate::ldap::sync::Notice>,
+
     /// How many times the store has been read in full.
     ///
     /// An operator number - it says what the write path costs - and the thing a test can look at
@@ -74,6 +88,7 @@ impl Source {
             schema_files: config.schema_files.clone(),
             schema_mode: config.schema_mode,
             store_reads: std::sync::atomic::AtomicU64::new(1),
+            notices: tokio::sync::broadcast::channel(NOTICE_BUFFER).0,
         });
 
         Ok((source, directory))
@@ -148,6 +163,47 @@ impl Source {
         Arc::clone(&directory)
     }
 
+    /// Listens for writes.
+    ///
+    /// Subscribing before the initial refresh matters: a change that lands between the refresh and
+    /// the subscription would otherwise be lost for ever, and a replica would stay wrong until the
+    /// next full poll.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::ldap::sync::Notice> {
+        self.notices.subscribe()
+    }
+
+    /// Tells every listener what was just written.
+    ///
+    /// A failed send means nobody is listening, which is the normal case: a server with no
+    /// persistent searches has no subscribers.
+    fn announce(&self, changes: &[EntryChange]) {
+        for change in changes {
+            let notice = match change {
+                EntryChange::Upsert { entry } => crate::ldap::sync::Notice {
+                    kind: crate::backend::redb_store::ChangeKind::Modify,
+                    dn: entry.dn().to_string(),
+                    uuid: entry
+                        .attributes()
+                        .get(crate::model::ATTR_ENTRY_UUID)
+                        .and_then(|attribute| attribute.values.first().cloned())
+                        .unwrap_or_else(|| crate::directory::entry_uuid(entry.dn())),
+                    entry: Some(entry.clone()),
+                },
+                EntryChange::Delete { dn, .. } => crate::ldap::sync::Notice {
+                    kind: crate::backend::redb_store::ChangeKind::Delete,
+                    dn: dn.clone(),
+                    uuid: crate::directory::entry_uuid(dn),
+                    entry: None,
+                },
+                // A user or group change from a JSON backend: the directory re-reads it anyway, so
+                // there is no entry here to describe.
+                _ => continue,
+            };
+
+            let _ = self.notices.send(notice);
+        }
+    }
+
     /// Whether a password-hash upgrade could be persisted by this backend.
     ///
     /// Asked by the server once, at startup, so that a bind does not attempt a write the
@@ -186,10 +242,14 @@ impl Source {
         self.backend.apply(changes).await?;
 
         if let Some(entries) = self.apply_in_place(changes).await? {
+            self.announce(changes);
             return Ok(entries);
         }
 
-        self.reload().await
+        let entries = self.reload().await?;
+        self.announce(changes);
+
+        Ok(entries)
     }
 
     /// Applies a change set to the snapshot without reading the store, or reports that it cannot.

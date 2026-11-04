@@ -196,12 +196,50 @@ pub async fn serve_connection_as(
     let mut session = Session::new();
     session.set_encrypted(stream.is_encrypted());
 
+    // Persistent searches on this connection. Empty for every ordinary client, and in that case
+    // the loop below is exactly what it was: nothing is subscribed to and nothing is pushed.
+    let mut notifications = source.subscribe();
+    let mut persisted: Vec<crate::ldap::search::Subscription> = Vec::new();
+
     loop {
         // The stop signal is only watched while waiting for the NEXT message: an
         // operation already being answered is finished before the connection is
         // closed, which is what "graceful" has to mean for a client mid-search.
         let bytes = match tokio::select! {
             read = codec::read_message(&mut stream) => read,
+            // A change to push down one of the persistent searches. `Lagged` means this connection
+            // fell behind the buffer: the honest recovery is to let it re-read, which the client
+            // does when its cookie no longer matches, so the subscription is dropped rather than
+            // filled with a gap.
+            notice = notifications.recv(), if !persisted.is_empty() => {
+                match notice {
+                    Ok(notice) => {
+                        let directory = source.directory().await;
+                        let policy = security.current();
+                        for subscription in &persisted {
+                            for message in
+                                subscription.messages_for(&notice, &directory, &policy)
+                            {
+                                if codec::write_message(&mut stream, &message).await.is_err() {
+                                    return Ok(Hangup::PeerClosed);
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        eprintln!(
+                            "{}",
+                            crate::i18n::t(
+                                "error.sync_lagged",
+                                &[("peer", &peer), ("missed", &missed.to_string())]
+                            )
+                        );
+                        persisted.clear();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => persisted.clear(),
+                }
+                continue;
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
@@ -308,6 +346,18 @@ pub async fn serve_connection_as(
                         codec::write_message(&mut stream, &response).await?;
                     }
                 }
+            }
+            Action::Persisted {
+                messages,
+                subscription,
+            } => {
+                for message in &messages {
+                    codec::write_message(&mut stream, message).await?;
+                }
+                // Registered before the loop continues, so a change that lands while the answer is
+                // still being written is delivered rather than lost between the refresh and the
+                // subscription.
+                persisted.push(*subscription);
             }
             Action::PersistAfterReply { messages, changes } => {
                 for message in &messages {

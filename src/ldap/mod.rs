@@ -57,6 +57,15 @@ pub enum Action {
     /// decides whether the running process can adopt it, because that needs the configuration
     /// it started with and the policy handle - neither of which a handler holds.
     ConfigCommitted(Box<ConfigCommitted>),
+    /// Send these messages, then keep the search open and push what changes.
+    ///
+    /// Only a `refreshAndPersist` search produces this. The subscriber is registered *before* the
+    /// messages are sent, so a change that lands while the answer is being written is delivered
+    /// rather than lost between the refresh and the subscription.
+    Persisted {
+        messages: Vec<LdapMessage>,
+        subscription: Box<crate::ldap::search::Subscription>,
+    },
     /// Close the connection (unbind, protocol violation).
     Close,
 }
@@ -274,14 +283,57 @@ pub fn handle(
             Action::Close
         }
         ProtocolOp::AbandonRequest(_) => Action::Silent,
-        ProtocolOp::SearchRequest(request) => Action::Reply(search::handle_search(
-            session,
-            directory,
-            message_id,
-            &request,
-            controls.as_ref(),
-            security,
-        )),
+        ProtocolOp::SearchRequest(request) => {
+            let messages = search::handle_search(
+                session,
+                directory,
+                message_id,
+                &request,
+                controls.as_ref(),
+                security,
+            );
+
+            // A `refreshAndPersist` search that produced an answer stays open. The decision is
+            // taken here rather than inside the handler because the handler returns messages and
+            // this returns a plan for the connection - and because the subscription has to be
+            // registered before the answer is written, or a change landing while it is being
+            // written would be lost between the refresh and the subscription.
+            let persistent = controls.into_iter().flatten().any(|control| {
+                control.control_type.as_ref() == sync::SYNC_OID.as_bytes()
+                    && control
+                        .control_value
+                        .as_ref()
+                        .and_then(|value| sync::decode_request(value.as_ref()).ok())
+                        .is_some_and(|request| request.mode == sync::Mode::RefreshAndPersist)
+            });
+
+            // A refusal is not something to keep open: `messages` then carries a `searchResDone`
+            // with a failure code, and the client is told rather than left waiting.
+            // The `syncInfo` message is what says the refresh finished; a failure answer has a
+            // `searchResDone` instead and must not leave the search open.
+            let answered = messages
+                .iter()
+                .any(|message| matches!(message.protocol_op, ProtocolOp::IntermediateResponse(_)));
+
+            match (persistent, answered) {
+                (true, true) => Action::Persisted {
+                    messages,
+                    subscription: Box::new(search::Subscription {
+                        message_id,
+                        base_object: request.base_object.0.to_string(),
+                        scope: search::scope_of(&request),
+                        filter: request.filter.clone(),
+                        requester: session.requester(),
+                        selection: request
+                            .attributes
+                            .iter()
+                            .map(|attribute| attribute.0.clone())
+                            .collect(),
+                    }),
+                },
+                _ => Action::Reply(messages),
+            }
+        }
         ProtocolOp::CompareRequest(request) => Action::Reply(vec![compare::handle_compare(
             session, directory, message_id, &request, security,
         )]),

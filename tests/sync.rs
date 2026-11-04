@@ -328,30 +328,133 @@ async fn a_refresh_only_answer_names_every_entry_and_ends_with_a_done() {
 }
 
 #[tokio::test]
-async fn refresh_and_persist_is_refused_with_a_code_that_says_what_to_do() {
-    // The honest answer. A refreshOnly stream the client waits on forever would look like a
-    // working replica that never updates.
+async fn a_persistent_search_is_answered_and_then_pushes_what_changes() {
+    // RFC 4533 §1.3.2: the refresh stage ends with a `syncInfo` message rather than a
+    // `searchResDone`, and after it the server pushes changes on the same connection.
     let url = serve(vec![person("alice")]).await;
     let client = Client::connect(&url, Options::default())
         .await
         .expect("connect");
 
-    let outcome = client.search_with(search(), vec![sync_control(3)]).await;
+    let (refresh, id) = client
+        .search_persist(search(), vec![sync_control(3)])
+        .await
+        .expect("persistent refresh");
 
-    match outcome {
-        Ok((messages, _)) => panic!(
-            "must not answer an unsupported mode with entries: {:?}",
-            result_code(&messages)
+    assert!(
+        states(&refresh)
+            .iter()
+            .any(|(dn, _)| dn == "cn=alice,ou=users,dc=example,dc=com"),
+        "the refresh stage sends the content as usual"
+    );
+    assert!(
+        matches!(
+            refresh.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::IntermediateResponse(_))
         ),
-        Err(rust_rest_ldap::client::Error::Server { code, message }) => {
-            assert_eq!(code, ResultCode::UnwillingToPerform);
-            assert!(
-                message.contains("refreshOnly"),
-                "the message says what to ask for instead: {message}"
-            );
-        }
-        Err(other) => panic!("unexpected failure: {other}"),
-    }
+        "the refresh ends with syncInfo, not with searchResDone - the search is not over"
+    );
+
+    // A write, from another client, as a replica would see it.
+    let other = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+    let new_dn = "cn=bob,ou=users,dc=example,dc=com";
+    // Not `person`: that is stamped with operational attributes, and RFC 4511 forbids a client
+    // from supplying those.
+    let added = raw_person("bob");
+    other
+        .request(
+            ProtocolOp::AddRequest(rasn_ldap::AddRequest {
+                entry: LdapDn::from(new_dn),
+                attributes: added
+                    .attributes()
+                    .values()
+                    .iter()
+                    .filter(|attribute| !attribute.values.is_empty())
+                    .map(|attribute| {
+                        rasn_ldap::Attribute::new(
+                            rasn_ldap::AttributeDescription::from(attribute.name.to_string()),
+                            rasn::types::SetOf::from_vec(
+                                attribute
+                                    .values
+                                    .iter()
+                                    .map(|value| {
+                                        rasn_ldap::AttributeValue::from(value.as_bytes().to_vec())
+                                    })
+                                    .collect(),
+                            ),
+                        )
+                    })
+                    .collect(),
+            }),
+            "add response",
+        )
+        .await
+        .expect("add");
+
+    // The push arrives without anyone asking again: that is the difference between this and a
+    // poll.
+    let pushed = tokio::time::timeout(std::time::Duration::from_secs(5), client.next_change())
+        .await
+        .expect("a change must be pushed, not waited for")
+        .expect("no transport error")
+        .expect("a message");
+
+    assert_eq!(pushed.message_id, id, "it belongs to the persistent search");
+    let entries = synchronised(std::slice::from_ref(&pushed));
+    assert_eq!(entries.len(), 1, "one pushed entry");
+    assert_eq!(entries[0].0, new_dn);
+    assert_eq!(entries[0].1.state, State::Add, "a new entry arrives as add");
+    assert!(
+        entries[0].2 > 0,
+        "and with its attributes, or the client cannot apply it"
+    );
+}
+
+#[tokio::test]
+async fn a_persistent_search_is_told_about_a_deletion_it_did_not_ask_about() {
+    // The half of replication that a refresh cannot express: an entry that is gone leaves no
+    // trace in the directory, so only a push can say so.
+    let url = serve(vec![person("alice"), person("bob")]).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (_, id) = client
+        .search_persist(search(), vec![sync_control(3)])
+        .await
+        .expect("persistent refresh");
+
+    let other = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+    other
+        .request(
+            ProtocolOp::DelRequest(rasn_ldap::DelRequest(LdapDn::from(
+                "cn=bob,ou=users,dc=example,dc=com",
+            ))),
+            "delete response",
+        )
+        .await
+        .expect("delete");
+
+    let pushed = tokio::time::timeout(std::time::Duration::from_secs(5), client.next_change())
+        .await
+        .expect("a deletion must be pushed")
+        .expect("no transport error")
+        .expect("a message");
+
+    assert_eq!(pushed.message_id, id);
+    let entries = synchronised(std::slice::from_ref(&pushed));
+    assert_eq!(
+        entries.len(),
+        1,
+        "an empty entry carrying the state is how a removal is sent (RFC 4533 §1.3.2)"
+    );
+    assert_eq!(entries[0].0, "cn=bob,ou=users,dc=example,dc=com");
+    assert_eq!(entries[0].1.state, State::Delete);
+    assert_eq!(entries[0].2, 0, "a deletion carries no attributes");
 }
 
 #[tokio::test]
