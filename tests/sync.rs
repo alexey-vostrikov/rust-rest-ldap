@@ -29,6 +29,17 @@ use rust_rest_ldap::security::Security;
 const BASE: &str = "dc=example,dc=com";
 
 fn person(cn: &str) -> Entry {
+    // Stamped, because that is what an entry written through the protocol always is: `entryCSN`
+    // is what a resumed refresh compares against, and an entry without one cannot be called
+    // unchanged.
+    rust_rest_ldap::operational::stamp_write(
+        &raw_person(cn),
+        "cn=admin,dc=example,dc=com",
+        std::time::SystemTime::now(),
+    )
+}
+
+fn raw_person(cn: &str) -> Entry {
     Entry::new(
         format!("cn={cn},ou=users,dc=example,dc=com"),
         Attributes::new()
@@ -74,6 +85,9 @@ async fn serve(entries: Vec<Entry>) -> String {
                 "read".to_string(),
                 "search".to_string(),
                 "compare".to_string(),
+                // The changed-entry test writes through the protocol, so the policy has to allow
+                // it - a modify refused by the ACL looks exactly like one that did nothing.
+                "write".to_string(),
             ],
         }]))
         .expect("acl"),
@@ -151,6 +165,38 @@ fn search() -> SearchRequest {
     )
 }
 
+/// The `syncRequest` control with a cookie: a client that already has a copy, asking for what
+/// changed since.
+fn sync_control_resuming(mode: u8, cookie: &[u8]) -> Control {
+    let mut body = vec![0x0a, 0x01, mode, 0x04];
+    body.push(cookie.len() as u8);
+    body.extend_from_slice(cookie);
+
+    let mut value = vec![0x30];
+    value.push(body.len() as u8);
+    value.extend_from_slice(&body);
+
+    Control::new(
+        LdapOid::from(sync::SYNC_OID.as_bytes()),
+        true,
+        Some(OctetString::from(value)),
+    )
+}
+
+/// A paged-results control, so a refresh can be made deliberately incomplete.
+fn paged_control(size: u32) -> Control {
+    let mut value = vec![0x30, 0x05, 0x02, 0x01, size as u8, 0x04, 0x00];
+    value.truncate(7);
+
+    Control::new(
+        LdapOid::from(b"1.2.840.113556.1.4.319".as_slice()),
+        true,
+        Some(OctetString::from(vec![
+            0x30, 0x05, 0x02, 0x01, size as u8, 0x04, 0x00,
+        ])),
+    )
+}
+
 /// The `syncRequest` control, as a client writes it: `SEQUENCE { ENUMERATED mode }`.
 fn sync_control(mode: u8) -> Control {
     Control::new(
@@ -173,6 +219,29 @@ fn states(messages: &[rasn_ldap::LdapMessage]) -> Vec<(String, sync::SyncState)>
                 let value = control.control_value.as_ref()?;
                 let state = sync::decode_state(value.as_ref()).expect("a decodable state");
                 Some((entry.object_name.0.to_string(), state))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every entry of a synchronised answer with its state and how many attributes it carried.
+fn synchronised(messages: &[rasn_ldap::LdapMessage]) -> Vec<(String, sync::SyncState, usize)> {
+    messages
+        .iter()
+        .filter_map(|message| match &message.protocol_op {
+            ProtocolOp::SearchResEntry(entry) => {
+                let control =
+                    message.controls.as_ref()?.iter().find(|control| {
+                        control.control_type.as_ref() == sync::SYNC_OID.as_bytes()
+                    })?;
+                let value = control.control_value.as_ref()?;
+                let state = sync::decode_state(value.as_ref()).expect("a decodable state");
+                Some((
+                    entry.object_name.0.to_string(),
+                    state,
+                    entry.attributes.len(),
+                ))
             }
             _ => None,
         })
@@ -226,9 +295,9 @@ async fn a_refresh_only_answer_names_every_entry_and_ends_with_a_done() {
     for (dn, state) in &states {
         assert_eq!(
             state.state,
-            State::Present,
-            "{dn}: a full refresh describes what is there; without history there is nothing to \
-             report as added or modified"
+            State::Add,
+            "{dn}: RFC 4533 §1.3.1 - an entry the client does not have goes as add, with its \
+             attributes"
         );
         assert_ne!(
             state.uuid, [0u8; 16],
@@ -371,6 +440,245 @@ async fn an_entry_without_a_stored_uuid_still_gets_a_stable_identity() {
         Some(uuid),
         "the identity of an entry is a property of the entry, not of the answer"
     );
+}
+
+#[tokio::test]
+async fn a_complete_refresh_asks_the_client_to_prune_what_it_was_not_sent() {
+    // RFC 4533 §1.3.1: `refreshDeletes` FALSE means "drop every entry I did not identify as
+    // present". That is how a refreshOnly answer reports a deletion at all - and it is only safe
+    // when the answer is the whole content, which an unpaged, unlimited one is.
+    let url = serve(vec![person("alice"), person("bob")]).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (messages, _) = client
+        .search_with(search(), vec![sync_control(1)])
+        .await
+        .expect("refresh");
+
+    assert!(
+        !done(&messages).expect("done").1,
+        "a complete refresh prunes: an entry the client holds and did not get back is gone"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_refresh_sends_only_the_changes_with_their_attributes() {
+    // The payoff of the journal and the CSN cookie, and the reason the two exist: an unchanged
+    // entry goes back as an **empty** entry with state `present`, so a poll costs the changes
+    // rather than the directory - while the client still learns which entries are still there.
+    let url = serve(vec![person("alice"), person("bob")]).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (first, _) = client
+        .search_with(search(), vec![sync_control(1)])
+        .await
+        .expect("first refresh");
+    let cookie = done(&first)
+        .and_then(|(cookie, _)| cookie)
+        .expect("a cookie");
+    // The cookie carries the CSN, not only the snapshot: without it a resume cannot tell which
+    // entries changed.
+    let (_, csn) = sync::decode_cookie(&cookie).expect("a cookie of ours");
+    assert!(
+        csn.is_some(),
+        "the journal exists, so the cookie must say how far it had got"
+    );
+
+    // A second refresh over an untouched directory: everything is unchanged.
+    let (second, _) = client
+        .search_with(search(), vec![sync_control_resuming(1, &cookie)])
+        .await
+        .expect("resumed refresh");
+
+    let entries: Vec<(String, sync::SyncState, usize)> = synchronised(&second);
+    assert!(
+        !entries.is_empty(),
+        "the client is told what is still there"
+    );
+    // A user entry is stamped with `entryCSN` on every write, so it can be reported unchanged: a
+    // `present` state and no attributes, which is what makes a poll cost the changes rather than
+    // the directory.
+    let (_, state, attributes) = entries
+        .iter()
+        .find(|(dn, _, _)| dn == "cn=alice,ou=users,dc=example,dc=com")
+        .expect("alice is in the answer");
+    assert_eq!(
+        state.state,
+        State::Present,
+        "unchanged since the cookie, so present rather than add"
+    );
+    assert_eq!(*attributes, 0, "an unchanged entry carries no attributes");
+
+    // What is sent in full is what cannot be called unchanged. The directory synthesises the
+    // naming context and the two units, and those carry no `entryCSN`, so there is nothing to
+    // compare: they go as `add` with their attributes. Three entries per poll, and honest -
+    // claiming "unchanged" about them would be a guess.
+    assert!(
+        entries
+            .iter()
+            .filter(|(dn, _, _)| !dn.starts_with("cn="))
+            .all(|(_, state, _)| state.state == State::Add),
+        "entries without a CSN are sent in full: {:?}",
+        entries
+            .iter()
+            .map(|(dn, state, _)| (dn.clone(), state.state))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !done(&second).expect("done").1,
+        "the answer is still complete, so pruning stays safe"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_refresh_sends_a_changed_entry_with_its_attributes() {
+    let url = serve(vec![person("alice")]).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (first, _) = client
+        .search_with(search(), vec![sync_control(1)])
+        .await
+        .expect("first refresh");
+    let cookie = done(&first)
+        .and_then(|(cookie, _)| cookie)
+        .expect("a cookie");
+
+    // One write through the protocol, which stamps a newer entryCSN.
+    let mut changed = person("alice");
+    changed = rust_rest_ldap::operational::stamp_write(
+        &changed,
+        "cn=admin,dc=example,dc=com",
+        std::time::SystemTime::now() + std::time::Duration::from_secs(1),
+    );
+    let dn = changed.dn().to_string();
+    let responses = client
+        .request(
+            ProtocolOp::ModifyRequest(rasn_ldap::ModifyRequest {
+                object: LdapDn::from(dn.as_str()),
+                changes: vec![rasn_ldap::ModifyRequestChanges {
+                    operation: rasn_ldap::ChangeOperation::Replace,
+                    modification: rasn_ldap::PartialAttribute::new(
+                        rasn_ldap::AttributeDescription::from("sn"),
+                        rasn::types::SetOf::from_vec(vec![rasn_ldap::AttributeValue::from(
+                            b"Changed".as_slice(),
+                        )]),
+                    ),
+                }],
+            }),
+            "modify response",
+        )
+        .await
+        .expect("modify");
+
+    // `request` does not fail on a non-success result code, so the code is checked here: a
+    // refused modify would otherwise read as "the entry did not change", which is exactly the
+    // assertion this test makes about the server.
+    let modified_code = responses
+        .iter()
+        .find_map(|message| match &message.protocol_op {
+            ProtocolOp::ModifyResponse(response) => Some(response.0.result_code),
+            _ => None,
+        })
+        .expect("a modify response");
+    assert_eq!(
+        modified_code,
+        ResultCode::Success,
+        "the modify has to be accepted for the test to be about synchronisation"
+    );
+
+    let (second, _) = client
+        .search_with(search(), vec![sync_control_resuming(1, &cookie)])
+        .await
+        .expect("resumed refresh");
+
+    let entries = synchronised(&second);
+    let (_, state, attributes) = entries
+        .iter()
+        .find(|(found, _, _)| found == &dn)
+        .expect("the changed entry is in the answer");
+
+    assert_eq!(state.state, State::Add, "changed since the cookie");
+    assert!(
+        *attributes > 0,
+        "a changed entry is sent with its attributes, or the client cannot apply the change"
+    );
+}
+
+#[tokio::test]
+async fn a_paged_refresh_refuses_to_let_the_client_prune() {
+    // The reason this matters: with paging, entries are left out because they did not fit the
+    // page - not because they were deleted. Signalling deletes there would make a client delete
+    // live entries, and nothing would say so.
+    let url = serve(vec![person("alice"), person("bob"), person("carol")]).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (first, _) = client
+        .search_with(search(), vec![sync_control(1)])
+        .await
+        .expect("first refresh");
+    let cookie = done(&first)
+        .and_then(|(cookie, _)| cookie)
+        .expect("a cookie");
+
+    let (second, _) = client
+        .search_with(
+            search(),
+            vec![sync_control_resuming(1, &cookie), paged_control(1)],
+        )
+        .await
+        .expect("paged refresh");
+
+    assert!(
+        done(&second).expect("done").1,
+        "a page is not the whole directory, so the client must keep what it has instead of \
+         pruning what it was not sent"
+    );
+}
+
+#[tokio::test]
+async fn a_size_limited_refresh_is_an_error_to_the_client_so_no_delete_hint_reaches_it() {
+    let url = serve(vec![person("alice"), person("bob"), person("carol")]).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (first, _) = client
+        .search_with(search(), vec![sync_control(1)])
+        .await
+        .expect("first refresh");
+    let cookie = done(&first)
+        .and_then(|(cookie, _)| cookie)
+        .expect("a cookie");
+
+    let mut limited = search();
+    limited.size_limit = 1;
+
+    let outcome = client
+        .search_with(limited, vec![sync_control_resuming(1, &cookie)])
+        .await;
+
+    // The client refuses the answer as a whole, which is the strongest form of "the absence of an
+    // entry proves nothing": it never gets as far as reconciling. The server, for its part, does
+    // not set `refreshDeletes` on an answer it cut short - the two halves agree, and neither
+    // invites a client to delete a live entry.
+    match outcome {
+        Err(rust_rest_ldap::client::Error::Server { code, .. }) => {
+            assert_eq!(code, ResultCode::SizeLimitExceeded);
+        }
+        Ok((messages, _)) => panic!(
+            "a size-limited answer must not be accepted: {:?}",
+            result_code(&messages)
+        ),
+        Err(other) => panic!("unexpected failure: {other}"),
+    }
 }
 
 #[tokio::test]

@@ -411,6 +411,33 @@ pub fn done_control(cookie: Option<&[u8]>, refresh_deletes: bool) -> Control {
     )
 }
 
+/// The cookie this server hands out: `<snapshot>:<csn>`.
+///
+/// Two numbers for the same reason paging has two: the snapshot says which directory the answer
+/// was cut from, and the CSN says how far the change journal had got. The CSN is what makes a
+/// resumed refresh cheap - entries whose `entryCSN` is not newer than it are unchanged, and can be
+/// reported as empty `present` entries instead of being sent again.
+///
+/// RFC 4533 §2.4 leaves the cookie opaque, so its shape is this server's business.
+pub fn encode_cookie(snapshot: u64, csn: Option<&str>) -> Vec<u8> {
+    format!("{snapshot}:{}", csn.unwrap_or("")).into_bytes()
+}
+
+/// A cookie as this server issued it.
+pub fn decode_cookie(value: &[u8]) -> Option<(u64, Option<String>)> {
+    let text = std::str::from_utf8(value).ok()?;
+    let (snapshot, csn) = text.split_once(':')?;
+    let snapshot: u64 = snapshot.parse().ok()?;
+
+    Some((snapshot, (!csn.is_empty()).then(|| csn.to_string())))
+}
+
+/// Whether `csn` is newer than `since`. Both are fixed-width `entryCSN` values, so text order is
+/// chronological order - the same property the journal keys rely on.
+pub fn is_newer(csn: &str, since: &str) -> bool {
+    csn > since
+}
+
 /// The sixteen octets of a `syncUUID`, from the entry's `entryUUID` text.
 ///
 /// `None` when the attribute is missing or is not a UUID: an entry whose identity cannot be stated
@@ -597,6 +624,45 @@ mod tests {
             decode_done(&encode_done(Some(b"c9"), true)),
             Ok((Some(b"c9".to_vec()), true))
         );
+    }
+
+    #[test]
+    fn a_cookie_carries_the_snapshot_and_the_csn() {
+        assert_eq!(
+            encode_cookie(7, Some("20261102143012.000001Z#000006#000#000000")),
+            b"7:20261102143012.000001Z#000006#000#000000".to_vec()
+        );
+        assert_eq!(
+            decode_cookie(b"7:20261102143012.000001Z#000006#000#000000"),
+            Some((
+                7,
+                Some("20261102143012.000001Z#000006#000#000000".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn a_cookie_without_a_csn_says_so_rather_than_inventing_one() {
+        // The case of a store with no journal: the client gets a cookie it can hand back, but the
+        // server must not pretend to know how far the history had got.
+        assert_eq!(decode_cookie(&encode_cookie(3, None)), Some((3, None)));
+    }
+
+    #[test]
+    fn a_cookie_that_is_not_ours_is_not_guessed_at() {
+        assert_eq!(decode_cookie(b"nonsense"), None);
+        assert_eq!(decode_cookie(b"7"), None);
+        assert_eq!(decode_cookie(b"x:"), None);
+    }
+
+    #[test]
+    fn csns_compare_by_text_because_they_are_fixed_width() {
+        let earlier = "20261102143012.000001Z#000001#000#000000";
+        let later = "20261102143012.000002Z#000001#000#000000";
+
+        assert!(is_newer(later, earlier));
+        assert!(!is_newer(earlier, later));
+        assert!(!is_newer(earlier, earlier), "equal is not newer");
     }
 
     #[test]

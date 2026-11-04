@@ -53,6 +53,13 @@ pub struct Directory {
     /// The cookie carries this number too, so a page that continues a snapshot which no longer
     /// exists is refused instead of answered wrongly.
     snapshot: u64,
+    /// How far the change journal had got when this snapshot was built.
+    ///
+    /// A synchronised search hands it to the client in a cookie, and compares it with each
+    /// entry's `entryCSN` to tell "changed since you last asked" from "unchanged". It rides here
+    /// because the snapshot and the journal head have to describe the same moment: a head from a
+    /// later write would claim the client has changes it has not been sent.
+    csn: Option<String>,
 }
 
 impl Directory {
@@ -119,6 +126,22 @@ impl Directory {
     /// Sets the snapshot number on a directory that is being patched in place.
     pub fn set_snapshot(&mut self, snapshot: u64) {
         self.snapshot = snapshot;
+    }
+
+    /// The same directory, knowing how far the change journal had got.
+    pub fn with_csn(mut self, csn: Option<String>) -> Self {
+        self.csn = csn;
+        self
+    }
+
+    /// Records how far the change journal has got, on a directory being patched in place.
+    pub fn set_csn(&mut self, csn: Option<String>) {
+        self.csn = csn;
+    }
+
+    /// How far the change journal had got when this snapshot was built.
+    pub fn csn(&self) -> Option<&str> {
+        self.csn.as_deref()
     }
 
     pub fn snapshot(&self) -> u64 {
@@ -211,6 +234,7 @@ impl Directory {
             // Zero until the source that built it says which snapshot this is: a directory
             // built by hand in a test has no history to be inconsistent with.
             snapshot: 0,
+            csn: None,
             index: Arc::new(Index::default()),
         }
     }

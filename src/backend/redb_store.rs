@@ -480,11 +480,35 @@ impl RedbBackend {
     }
 
     /// The newest CSN in the journal, if there is one.
+    ///
+    /// The last key, not a scan: this is asked on every synchronised search, and the whole point
+    /// of a fixed-width key is that the newest one is at the end.
     pub fn journal_head(&self) -> Result<Option<String>, BackendError> {
-        Ok(self
-            .journal_since(None)?
-            .last()
-            .map(|record| record.csn.clone()))
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+
+        let table = match transaction.open_table(CHANGES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(source) => {
+                return Err(BackendError::Redb {
+                    path: "<changes>".to_string(),
+                    reason: source.to_string(),
+                });
+            }
+        };
+
+        let last = table.last().map_err(|source| BackendError::Redb {
+            path: "<changes>".to_string(),
+            reason: source.to_string(),
+        })?;
+
+        Ok(last.map(|(key, _)| key.value().to_string()))
     }
 
     /// How many records the journal holds.
