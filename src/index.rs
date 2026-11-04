@@ -458,6 +458,22 @@ impl Index {
     ///
     /// `entries` must be in canonical order: the position is the entry id.
     pub fn build(entries: &[Entry], config: &IndexConfig) -> Result<Self, IndexError> {
+        // Ids in canonical order, which is what a directory assembled from scratch issues.
+        let ids: Vec<u32> = (0..entries.len() as u32).collect();
+        Self::build_for(entries, &ids, config)
+    }
+
+    /// Builds the index with the ids the directory has issued.
+    ///
+    /// The id is not the position. A position moves when an entry is added or removed before it,
+    /// and an index built over positions would have to be rewritten whole on every insert;
+    /// [`crate::directory::Directory`] keeps the two apart, and this is where the index learns
+    /// which number belongs to which entry.
+    pub fn build_for(
+        entries: &[Entry],
+        ids: &[u32],
+        config: &IndexConfig,
+    ) -> Result<Self, IndexError> {
         let plan = config.resolve()?;
         let default_kinds = plan.get(DEFAULT_KEY).cloned().unwrap_or_default();
         let per_attribute: BTreeMap<String, BTreeSet<Kind>> = plan
@@ -478,7 +494,8 @@ impl Index {
         };
 
         for (position, entry) in entries.iter().enumerate() {
-            index.touch(position as u32, entry, &per_attribute, Touch::Add);
+            let id = ids.get(position).copied().unwrap_or(position as u32);
+            index.touch(id, entry, &per_attribute, Touch::Add);
         }
 
         Ok(index)
