@@ -285,8 +285,26 @@ pub fn handle_add(
         .unwrap_or_default();
     let stamped = crate::operational::stamp_write(&entry, &actor, std::time::SystemTime::now());
 
+    // A group created with members gives each of them a `memberOf`, in the same change set. The
+    // members are stamped too: their entry changed, and a change that is not stamped is one a
+    // replica cannot order.
+    let mut changes = vec![EntryChange::Upsert {
+        entry: stamped.clone(),
+    }];
+    if security.integrity.referential_integrity {
+        for member in crate::integrity::member_of_changes(directory, None, Some(&stamped)) {
+            changes.push(EntryChange::Upsert {
+                entry: crate::operational::stamp_write(
+                    &member,
+                    &actor,
+                    std::time::SystemTime::now(),
+                ),
+            });
+        }
+    }
+
     Outcome::Persist {
-        changes: vec![EntryChange::Upsert { entry: stamped }],
+        changes,
         success: response(ResultCode::Success, ""),
     }
 }
@@ -365,6 +383,21 @@ pub fn handle_delete(
     if let Some(entry) = removed.filter(|_| security.integrity.referential_integrity) {
         for group in crate::integrity::changes_for_removed(directory, entry) {
             changes.push(EntryChange::Upsert { entry: group });
+        }
+
+        // A group that goes away leaves no DN for its members to point at.
+        let actor = session
+            .identity()
+            .map(|identity| identity.dn.clone())
+            .unwrap_or_default();
+        for member in crate::integrity::member_of_changes(directory, Some(entry), None) {
+            changes.push(EntryChange::Upsert {
+                entry: crate::operational::stamp_write(
+                    &member,
+                    &actor,
+                    std::time::SystemTime::now(),
+                ),
+            });
         }
     }
 
@@ -517,6 +550,12 @@ pub fn handle_modify_dn(
     if security.integrity.referential_integrity {
         for group in crate::integrity::retarget_members(directory, entry, &renamed) {
             changes.push(EntryChange::Upsert { entry: group });
+        }
+
+        // The same question from the other side: a group that moved has a new DN, and every
+        // member's `memberOf` still names the old one.
+        for member in crate::integrity::member_of_changes(directory, Some(entry), Some(&renamed)) {
+            changes.push(EntryChange::Upsert { entry: member });
         }
     }
 

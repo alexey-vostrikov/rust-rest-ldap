@@ -126,7 +126,7 @@ fn rejection(session: &Session, dn: &str, changes: Vec<ModifyRequestChanges>) ->
 /// The entry a request would store.
 fn persisted(session: &Session, dn: &str, changes: Vec<ModifyRequestChanges>) -> Entry {
     match run(session, dn, changes) {
-        Outcome::Persist { entry, success } => {
+        Outcome::Persist { entry, success, .. } => {
             assert_eq!(code(&success), ResultCode::Success);
             entry
         }

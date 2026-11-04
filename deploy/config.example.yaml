@@ -79,6 +79,9 @@ indexes:
   default: [pres]
   attributes:
     objectClass: [eq, pres]
+    # `memberOf` is what a client asks to find out who is in a group, and the value is a DN,
+    # so equality is the whole query shape: `(memberOf=cn=admins,ou=groups,…)`.
+    memberOf: [eq]
     uid: [eq]
     cn: [eq, pres]
     sn: [eq]

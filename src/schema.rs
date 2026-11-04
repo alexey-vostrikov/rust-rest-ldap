@@ -1155,9 +1155,14 @@ attributetype ( 1.3.6.1.1.1.1.6 NAME 'room' SUP name )
 attributetype ( 1.3.6.1.1.1.1.9 NAME 'host' SUP name )
 attributetype ( 1.3.6.1.1.1.1.5 NAME 'memberUid' EQUALITY caseExactIA5Match SUBSTR caseExactIA5SubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 )
 attributetype ( 2.5.4.31 NAME 'member' SUP distinguishedName )
-# gorestldap fills memberOf with group names, not DNs: the port keeps that
-# contract, so the syntax here is text rather than distinguishedName.
-attributetype ( 1.2.840.113556.1.2.102 NAME 'memberOf' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+# memberOf names the groups an entry belongs to, by DN: that is what AD, OpenLDAP's memberof
+# overlay and 389 DS publish, and what SSSD, Samba and the panels that read a directory ask
+# for. gorestldap wrote a bare group name here, which cannot name one group when two units
+# hold a group of the same name - and no directory client queries a bare name.
+#
+# Operational, because the server maintains it from the group side: a client that could write
+# it would be able to declare itself a member of anything.
+attributetype ( 1.2.840.113556.1.4.222 NAME 'memberOf' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 NO-USER-MODIFICATION USAGE directoryOperation )
 attributetype ( 2.5.4.45 NAME ( 'x500UniqueIdentifier' ) SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
 attributetype ( 1.3.6.1.1.16.4 NAME 'entryUUID' EQUALITY uuidMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )
 # entryCSN and entryUUID are operational in OpenLDAP as well; without USAGE the

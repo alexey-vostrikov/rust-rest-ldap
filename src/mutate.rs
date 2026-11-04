@@ -105,7 +105,7 @@ fn apply_one(
     schema: Option<&Schema>,
 ) -> Result<(), MutateError> {
     let name = modification.attribute.to_lowercase();
-    check_editable(attributes, modification)?;
+    check_editable(attributes, modification, schema)?;
 
     match modification.op {
         Op::Add => add(attributes, modification, &name, schema),
@@ -253,11 +253,32 @@ fn replace(
 }
 
 /// Refuses changes to attributes the server owns or has hidden.
-fn check_editable(attributes: &Attributes, modification: &Modification) -> Result<(), MutateError> {
+///
+/// Two sources, and both are needed. The flag on the entry says how this value is held; the
+/// schema says what the attribute *is*. Checking only the entry let a client add an attribute the
+/// server maintains whenever the entry did not carry it yet - so `memberOf` was writable on any
+/// entry not already in a group, which is exactly the case an attacker picks, and a live run
+/// missed it because there the value was already there.
+fn check_editable(
+    attributes: &Attributes,
+    modification: &Modification,
+    schema: Option<&Schema>,
+) -> Result<(), MutateError> {
     let name = modification.attribute.to_lowercase();
 
     if name == "entrydn" {
         return Err(MutateError::Protected(modification.attribute.clone()));
+    }
+
+    // The published schema is the contract a client can read: an attribute declared
+    // NO-USER-MODIFICATION, or operational (which RFC 4512 says a client may not write), is the
+    // server's whatever this particular entry happens to carry.
+    if let Some(definition) = schema.and_then(|schema| schema.resolved(&name))
+        && (definition.no_user_modification || definition.operational)
+    {
+        return Err(MutateError::NotUserModifiable(
+            modification.attribute.clone(),
+        ));
     }
 
     let Some(attribute) = attributes.get(&name) else {

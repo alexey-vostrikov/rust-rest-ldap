@@ -348,11 +348,21 @@ pub fn handle(
                 security,
             ) {
                 modify::Outcome::Reject(message) => Action::Reply(vec![message]),
-                modify::Outcome::Persist { entry, success } => {
+                modify::Outcome::Persist {
+                    entry,
+                    extra,
+                    success,
+                } => {
                     let note = Note::new(ChangeKind::Modify, entry.dn(), actor(session));
 
+                    // The entry the client addressed first, then the members whose `memberOf`
+                    // followed it: one transaction, and the journal line names the entry the
+                    // request was about.
+                    let mut changes = vec![EntryChange::Upsert { entry }];
+                    changes.extend(extra.into_iter().map(|entry| EntryChange::Upsert { entry }));
+
                     Action::Persist(Box::new(PersistAction {
-                        changes: vec![EntryChange::Upsert { entry }],
+                        changes,
                         success,
                         message_id,
                         failure: FailureResponse::Modify,
