@@ -35,9 +35,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No toolchain input: the action reads rust-toolchain.toml, so the version here is the one
-      # the project pins, not a second place to keep in step.
+      # The pinned version is read from rust-toolchain.toml rather than repeated here, so there is
+      # still one place to change it. It has to be passed explicitly: dtolnay/rust-toolchain does
+      # not read the file itself, and without a toolchain input it fails on every run with
+      # "'toolchain' is a required input" - which is why this workflow was red from the start.
+      - name: toolchain version
+        id: rust
+        run: |
+          channel=$(awk -F'"' '/^channel/ { print $2; exit }' rust-toolchain.toml)
+          test -n "$channel" || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -55,7 +66,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: toolchain version
+        id: rust
+        run: |
+          channel=$(awk -F'"' '/^channel/ { print $2; exit }' rust-toolchain.toml)
+          test -n "$channel" || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           # A different profile builds different artefacts; sharing the key would evict the
