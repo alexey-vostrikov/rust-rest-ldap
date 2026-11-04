@@ -72,7 +72,8 @@ impl Source {
         // reload: a synchronised search hands it to the client, and a missing head would make a
         // resumed refresh send the whole directory again.
         let head = backend.journal_head()?;
-        let directory = Arc::new(directory.with_csn(head));
+        let floor = backend.journal_floor()?;
+        let directory = Arc::new(directory.with_csn(head).with_floor(floor));
 
         check_schema(&directory, &config.schema, config.schema_mode)?;
 
@@ -202,6 +203,15 @@ impl Source {
 
             let _ = self.notices.send(notice);
         }
+    }
+
+    /// Trims the journal to its newest `keep` records.
+    ///
+    /// Called at startup and never while serving: pruning is a decision about how far back this
+    /// node can answer, and doing it mid-flight would move the floor under a peer that is reading
+    /// it. A node that wants a smaller journal restarts.
+    pub fn prune_journal(&self, keep: usize) -> Result<usize, BackendError> {
+        self.backend.journal_prune(keep)
     }
 
     /// The oldest change the journal still holds.
@@ -354,6 +364,7 @@ impl Source {
 
         directory.set_snapshot(snapshot);
         directory.set_csn(self.backend.journal_head()?);
+        directory.set_floor(self.backend.journal_floor()?);
         let entries = directory
             .entries(&self.base_dn, crate::directory::Scope::Subtree)
             .len();
@@ -416,7 +427,11 @@ impl Source {
         // The journal head is taken with the snapshot for the same reason the snapshot number is:
         // a head from a later write would tell a replica it has changes nobody sent it.
         let head = self.backend.journal_head()?;
-        let directory = directory.at_snapshot(snapshot).with_csn(head);
+        let floor = self.backend.journal_floor()?;
+        let directory = directory
+            .at_snapshot(snapshot)
+            .with_csn(head)
+            .with_floor(floor);
 
         *self.current.write().await = Arc::new(directory);
 
@@ -609,6 +624,7 @@ mod tests {
             referrals: Default::default(),
             server_id: 0,
             peers: Vec::new(),
+            journal_keep: None,
             acl: Default::default(),
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),

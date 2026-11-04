@@ -401,6 +401,10 @@ const ENGLISH: &[(&str, &str)] = &[
     ("start.shutting_down", "shutting down"),
     ("start.export_done", "exported {entries} entries to {path}"),
     (
+        "start.journal_pruned",
+        "journal: dropped {removed} of the oldest change records, as replication.journal_keep says",
+    ),
+    (
         "start.http",
         "http: listening on {addr} (health, metrics, callback)",
     ),
@@ -447,6 +451,11 @@ const ENGLISH: &[(&str, &str)] = &[
         "connection {peer} fell {missed} changes behind and its persistent searches were dropped",
     ),
     ("error.peer", "peer {url}: {detail}; retrying"),
+    (
+        "error.peer_behind",
+        "peer {url}: its cookie points into a part of the journal this node has already pruned, \
+         so the changes in between are gone; starting a full refresh instead of a silent gap",
+    ),
     (
         "error.peer_id",
         "peer {url} says it is server {actual}, but the configuration says {expected}: two nodes \
@@ -559,6 +568,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ("warn.schema", "schema warning: {detail}"),
     // Configuration diagnostics, one per variant an operator can hit
     ("config.server_id", "invalid server id: {detail}"),
+    ("config.journal_keep", "invalid journal_keep: {detail}"),
     ("config.peers", "invalid peers: {detail}"),
     ("config.referral", "invalid referrals: {detail}"),
     (
