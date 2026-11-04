@@ -49,7 +49,16 @@ pub enum Outcome {
     Reject(LdapMessage),
     /// Persist the entry, then answer with `success`, or with an error carrying the
     /// backend's message.
-    Persist { entry: Entry, success: LdapMessage },
+    ///
+    /// `extra` carries the entries whose `memberOf` follows this one: a group whose membership
+    /// changed leaves every added or removed member with a value to rewrite, and that rewrite
+    /// has to land in the same change set. Two change sets would leave a moment where the group
+    /// lists a user who does not list the group.
+    Persist {
+        entry: Entry,
+        extra: Vec<Entry>,
+        success: LdapMessage,
+    },
 }
 
 /// Checks a modify request and produces the entry to store.
@@ -184,8 +193,20 @@ pub fn handle_modify(
         ));
     }
 
+    // The group side is where `memberOf` is computed from, so a change to `member` or
+    // `memberUid` is also a change to every member's entry.
+    let extra = if security.integrity.referential_integrity {
+        crate::integrity::member_of_changes(directory, Some(entry), Some(&modified))
+            .into_iter()
+            .map(|member| stamp(&member, session, &requester))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Outcome::Persist {
         entry: modified,
+        extra,
         success: modify_response(message_id, ResultCode::Success, ""),
     }
 }

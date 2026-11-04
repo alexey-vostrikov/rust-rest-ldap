@@ -266,6 +266,166 @@ pub fn retarget_members(directory: &Directory, before: &Entry, after: &Entry) ->
     updated
 }
 
+/// Names of the attributes that list a group's members, and the form each one takes.
+const MEMBER_ATTRIBUTE: &str = "member";
+const MEMBER_UID_ATTRIBUTE: &str = "memberUid";
+
+/// The DNs a group entry lists as its members.
+///
+/// Two spellings, because two object classes are in use: `groupOfNames` holds DNs in `member`,
+/// and `posixGroup` holds bare names in `memberUid` that have to be resolved against the
+/// directory. A name that resolves to nothing is left out - there is no entry to stamp, and
+/// inventing a DN from a name would attach a membership to whatever entry happens to answer.
+fn members_of(directory: &Directory, group: &Entry) -> std::collections::BTreeSet<String> {
+    let mut members = std::collections::BTreeSet::new();
+
+    if let Some(attribute) = group.attributes().get(MEMBER_ATTRIBUTE) {
+        for value in &attribute.values {
+            let dn = crate::dn::normalize(value);
+            if directory.position(&dn).is_some() {
+                members.insert(dn);
+            }
+        }
+    }
+
+    if let Some(attribute) = group.attributes().get(MEMBER_UID_ATTRIBUTE) {
+        for value in &attribute.values {
+            if let Some(found) = find_user_by_name(directory, value) {
+                members.insert(found);
+            }
+        }
+    }
+
+    members
+}
+
+/// The user an LDAP name refers to: `uid` first, then `cn`, the order a bind uses.
+fn find_user_by_name(directory: &Directory, name: &str) -> Option<String> {
+    for attribute in ["uid", "cn"] {
+        for entry in directory.users() {
+            if entry.attributes().get(attribute).is_some_and(|held| {
+                held.values
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(name))
+            }) {
+                return Some(entry.dn().to_string());
+            }
+        }
+        // Nothing under `uid`; `cn` is the next spelling, not a second search of the same one.
+    }
+    None
+}
+
+/// The entries whose `memberOf` has to change because a group changed.
+///
+/// One function for four operations, because the question is the same in all of them: what
+/// members did this group gain, and what did it lose. An add starts from nothing, a delete ends
+/// at nothing, a rename keeps the members but changes the group's own DN, and a modify changes
+/// the list - and each of them is a difference between the group as it was and as it will be.
+///
+/// `memberOf` is derived, not stored by a client: AD calls it a backlink, OpenLDAP an overlay,
+/// 389 DS a plugin. Whatever it is called, the property is the same - the group side is what
+/// `memberOf` is computed from, so a change there has to reach the members in the same change
+/// set. Two writes would leave a window where a group holds a user who is not in it, and a
+/// replica or a client reading in that window sees a directory that contradicts itself.
+pub fn member_of_changes(
+    directory: &Directory,
+    before: Option<&Entry>,
+    after: Option<&Entry>,
+) -> Vec<Entry> {
+    // A call with neither side is a call about nothing; both other cases are real changes.
+    if after.is_none() && before.is_none() {
+        return Vec::new();
+    }
+
+    let held = |entry: Option<&Entry>| match entry {
+        Some(entry) => members_of(directory, entry),
+        None => std::collections::BTreeSet::new(),
+    };
+
+    let was = held(before);
+    let now = held(after);
+
+    let old_dn = before.map(|entry| entry.dn().to_string());
+    let new_dn = after.map(|entry| entry.dn().to_string());
+
+    // Everyone whose `memberOf` can change: the members the group had and the ones it will have.
+    let affected: std::collections::BTreeSet<&String> = was.union(&now).collect();
+
+    // Both spellings of the group's DN are cleared first, and the current one is written back for
+    // whoever is still a member. That one rule covers all four operations without a special case:
+    //
+    // - a member the group kept: the value is removed and written again, so the set is unchanged
+    //   and nothing is written;
+    // - a member the group lost: removed, and not written back - which is what a removal means;
+    // - a group that was renamed: the old DN is cleared and the new one written, for every member;
+    // - a group that was created: there was nothing to clear, and the value is written.
+    //
+    // Writing the value back before comparing is what makes the fourth case and the first one the
+    // same code path: the comparison is between the sets, not between the operations that made
+    // them.
+    let stale: Vec<&String> = old_dn.iter().chain(new_dn.iter()).collect();
+    let wanted: Option<&String> = new_dn.as_ref();
+
+    let mut updated: Vec<Entry> = Vec::new();
+    for dn in affected {
+        let Some(entry) = directory_entries(directory).find(|entry| entry.dn() == dn.as_str())
+        else {
+            // A membership that names no entry: nothing to stamp, and the group side already says
+            // so through referential integrity.
+            continue;
+        };
+
+        let original: Vec<String> = entry
+            .attributes()
+            .get("memberOf")
+            .map(|attribute| {
+                attribute
+                    .values
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut values = original.clone();
+
+        values.retain(|value| !stale.iter().any(|dn| value.eq_ignore_ascii_case(dn)));
+        if now.contains(dn)
+            && let Some(wanted) = wanted
+            && !values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(wanted))
+        {
+            values.push(wanted.clone());
+        }
+
+        // Sorted before the comparison, so an entry whose set did not change is not rewritten:
+        // a write that changes nothing still costs a journal record and a revision bump.
+        values.sort_by_key(|value| value.to_lowercase());
+        if values == original {
+            continue;
+        }
+
+        let attributes = if values.is_empty() {
+            entry.attributes().clone().without("memberOf")
+        } else {
+            entry
+                .attributes()
+                .clone()
+                .replace(Attribute::new("memberOf", values).operational())
+        };
+
+        updated.push(Entry::new(entry.dn(), attributes));
+    }
+
+    updated
+}
+
+/// Every entry the directory holds, as a slice of references the caller can search.
+fn directory_entries(directory: &Directory) -> impl Iterator<Item = &Entry> {
+    directory.users().iter().chain(directory.groups())
+}
+
 /// Every group entry that has to be rewritten because `removed` went away.
 pub fn changes_for_removed(directory: &Directory, removed: &Entry) -> Vec<Entry> {
     let mut by_dn: BTreeMap<String, Entry> = BTreeMap::new();
@@ -339,6 +499,304 @@ mod tests {
 
     fn unique() -> Vec<String> {
         IntegrityConfig::default().unique_attributes()
+    }
+
+    /// A group listing `members` by DN, the `groupOfNames` spelling.
+    fn group_of_names(dn: &str, cn: &str, members: &[&str]) -> Entry {
+        let mut attributes = Attributes::new()
+            .push(Attribute::new(
+                "objectClass",
+                vec!["top".to_string(), "groupOfNames".to_string()],
+            ))
+            .push(Attribute::single("cn", cn));
+        if !members.is_empty() {
+            attributes = attributes.push(Attribute::new(
+                "member",
+                members.iter().map(|dn| dn.to_string()).collect::<Vec<_>>(),
+            ));
+        }
+        Entry::new(dn, attributes)
+    }
+
+    fn member_of(entry: &Entry) -> Vec<String> {
+        entry
+            .attributes()
+            .get("memberOf")
+            .map(|attribute| {
+                attribute
+                    .values
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    const ADMINS_DN: &str = "cn=admins,ou=groups,dc=example,dc=com";
+
+    #[test]
+    fn a_group_created_with_members_gives_each_of_them_a_member_of() {
+        // The property the whole attribute rests on: the group side is what `memberOf` is
+        // computed from, so creating the group has to stamp the members.
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![
+                user(ALICE_DN, "alice", "alice"),
+                user(BOB_DN, "bob", "bob"),
+                group_of_names(ADMINS_DN, "admins", &[ALICE_DN]),
+            ],
+        );
+
+        let changes = member_of_changes(&directory, None, directory.find(ADMINS_DN));
+        assert_eq!(changes.len(), 1, "only the member gained a value");
+
+        let alice = changes
+            .iter()
+            .find(|entry| entry.dn() == ALICE_DN)
+            .unwrap_or_else(|| panic!("alice is not among {:?}", changes));
+        assert_eq!(
+            member_of(alice),
+            vec![ADMINS_DN.to_string()],
+            "the value is the group's DN, which is what a client can resolve"
+        );
+        assert!(
+            alice
+                .attributes()
+                .get("memberOf")
+                .is_some_and(|attribute| attribute.flags.operational),
+            "a client must not be able to write it back: it is the server's"
+        );
+    }
+
+    #[test]
+    fn a_member_removed_from_the_group_loses_the_value_and_keeps_the_others() {
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![
+                user(ALICE_DN, "alice", "alice"),
+                group_of_names(ADMINS_DN, "admins", &[ALICE_DN]),
+                group_of_names("cn=staff,ou=groups,dc=example,dc=com", "staff", &[ALICE_DN]),
+            ],
+        );
+
+        // Alice already carries both, as earlier writes would have left her.
+        let before = group_of_names(ADMINS_DN, "admins", &[ALICE_DN]);
+        let after = group_of_names(ADMINS_DN, "admins", &[]);
+
+        // The directory holds her with both values, which is the state a real sequence leaves.
+        let mut with_values = directory.find(ALICE_DN).cloned().expect("alice");
+        with_values = Entry::new(
+            ALICE_DN,
+            with_values.attributes().clone().replace(
+                Attribute::new(
+                    "memberOf",
+                    vec![
+                        ADMINS_DN.to_string(),
+                        "cn=staff,ou=groups,dc=example,dc=com".to_string(),
+                    ],
+                )
+                .operational(),
+            ),
+        );
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![
+                with_values,
+                group_of_names("cn=staff,ou=groups,dc=example,dc=com", "staff", &[ALICE_DN]),
+            ],
+        );
+
+        let changes = member_of_changes(&directory, Some(&before), Some(&after));
+        let alice = changes
+            .iter()
+            .find(|entry| entry.dn() == ALICE_DN)
+            .expect("alice was updated");
+
+        assert_eq!(
+            member_of(alice),
+            vec!["cn=staff,ou=groups,dc=example,dc=com".to_string()],
+            "the group she left is gone and the one she is in stays"
+        );
+    }
+
+    #[test]
+    fn a_deleted_group_leaves_no_member_pointing_at_it() {
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![
+                user(ALICE_DN, "alice", "alice"),
+                group_of_names(ADMINS_DN, "admins", &[ALICE_DN]),
+            ],
+        );
+        let alice = Entry::new(
+            ALICE_DN,
+            directory
+                .find(ALICE_DN)
+                .expect("alice")
+                .attributes()
+                .clone()
+                .replace(Attribute::new("memberOf", vec![ADMINS_DN.to_string()]).operational()),
+        );
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![alice, group_of_names(ADMINS_DN, "admins", &[ALICE_DN])],
+        );
+
+        let changes = member_of_changes(&directory, directory.find(ADMINS_DN), None);
+        let updated = changes
+            .iter()
+            .find(|entry| entry.dn() == ALICE_DN)
+            .expect("alice was updated");
+
+        assert!(
+            updated.attributes().get("memberOf").is_none(),
+            "the attribute is removed rather than left empty: LDAP has no empty value"
+        );
+    }
+
+    #[test]
+    fn a_renamed_group_moves_every_member_onto_its_new_dn() {
+        // The case that makes a bare group name tempting and wrong: after a rename the value has
+        // to change, and a client that stored the group under its new DN must still find its
+        // members.
+        let new_dn = "cn=administrators,ou=groups,dc=example,dc=com";
+        let alice = Entry::new(
+            ALICE_DN,
+            Attributes::new()
+                .push(Attribute::new(
+                    "objectClass",
+                    vec!["top".to_string(), "person".to_string()],
+                ))
+                .push(Attribute::single("cn", "alice"))
+                .push(Attribute::single("sn", "S"))
+                .push(Attribute::single("uid", "alice"))
+                .push(Attribute::new("memberOf", vec![ADMINS_DN.to_string()]).operational()),
+        );
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![alice, group_of_names(new_dn, "administrators", &[ALICE_DN])],
+        );
+
+        let changes = member_of_changes(
+            &directory,
+            Some(&group_of_names(ADMINS_DN, "admins", &[ALICE_DN])),
+            Some(&group_of_names(new_dn, "administrators", &[ALICE_DN])),
+        );
+
+        let updated = changes
+            .iter()
+            .find(|entry| entry.dn() == ALICE_DN)
+            .expect("alice was updated");
+        assert_eq!(
+            member_of(updated),
+            vec![new_dn.to_string()],
+            "the old DN is gone and the new one is there, not both"
+        );
+    }
+
+    #[test]
+    fn a_posix_group_resolves_member_uid_to_the_users_dn() {
+        // `posixGroup` lists names, not DNs, and a name alone cannot say which entry it means -
+        // resolving it is the same step a bind takes, in the same order.
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![
+                user(ALICE_DN, "alice", "alice"),
+                Entry::new(
+                    "cn=wheel,ou=groups,dc=example,dc=com",
+                    Attributes::new()
+                        .push(Attribute::new(
+                            "objectClass",
+                            vec!["top".to_string(), "posixGroup".to_string()],
+                        ))
+                        .push(Attribute::single("cn", "wheel"))
+                        .push(Attribute::single("gidNumber", "10"))
+                        .push(Attribute::new("memberUid", vec!["alice".to_string()])),
+                ),
+            ],
+        );
+
+        let changes = member_of_changes(
+            &directory,
+            None,
+            directory.find("cn=wheel,ou=groups,dc=example,dc=com"),
+        );
+
+        let updated = changes
+            .iter()
+            .find(|entry| entry.dn() == ALICE_DN)
+            .expect("the user named in memberUid gained a value");
+        assert_eq!(
+            member_of(updated),
+            vec!["cn=wheel,ou=groups,dc=example,dc=com".to_string()],
+            "the value is a DN even though the group lists a name"
+        );
+    }
+
+    #[test]
+    fn a_membership_naming_no_entry_is_skipped_rather_than_invented() {
+        // A `member` value that resolves to nothing: there is no entry to stamp, and a DN made up
+        // from the text would attach the membership to whatever answered to it.
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![group_of_names(
+                ADMINS_DN,
+                "admins",
+                &["cn=ghost,ou=users,dc=example,dc=com"],
+            )],
+        );
+
+        let changes = member_of_changes(&directory, None, directory.find(ADMINS_DN));
+        assert!(
+            changes.is_empty(),
+            "nothing to stamp, and nothing invented: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_that_leaves_the_set_alone_writes_nothing() {
+        // A modify that touches the group but not its members must not rewrite every member: a
+        // write costs a journal record and a revision, and a no-op write costs them too.
+        // The member already carries the value, which is the only state in which "nothing
+        // changed" is the right answer: an entry missing it is a divergence to repair, not a
+        // no-op.
+        let member = Entry::new(
+            ALICE_DN,
+            user(ALICE_DN, "alice", "alice")
+                .attributes()
+                .clone()
+                .replace(Attribute::new("memberOf", vec![ADMINS_DN.to_string()]).operational()),
+        );
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![member, group_of_names(ADMINS_DN, "admins", &[ALICE_DN])],
+        );
+
+        let changes = member_of_changes(
+            &directory,
+            Some(&group_of_names(ADMINS_DN, "admins", &[ALICE_DN])),
+            Some(&group_of_names(ADMINS_DN, "admins", &[ALICE_DN])),
+        );
+
+        assert!(changes.is_empty(), "nothing changed: {changes:?}");
     }
 
     #[test]
