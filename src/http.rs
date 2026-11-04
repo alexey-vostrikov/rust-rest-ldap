@@ -210,6 +210,7 @@ mod tests {
             referrals: Default::default(),
             server_id: 0,
             peers: Vec::new(),
+            journal_keep: None,
             acl: Default::default(),
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),

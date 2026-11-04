@@ -98,6 +98,10 @@ impl ConfigError {
         let mut owned: Vec<(String, String)> = Vec::new();
 
         match self {
+            Self::JournalKeep(detail) => {
+                key = "config.journal_keep";
+                owned.push(("detail".to_string(), detail.clone()));
+            }
             Self::Peers(detail) => {
                 key = "config.peers";
                 owned.push(("detail".to_string(), detail.clone()));
@@ -292,6 +296,8 @@ pub struct Config {
     /// Empty means this node stands alone. Checked against the id at startup: a peer with this
     /// node's own id is refused, because the damage is permanent.
     pub peers: Vec<crate::peers::Peer>,
+    /// How many change records this node keeps; `None` keeps everything.
+    pub journal_keep: Option<usize>,
     /// Subtrees held elsewhere, and where a client is sent for them.
     ///
     /// Empty means the server answers `noSuchObject` for anything outside its own tree, which is
@@ -329,6 +335,8 @@ pub enum ConfigError {
     ServerId(String),
     #[error("invalid peers: {0}")]
     Peers(String),
+    #[error("invalid journal_keep: {0}")]
+    JournalKeep(String),
     #[error("invalid referrals: {0}")]
     Referral(String),
     #[error("use_tls is enabled, but server_cert and server_key are not both set")]
@@ -405,6 +413,9 @@ struct FileConfig {
     /// Nodes this one replicates with, if any.
     #[serde(default)]
     peers: Vec<crate::peers::PeerConfig>,
+    /// How far behind a peer may fall.
+    #[serde(default)]
+    replication: ReplicationConfig,
     #[serde(default)]
     observability: ObservabilityConfig,
     /// Language for operator-facing diagnostics: `ru`, `en`. Empty means "ask the
@@ -493,6 +504,23 @@ pub struct ReferralConfig {
     pub dn: String,
     /// An `ldap://` or `ldaps://` URL a client should ask instead.
     pub url: String,
+}
+
+/// `replication:` section of the configuration file.
+///
+/// Nothing here is needed to serve a directory: it bounds how far behind a peer may fall before it
+/// is refused, which is a decision about storage, not about the protocol.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ReplicationConfig {
+    /// How many change records to keep.
+    ///
+    /// The journal is the only place a deletion is remembered. Pruning it is therefore not
+    /// housekeeping: a peer whose cookie points before the oldest record left has lost deletions
+    /// nobody will ever send it, and the surviving records say nothing about the gap. `None` keeps
+    /// everything, which is the honest default for a node whose peers have been down for a long
+    /// time - and a slow leak for a node nobody reads.
+    pub journal_keep: Option<usize>,
 }
 
 /// `observability:` section of the configuration file.
@@ -809,6 +837,18 @@ pub fn resolve(
         },
         peers: crate::peers::from_config(&file.peers, file.server_id.unwrap_or(0))
             .map_err(|err| ConfigError::Peers(err.to_string()))?,
+        // Zero is not "keep none" - that would throw away the only record of every deletion while
+        // the peers are still behind. It is a mistake in the file, and it fails here.
+        journal_keep: match file.replication.journal_keep {
+            Some(0) => {
+                return Err(ConfigError::JournalKeep(
+                    "journal_keep: 0 would discard every change record, including the only \
+                     record that a deletion ever happened; omit the key to keep everything"
+                        .to_string(),
+                ));
+            }
+            other => other,
+        },
         referrals,
         acl: crate::acl::from_config(file.access.as_deref())?,
         allow_unencrypted_bind: file.bind.allow_unencrypted_bind.is_on(),
@@ -1032,6 +1072,31 @@ bootstrap:
             matches!(err, ConfigError::BootstrapPasswordMissing),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_journal_keep_is_read_from_the_file() {
+        let text = "base_dn: dc=example,dc=com\nreplication:\n  journal_keep: 5000\n";
+        let cfg = resolve(Args::default(), Some(text), no_env).expect("config");
+        assert_eq!(cfg.journal_keep, Some(5000));
+    }
+
+    #[test]
+    fn an_unconfigured_journal_keeps_everything() {
+        // `None` and not a number: a node whose peers have been down for a long time needs the
+        // deletions it would otherwise have thrown away, and the operator has not said otherwise.
+        let cfg = resolve(Args::default(), None, no_env).expect("defaults");
+        assert_eq!(cfg.journal_keep, None);
+    }
+
+    #[test]
+    fn a_journal_keep_of_zero_is_refused_at_startup() {
+        // Not "keep none": the journal is the only record that a deletion ever happened, so zero
+        // would make every peer wrong the moment one goes down. It is a mistake in the file, and
+        // it fails here rather than at the first silent divergence.
+        let text = "base_dn: dc=example,dc=com\nreplication:\n  journal_keep: 0\n";
+        let err = resolve(Args::default(), Some(text), no_env).expect_err("must reject");
+        assert!(matches!(err, ConfigError::JournalKeep(_)), "{err}");
     }
 
     #[test]

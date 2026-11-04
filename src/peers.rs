@@ -345,6 +345,24 @@ pub async fn follow(
     }
 }
 
+/// Whether resuming from `cookie` would ask about changes this node no longer remembers.
+///
+/// Comparing against the floor of the journal is the only way to know: pruning leaves no marker in
+/// the surviving records, so a resume from a pruned cookie is indistinguishable from a resume from
+/// a current one unless the caller checks.
+fn too_old_for(cookie: &[u8], source: &crate::reload::Source) -> bool {
+    let Some(csn) = cookie_csn(Some(cookie)) else {
+        // A cookie this server cannot read is one it cannot resume from either.
+        return true;
+    };
+    let Some(floor) = source.journal_floor().ok().flatten() else {
+        // No journal at all: nothing was pruned, so there is nothing to have missed.
+        return false;
+    };
+
+    csn.as_str() < floor.as_str()
+}
+
 /// One connection's worth of exchange.
 async fn exchange(
     peer: &Peer,
@@ -362,6 +380,21 @@ async fn exchange(
             .bind(dn, password)
             .await
             .map_err(|err| err.to_string())?;
+    }
+
+    // A cookie older than the oldest record still kept points into a part of the journal that
+    // has been pruned. Resuming from it would ask for changes since a moment nobody can answer
+    // about, and the answer would look complete: the range simply starts later. Dropping the
+    // cookie costs a full refresh and is the only correct answer - a replica that is wrong and
+    // looks healthy is worse than a slow one.
+    if let Some(old) = cookie.clone()
+        && too_old_for(&old, source)
+    {
+        eprintln!(
+            "{}",
+            crate::i18n::t("error.peer_behind", &[("url", &peer.url)])
+        );
+        *cookie = None;
     }
 
     let (request, controls) = request(base_dn, cookie.as_deref());

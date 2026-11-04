@@ -401,6 +401,20 @@ async fn main() {
     // "no node" and a peer could not tell it from its own.
     rust_rest_ldap::replication::set_server_id(config.server_id);
 
+    // Before the directory is built, so the floor the snapshot carries is the floor that is: a
+    // snapshot taken before pruning would say the journal reaches further back than it does, and a
+    // peer resuming from that stretch would be told nothing was missed.
+    if let Some(keep) = config.journal_keep {
+        match backend.journal_prune(keep) {
+            Ok(removed) if removed > 0 => println!(
+                "{}",
+                i18n::t("start.journal_pruned", &[("removed", &removed.to_string())])
+            ),
+            Ok(_) => {}
+            Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
+        }
+    }
+
     let (source, directory) = match rust_rest_ldap::reload::Source::load(&config, backend).await {
         Ok(loaded) => loaded,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),

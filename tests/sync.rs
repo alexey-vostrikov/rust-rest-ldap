@@ -78,6 +78,7 @@ async fn serve(entries: Vec<Entry>) -> String {
         referrals: Default::default(),
         server_id: 0,
         peers: Vec::new(),
+        journal_keep: None,
         acl: rust_rest_ldap::acl::from_config(Some(&[rust_rest_ldap::acl::AccessRuleConfig {
             subject: "anonymous".to_string(),
             base: None,

@@ -377,11 +377,41 @@ pub fn handle_search(
 
     // What the client already has, if it said. `None` means "send me everything with attributes",
     // which is what a first refresh is.
-    let client_csn = sync_request
+    //
+    // A cookie older than the journal's floor is a cookie this server cannot honour: the changes
+    // between then and the oldest surviving record were pruned, and nothing in what remains says
+    // so. RFC 4533 §3.1 puts it exactly that way - an unrecognised cookie means initial content
+    // as if no cookie had been provided, or an empty answer with `syncRefreshRequired`, and the
+    // choice may follow the client's `reloadHint`. A client that asked for a reload is told so
+    // explicitly; one that did not gets the content, which is expensive and correct.
+    let client_cookie = sync_request
         .as_ref()
         .and_then(|request| request.cookie.as_deref())
-        .and_then(sync::decode_cookie)
-        .and_then(|(_, csn)| csn);
+        .and_then(sync::decode_cookie);
+
+    let recognized = match (&client_cookie, directory.floor()) {
+        // A cookie that decodes but points before the oldest surviving change is not recognised,
+        // even though it is well formed. This is the case that would otherwise be silent.
+        (Some((_, Some(csn))), Some(floor)) => csn.as_str() >= floor,
+        _ => true,
+    };
+
+    if !recognized
+        && let Some(request) = sync_request.as_ref()
+        && request.reload_hint
+    {
+        return vec![responses::search_done(
+            message_id,
+            ResultCode::SyncRefreshRequired,
+            "the cookie describes a state this server can no longer answer about: the changes \
+             since then were pruned, so a full refresh is required",
+        )];
+    }
+
+    let client_csn = match (&client_cookie, recognized) {
+        (Some((_, csn)), true) => csn.clone(),
+        _ => None,
+    };
 
     // Whether present entries are collapsed into a `syncIdSet` depends on how many there are,
     // which is only known once every entry is classified - and an entry cannot be written and then
@@ -1350,6 +1380,221 @@ mod tests {
             diagnostic(&messages),
             "paged results cookie 'nonsense' is not a cursor this server issued"
         );
+    }
+
+    /// A directory whose entries carry `entryCSN`, so a resumed refresh can tell them apart.
+    fn stamped_directory() -> Directory {
+        use crate::model::{Attribute, Attributes, Entry};
+
+        let person = |cn: &str, csn: &str| {
+            Entry::new(
+                format!("cn={cn},ou=users,{BASE}"),
+                Attributes::new()
+                    .push(Attribute::new(
+                        "objectClass",
+                        vec!["top".to_string(), "person".to_string()],
+                    ))
+                    .push(Attribute::single("cn", cn))
+                    .push(Attribute::single("sn", "Person"))
+                    .push(Attribute::single("entryCSN", csn).operational()),
+            )
+        };
+
+        Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![
+                person("alice", "20260101000000.000001Z#000001#001#000000"),
+                person("bob", "20260101000000.000002Z#000001#001#000000"),
+            ],
+        )
+    }
+
+    fn sync_control(mode: u8, cookie: Option<&[u8]>, reload_hint: bool) -> Controls {
+        let mut body = vec![0x0a, 0x01, mode];
+        if let Some(cookie) = cookie {
+            body.push(0x04);
+            body.push(cookie.len() as u8);
+            body.extend_from_slice(cookie);
+        }
+        if reload_hint {
+            body.extend_from_slice(&[0x01, 0x01, 0xff]);
+        }
+
+        let mut value = vec![0x30, body.len() as u8];
+        value.extend_from_slice(&body);
+
+        vec![Control::new(
+            LdapOid::from(crate::ldap::sync::SYNC_OID.as_bytes()),
+            true,
+            Some(rasn::types::OctetString::from(value)),
+        )]
+    }
+
+    #[test]
+    fn a_cookie_older_than_the_journal_floor_gets_the_content_and_not_a_resume() {
+        // The silent case this closes: the journal was pruned, so the changes between the client's
+        // cookie and the oldest surviving record are gone, and nothing in what remains says so. A
+        // resume would answer as if nothing had happened in between.
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            0,
+            &["entryCSN"],
+        );
+
+        // The client is at a change older than anything the journal still holds.
+        let cookie =
+            crate::ldap::sync::encode_cookie(1, Some("20250101000000.000001Z#000001#001#000000"));
+        let directory = stamped_directory()
+            .with_csn(Some("20260101000000.000009Z#000001#001#000000".to_string()))
+            .with_floor(Some("20260101000000.000001Z#000001#001#000000".to_string()));
+
+        let messages = handle_search(
+            &session,
+            &directory,
+            1,
+            &request,
+            Some(&sync_control(1, Some(&cookie), false)),
+            &security(),
+        );
+
+        assert_eq!(
+            result_code(&messages),
+            ResultCode::Success,
+            "without a reload hint the client is simply given the content"
+        );
+        let entries = synchronised_entries(&messages);
+        assert_eq!(
+            entries.len(),
+            5,
+            "the naming context, both units and both users"
+        );
+        assert!(
+            entries.iter().all(|(_, state, _)| *state == 1),
+            "every entry arrives as add, not as an unchanged present: the client cannot be told \
+             which changes it missed, so it is given the content: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .filter(|(dn, _, _)| dn.starts_with("cn="))
+                .all(|(_, _, attributes)| *attributes > 0),
+            "and with their attributes, which a resume would have left out: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_cookie_older_than_the_floor_is_refused_outright_when_the_client_asked_for_a_reload() {
+        // RFC 4533 §3.1: an unrecognised cookie means initial content or an empty answer with
+        // `syncRefreshRequired`, and the choice may follow `reloadHint`. A client that asked to be
+        // told is told; one that did not gets the content.
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let cookie =
+            crate::ldap::sync::encode_cookie(1, Some("20250101000000.000001Z#000001#001#000000"));
+        let directory = stamped_directory()
+            .with_csn(Some("20260101000000.000009Z#000001#001#000000".to_string()))
+            .with_floor(Some("20260101000000.000001Z#000001#001#000000".to_string()));
+
+        let messages = handle_search(
+            &session,
+            &directory,
+            1,
+            &request,
+            Some(&sync_control(1, Some(&cookie), true)),
+            &security(),
+        );
+
+        assert!(dns(&messages).is_empty(), "no entry is served");
+        assert_eq!(
+            result_code(&messages),
+            ResultCode::SyncRefreshRequired,
+            "the code RFC 4533 §2.6 defines for exactly this"
+        );
+    }
+
+    #[test]
+    fn a_cookie_inside_the_journal_is_still_resumed() {
+        // The control case: the floor must not turn every resume into a full refresh, or the
+        // journal exists for nothing.
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            0,
+            &["entryCSN"],
+        );
+
+        // At the floor itself: everything after it is still in the journal, so this resumes.
+        let cookie =
+            crate::ldap::sync::encode_cookie(1, Some("20260101000000.000001Z#000001#001#000000"));
+        let directory = stamped_directory()
+            .with_csn(Some("20260101000000.000009Z#000001#001#000000".to_string()))
+            .with_floor(Some("20260101000000.000001Z#000001#001#000000".to_string()));
+
+        let messages = handle_search(
+            &session,
+            &directory,
+            1,
+            &request,
+            Some(&sync_control(1, Some(&cookie), true)),
+            &security(),
+        );
+
+        assert_eq!(result_code(&messages), ResultCode::Success);
+        let entries = synchronised_entries(&messages);
+        assert_eq!(
+            entries.len(),
+            5,
+            "the naming context, both units and both users"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(dn, state, _)| dn.starts_with("cn=alice") && *state == 0),
+            "an unchanged entry is present and empty, not resent: {entries:?}"
+        );
+    }
+
+    /// `(dn, state, attribute count)` for the entries in an answer.
+    fn synchronised_entries(messages: &[LdapMessage]) -> Vec<(String, u8, usize)> {
+        messages
+            .iter()
+            .filter_map(|message| {
+                let ProtocolOp::SearchResEntry(entry) = &message.protocol_op else {
+                    return None;
+                };
+                let control = message.controls.as_ref()?.iter().find(|control| {
+                    control.control_type.as_ref() == crate::ldap::sync::SYNC_OID.as_bytes()
+                })?;
+                let state =
+                    crate::ldap::sync::decode_state(control.control_value.as_ref()?.as_ref())
+                        .ok()?;
+                let code = match state.state {
+                    crate::ldap::sync::State::Present => 0,
+                    crate::ldap::sync::State::Add => 1,
+                    crate::ldap::sync::State::Modify => 2,
+                    crate::ldap::sync::State::Delete => 3,
+                };
+                Some((
+                    entry.object_name.0.to_string(),
+                    code,
+                    entry.attributes.len(),
+                ))
+            })
+            .collect()
     }
 
     #[test]

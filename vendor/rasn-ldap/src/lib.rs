@@ -295,6 +295,9 @@ pub enum ResultCode {
     CannotCancel = 121,
     AssertionFailed = 122,
     AuthorizationDenied = 123,
+    /// RFC 4533 §2.6: the client is told to redo the refresh, because the cookie it resumed from
+    /// describes a state this server can no longer answer about.
+    SyncRefreshRequired = 4096,
 }
 
 #[derive(AsnType, Encode, Decode, Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]

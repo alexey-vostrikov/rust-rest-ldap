@@ -60,6 +60,13 @@ pub struct Directory {
     /// because the snapshot and the journal head have to describe the same moment: a head from a
     /// later write would claim the client has changes it has not been sent.
     csn: Option<String>,
+    /// The oldest change the journal still remembers when this snapshot was built.
+    ///
+    /// Here for the same reason as the head, and it answers a different question: the head says
+    /// how far the journal has got, the floor says how far back it still reaches. A client resuming
+    /// from a cookie older than the floor has missed changes that were pruned, and nothing in the
+    /// surviving records says so.
+    floor: Option<String>,
 }
 
 impl Directory {
@@ -142,6 +149,22 @@ impl Directory {
     /// How far the change journal had got when this snapshot was built.
     pub fn csn(&self) -> Option<&str> {
         self.csn.as_deref()
+    }
+
+    /// The same directory, knowing how far back the journal still reaches.
+    pub fn with_floor(mut self, floor: Option<String>) -> Self {
+        self.floor = floor;
+        self
+    }
+
+    /// Records how far back the journal still reaches, on a directory being patched in place.
+    pub fn set_floor(&mut self, floor: Option<String>) {
+        self.floor = floor;
+    }
+
+    /// The oldest change the journal still remembers.
+    pub fn floor(&self) -> Option<&str> {
+        self.floor.as_deref()
     }
 
     pub fn snapshot(&self) -> u64 {
@@ -235,6 +258,7 @@ impl Directory {
             // built by hand in a test has no history to be inconsistent with.
             snapshot: 0,
             csn: None,
+            floor: None,
             index: Arc::new(Index::default()),
         }
     }
