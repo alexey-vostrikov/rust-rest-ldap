@@ -6,12 +6,11 @@
 //! - `refreshOnly` is answered: each entry carries a `syncState` control naming its identity and
 //!   the cookie, and the answer ends with a `syncDone` - without which a client must treat the
 //!   whole refresh as failed even though every entry arrived.
-//! - `refreshAndPersist` is refused with `syncRefreshRequired`'s code, because this server does
-//!   not keep an answer open and push changes: saying so is the honest answer, and a client that
-//!   gets it starts again in a mode that works.
-//! - There is no history, so no entry is ever reported as `add`, `modify` or `delete`. A replica
-//!   reconciling a full refresh gets `present` and compares; a wrong state would be worse than
-//!   none.
+//! - `refreshAndPersist` keeps the answer open: the refresh stage ends with a `syncInfo` rather
+//!   than a `searchResDone`, and changes are pushed afterwards without being asked for.
+//! - The journal makes a resumed refresh cheap: an entry whose `entryCSN` is not newer than the
+//!   cookie goes back as an empty `present` entry, and - past a threshold - a whole set of them
+//!   goes back as one `syncIdSet` message instead of one message each.
 
 use std::time::Duration;
 
@@ -207,6 +206,71 @@ fn sync_control(mode: u8) -> Control {
 }
 
 /// The sync state the answer attached to one entry.
+/// The `syncIdSet` messages in an answer, as the UUIDs they name.
+fn id_sets(messages: &[rasn_ldap::LdapMessage]) -> Vec<Vec<[u8; 16]>> {
+    messages
+        .iter()
+        .filter_map(|message| match &message.protocol_op {
+            ProtocolOp::IntermediateResponse(response) => {
+                response
+                    .response_name
+                    .as_ref()
+                    .filter(|oid| oid.as_ref() == sync::SYNC_OID.as_bytes())?;
+                let value = response.response_value.as_ref()?.as_ref();
+                assert_eq!(value[0], 0xa3, "a syncIdSet, not another syncInfo");
+
+                // The length is in long form once the set grows past 127 bytes, which twelve
+                // UUIDs already do.
+                let mut offset = 1;
+                let first = value[offset];
+                offset += 1;
+                if first & 0x80 != 0 {
+                    offset += (first & 0x7f) as usize;
+                }
+                let mut rest = &value[offset..];
+                if rest.first() == Some(&0x04) {
+                    let length = rest[1] as usize;
+                    rest = &rest[2 + length..];
+                }
+                if rest.first() == Some(&0x01) {
+                    rest = &rest[3..];
+                }
+                assert_eq!(rest[0], 0x31, "the set of UUIDs");
+
+                // A length in long form once the set passes 127 bytes, which it does at eight
+                // UUIDs.
+                let mut offset = 1;
+                let first = rest[offset];
+                offset += 1;
+                let length = if first & 0x80 != 0 {
+                    let count = (first & 0x7f) as usize;
+                    let value = rest[offset..offset + count]
+                        .iter()
+                        .fold(0usize, |acc, byte| (acc << 8) | *byte as usize);
+                    offset += count;
+                    value
+                } else {
+                    first as usize
+                };
+
+                let body = &rest[offset..offset + length];
+                let mut uuids = Vec::new();
+                let mut index = 0;
+                while index < body.len() {
+                    assert_eq!(body[index], 0x04);
+                    let length = body[index + 1] as usize;
+                    let mut uuid = [0u8; 16];
+                    uuid.copy_from_slice(&body[index + 2..index + 2 + length]);
+                    uuids.push(uuid);
+                    index += 2 + length;
+                }
+                Some(uuids)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn states(messages: &[rasn_ldap::LdapMessage]) -> Vec<(String, sync::SyncState)> {
     messages
         .iter()
@@ -634,6 +698,112 @@ async fn a_resumed_refresh_sends_only_the_changes_with_their_attributes() {
     assert!(
         !done(&second).expect("done").1,
         "the answer is still complete, so pruning stays safe"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_refresh_over_many_unchanged_entries_sends_one_set_not_a_message_each() {
+    // RFC 4533 §1.3.1 lets the server name unchanged entries as a set of UUIDs instead of one
+    // empty message per entry. Ten thousand untouched entries are then forty messages rather than
+    // ten thousand - and the client learns exactly the same thing.
+    let people: Vec<Entry> = (0..12)
+        .map(|index| person(&format!("user{index:02}")))
+        .collect();
+    let url = serve(people.clone()).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (first, _) = client
+        .search_with(search(), vec![sync_control(1)])
+        .await
+        .expect("first refresh");
+    let cookie = done(&first)
+        .and_then(|(cookie, _)| cookie)
+        .expect("a cookie");
+
+    let (second, _) = client
+        .search_with(search(), vec![sync_control_resuming(1, &cookie)])
+        .await
+        .expect("resumed refresh");
+
+    let sets = id_sets(&second);
+    assert_eq!(sets.len(), 1, "twelve UUIDs fit in one message");
+    assert_eq!(
+        sets[0].len(),
+        12,
+        "every unchanged entry is named once: {}",
+        sets[0].len()
+    );
+
+    // The UUIDs are the entries' own, so a client can match them to what it holds. These fixtures
+    // carry no stored `entryUUID`, so the server derives one from the DN - which is the identity a
+    // client was given in the first refresh and therefore the one it expects back.
+    let expected = sync::uuid_bytes(&rust_rest_ldap::directory::entry_uuid(
+        "cn=user00,ou=users,dc=example,dc=com",
+    ))
+    .expect("sixteen octets");
+    assert!(
+        sets[0].contains(&expected),
+        "the set names the entries' own UUIDs"
+    );
+
+    // And nothing is sent twice: a collapsed entry is not also written as an empty entry.
+    let entries = synchronised(&second);
+    assert!(
+        !entries
+            .iter()
+            .any(|(dn, state, _)| dn.starts_with("cn=user") && state.state == State::Present),
+        "a collapsed present entry carries no message of its own: {:?}",
+        entries
+            .iter()
+            .map(|(dn, state, _)| (dn.clone(), state.state))
+            .collect::<Vec<_>>()
+    );
+
+    // The synthetic entries have no CSN, so they are still sent in full: a set says nothing about
+    // content the client may not have.
+    assert!(
+        entries
+            .iter()
+            .any(|(dn, state, _)| dn == BASE && state.state == State::Add),
+        "the naming context still comes in full"
+    );
+}
+
+#[tokio::test]
+async fn a_few_unchanged_entries_are_not_worth_a_set() {
+    // The threshold exists so that a small answer is not made more expensive than it was: below
+    // it, one empty entry per entry beats a set message plus the bookkeeping.
+    let url = serve(vec![person("alice"), person("bob")]).await;
+    let client = Client::connect(&url, Options::default())
+        .await
+        .expect("connect");
+
+    let (first, _) = client
+        .search_with(search(), vec![sync_control(1)])
+        .await
+        .expect("first refresh");
+    let cookie = done(&first)
+        .and_then(|(cookie, _)| cookie)
+        .expect("a cookie");
+
+    let (second, _) = client
+        .search_with(search(), vec![sync_control_resuming(1, &cookie)])
+        .await
+        .expect("resumed refresh");
+
+    assert!(
+        id_sets(&second).is_empty(),
+        "two unchanged entries do not justify a set"
+    );
+    assert_eq!(
+        synchronised(&second)
+            .iter()
+            .filter(|(_, state, _)| state.state == State::Present)
+            .count(),
+        2,
+        "they come as empty entries, as before"
     );
 }
 
