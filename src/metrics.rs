@@ -101,6 +101,32 @@ pub struct Metrics {
     /// Sum of microseconds spent serving searches.
     search_micros: AtomicU64,
     started: Mutex<Option<std::time::SystemTime>>,
+    /// One series group per configured peer, keyed by its URL.
+    ///
+    /// The only labelled metrics in this file, and the label is bounded by the configuration: a
+    /// handful of peers, not a value from a client. That is the difference between a useful label
+    /// and the cardinality explosion the doc comment above warns about.
+    peers: Mutex<std::collections::BTreeMap<String, PeerState>>,
+}
+
+/// What is known about one peer.
+#[derive(Debug, Default, Clone)]
+pub struct PeerState {
+    /// Whether the persistent connection to it is up right now.
+    connected: bool,
+    /// Changes received and written.
+    applied: u64,
+    /// Changes received and dropped as already known or not newer.
+    ignored: u64,
+    /// Attempts that failed, at connecting or at accepting a change.
+    errors: u64,
+    /// The newest change number applied from this peer, as `<time>#<counter>#<server>#<modifier>`.
+    ///
+    /// The answer to "how fresh is this replica", which no other metric can give: an entry count
+    /// says nothing about whether the other node's writes have arrived.
+    last_csn: Option<String>,
+    /// When the last change from it was applied, as a Unix timestamp.
+    last_change: Option<u64>,
 }
 
 impl Metrics {
@@ -118,6 +144,64 @@ impl Metrics {
     /// The result code decides success rather than the caller: a search that returned
     /// `sizeLimitExceeded` is a request that happened, and a bind that failed is the one
     /// operators actually watch.
+    /// Declares a peer before it is contacted.
+    ///
+    /// Called at startup so every series exists with a zero value: a graph that starts the moment a
+    /// node first connects hides the case that matters most - a peer that never connected at all.
+    pub fn register_peer(&self, url: &str) {
+        let mut peers = self.lock_peers();
+        peers.entry(url.to_string()).or_default();
+    }
+
+    /// Records whether the persistent connection to a peer is up.
+    pub fn peer_connected(&self, url: &str, connected: bool) {
+        let mut peers = self.lock_peers();
+        peers.entry(url.to_string()).or_default().connected = connected;
+    }
+
+    /// Records a failed attempt: connecting, or accepting a change.
+    pub fn peer_error(&self, url: &str) {
+        let mut peers = self.lock_peers();
+        peers.entry(url.to_string()).or_default().errors += 1;
+    }
+
+    /// Records what happened to one change from a peer.
+    pub fn peer_change(&self, url: &str, applied: bool, csn: Option<&str>) {
+        let mut peers = self.lock_peers();
+        let state = peers.entry(url.to_string()).or_default();
+
+        if applied {
+            state.applied += 1;
+            state.last_change = Some(now_seconds());
+            // The newest change number, not the last one seen: a peer's changes can arrive out of
+            // order across reconnects, and a freshness gauge that went backwards would be worse
+            // than none.
+            if let Some(csn) = csn
+                && state.last_csn.as_deref().is_none_or(|seen| csn > seen)
+            {
+                state.last_csn = Some(csn.to_string());
+            }
+        } else {
+            state.ignored += 1;
+        }
+    }
+
+    /// The peers this process knows about, for tests and for a shutdown summary.
+    pub fn peers(&self) -> Vec<(String, PeerState)> {
+        self.lock_peers()
+            .iter()
+            .map(|(url, state)| (url.clone(), state.clone()))
+            .collect()
+    }
+
+    fn lock_peers(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, PeerState>> {
+        self.peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Records one unresolved disagreement with a peer.
     pub fn record_conflict(&self) {
         self.conflicts_total.fetch_add(1, Ordering::Relaxed);
@@ -308,6 +392,110 @@ impl Metrics {
             "ldap_replication_conflicts_total {}\n",
             self.conflicts_total.load(Ordering::Relaxed)
         ));
+
+        // Per-peer replication. Labelled, unlike everything above, because the only question
+        // these answer is "which node is behind" - and a single number cannot answer it.
+        let peers = self.peers();
+
+        if !peers.is_empty() {
+            out.push_str(
+                "# HELP ldap_replication_peer_connected Whether the persistent connection to a \
+                 peer is up.\n",
+            );
+            out.push_str("# TYPE ldap_replication_peer_connected gauge\n");
+            for (url, state) in &peers {
+                let _ = writeln!(
+                    out,
+                    "ldap_replication_peer_connected{{peer=\"{}\"}} {}",
+                    escape_label(url),
+                    u8::from(state.connected)
+                );
+            }
+            out.push('\n');
+
+            out.push_str(
+                "# HELP ldap_replication_changes_applied_total Changes written from a peer.\n",
+            );
+            out.push_str("# TYPE ldap_replication_changes_applied_total counter\n");
+            for (url, state) in &peers {
+                let _ = writeln!(
+                    out,
+                    "ldap_replication_changes_applied_total{{peer=\"{}\"}} {}",
+                    escape_label(url),
+                    state.applied
+                );
+            }
+            out.push('\n');
+
+            out.push_str(
+                "# HELP ldap_replication_changes_ignored_total Changes from a peer dropped as \
+                 already known or not newer.\n",
+            );
+            out.push_str("# TYPE ldap_replication_changes_ignored_total counter\n");
+            for (url, state) in &peers {
+                let _ = writeln!(
+                    out,
+                    "ldap_replication_changes_ignored_total{{peer=\"{}\"}} {}",
+                    escape_label(url),
+                    state.ignored
+                );
+            }
+            out.push('\n');
+
+            out.push_str(
+                "# HELP ldap_replication_peer_errors_total Failed attempts to reach a peer or to \
+                 accept its change.\n",
+            );
+            out.push_str("# TYPE ldap_replication_peer_errors_total counter\n");
+            for (url, state) in &peers {
+                let _ = writeln!(
+                    out,
+                    "ldap_replication_peer_errors_total{{peer=\"{}\"}} {}",
+                    escape_label(url),
+                    state.errors
+                );
+            }
+            out.push('\n');
+
+            // A gauge that is absent until something happens is a gauge nobody can alert on: the
+            // worst case is a peer that has never delivered a change, and that case must be
+            // visible rather than missing.
+            out.push_str(
+                "# HELP ldap_replication_last_change_timestamp_seconds When the last change from \
+                 this peer was written, as a Unix timestamp; 0 if none ever was.\n",
+            );
+            out.push_str("# TYPE ldap_replication_last_change_timestamp_seconds gauge\n");
+            for (url, state) in &peers {
+                let _ = writeln!(
+                    out,
+                    "ldap_replication_last_change_timestamp_seconds{{peer=\"{}\"}} {}",
+                    escape_label(url),
+                    state.last_change.unwrap_or(0)
+                );
+            }
+            out.push('\n');
+
+            out.push_str(
+                "# HELP ldap_replication_last_csn_newest The newest change number applied from \
+                 this peer, as information: absence means no change has ever arrived.\n",
+            );
+            out.push_str("# TYPE ldap_replication_last_csn_newest gauge\n");
+            for (url, state) in &peers {
+                let value = state
+                    .last_csn
+                    .as_deref()
+                    .and_then(csn_to_number)
+                    .map(|number| number.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let _ = writeln!(
+                    out,
+                    "ldap_replication_last_csn_newest{{peer=\"{}\"}} {}",
+                    escape_label(url),
+                    value
+                );
+            }
+            out.push('\n');
+        }
 
         out.push_str("# HELP ldap_reloads_total Successful directory reloads.\n");
         out.push_str("# TYPE ldap_reloads_total counter\n");
@@ -660,9 +848,183 @@ impl std::fmt::Debug for Journal {
     }
 }
 
+/// Escapes a label value the way the Prometheus text format requires.
+///
+/// A peer URL is configuration, so it is nearly always safe - but a URL with a quote in it would
+/// produce a document a scraper rejects, and rejecting the whole scrape for one bad label is a
+/// harsh way to learn about a typo.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+
+    for character in value.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+
+    out
+}
+
+/// A change number as a number, for a gauge.
+///
+/// Prometheus cannot compare strings, so "is this replica behind" would be unanswerable from a
+/// textual CSN. The mapping keeps the order: `<timestamp>#<counter>` becomes
+/// `YYYYmmddHHMMSS.microsecond * 1000 + counter`, which climbs with every change and fits in a
+/// `u64` until well past the year 9999. The server id and the modifier are dropped: they break
+/// ties, they do not measure progress, and a gauge that jumped when the tie-break changed would
+/// mislead exactly the person watching a replica lag.
+fn csn_to_number(csn: &str) -> Option<u64> {
+    let mut parts = csn.split('#');
+    let timestamp = parts.next()?;
+    let counter: u64 = parts.next()?.trim_start_matches('0').parse().unwrap_or(0);
+
+    // The timestamp goes through the same parser the write path uses, rather than through
+    // arithmetic on `YYYYmmddHHMMSS`: fourteen digits multiplied by a microsecond scale overflows a
+    // `u64`, and the failure is silent - two different changes collapse to the same maximum, which
+    // is a freshness gauge that stops moving exactly when it matters.
+    let at = crate::operational::parse_generalized_time(timestamp)?;
+    let micros = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_micros() as u64)
+        .unwrap_or(0);
+
+    Some(micros.saturating_mul(1000).saturating_add(counter))
+}
+
+/// Seconds since the Unix epoch, for a timestamp gauge.
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_that_never_connected_is_still_in_the_document() {
+        // The case a graph must show and an absent series cannot: a configured peer that has never
+        // once come up. Registered at startup, so the zeroes exist before anything is attempted.
+        let metrics = Metrics::new();
+        metrics.register_peer("ldap://node2.example.com");
+
+        let rendered = metrics.render();
+        assert!(
+            rendered
+                .contains("ldap_replication_peer_connected{peer=\"ldap://node2.example.com\"} 0"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "ldap_replication_last_change_timestamp_seconds{peer=\"ldap://node2.example.com\"} 0"
+            ),
+            "never having delivered a change must read as zero, not as a missing series: {rendered}"
+        );
+    }
+
+    #[test]
+    fn what_a_peer_delivered_is_counted_per_peer() {
+        // Two peers, and the numbers must not run together: the whole point of the label is that
+        // "which node is behind" has an answer.
+        let metrics = Metrics::new();
+        metrics.register_peer("ldap://one");
+        metrics.register_peer("ldap://two");
+
+        metrics.peer_connected("ldap://one", true);
+        metrics.peer_change(
+            "ldap://one",
+            true,
+            Some("20260101000000.000001Z#000001#002#000000"),
+        );
+        metrics.peer_change(
+            "ldap://one",
+            true,
+            Some("20260101000000.000002Z#000001#002#000000"),
+        );
+        metrics.peer_change("ldap://one", false, None);
+        metrics.peer_error("ldap://two");
+
+        let peers = metrics.peers();
+        let one = peers
+            .iter()
+            .find(|(url, _)| url == "ldap://one")
+            .map(|(_, state)| state)
+            .expect("peer one");
+        let two = peers
+            .iter()
+            .find(|(url, _)| url == "ldap://two")
+            .map(|(_, state)| state)
+            .expect("peer two");
+
+        assert!(one.connected);
+        assert_eq!(one.applied, 2);
+        assert_eq!(one.ignored, 1);
+        assert_eq!(one.errors, 0);
+
+        assert!(!two.connected);
+        assert_eq!(two.applied, 0);
+        assert_eq!(two.errors, 1);
+    }
+
+    #[test]
+    fn the_freshness_csn_only_moves_forward() {
+        // A peer's changes can arrive out of order across a reconnect. A freshness gauge that went
+        // backwards would tell an operator a replica had regressed when it had not.
+        let metrics = Metrics::new();
+        metrics.peer_change(
+            "ldap://one",
+            true,
+            Some("20260101000000.000009Z#000001#002#000000"),
+        );
+        metrics.peer_change(
+            "ldap://one",
+            true,
+            Some("20260101000000.000001Z#000001#002#000000"),
+        );
+
+        let state = metrics.peers().pop().expect("one peer").1;
+        assert_eq!(
+            state.last_csn.as_deref(),
+            Some("20260101000000.000009Z#000001#002#000000")
+        );
+    }
+
+    #[test]
+    fn a_change_number_becomes_a_number_that_keeps_the_order() {
+        // Prometheus cannot compare strings, so "is this replica behind" needs a numeric projection
+        // that climbs with every change.
+        let early = csn_to_number("20260101000000.000001Z#000001#002#000000").expect("a number");
+        let later = csn_to_number("20260101000000.000002Z#000001#002#000000").expect("a number");
+        let same_second =
+            csn_to_number("20260101000000.000001Z#000009#002#000000").expect("a number");
+        let next_year =
+            csn_to_number("20270101000000.000001Z#000001#002#000000").expect("a number");
+
+        assert!(early < later, "a later microsecond");
+        assert!(
+            early < same_second,
+            "a higher counter in the same microsecond"
+        );
+        assert!(later < next_year, "a later year");
+
+        assert_eq!(csn_to_number("nonsense"), None);
+        assert_eq!(csn_to_number(""), None);
+    }
+
+    #[test]
+    fn a_label_is_escaped_so_one_bad_url_does_not_break_the_scrape() {
+        // A URL is configuration, so it is nearly always safe - but a quote in it would produce a
+        // document a scraper rejects, and rejecting the whole scrape is a harsh way to learn about
+        // a typo.
+        assert_eq!(escape_label("ldap://plain"), "ldap://plain");
+        assert_eq!(escape_label("a\"b"), "a\\\"b");
+        assert_eq!(escape_label("a\\b"), "a\\\\b");
+    }
 
     #[test]
     fn a_conflict_is_counted_and_rendered() {

@@ -659,6 +659,10 @@ async fn main() {
         },
     );
 
+    // Declared before anything is contacted, so a peer that never connects still has a series with
+    // a zero in it - which is the case an operator most needs to see.
+    reporter.register(&config.peers);
+
     let peer_tasks: Vec<tokio::task::JoinHandle<()>> = config
         .peers
         .iter()
