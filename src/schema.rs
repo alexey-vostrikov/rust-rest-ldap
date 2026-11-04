@@ -23,6 +23,34 @@ use thiserror::Error;
 
 use crate::model::Entry;
 
+/// Where a schema definition came from, for a message that names the source rather than the
+/// symptom.
+///
+/// Separate from [`SchemaError`] because the parse failure is the same in every case and only
+/// the address differs: a file has a path, a definition sent over the protocol has a position
+/// and no path at all.
+#[derive(Debug, Error)]
+pub enum SchemaSource {
+    #[error("error reading schema file '{path}': {source}")]
+    Read {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("error loading schema from '{path}': {source}")]
+    Parse {
+        path: String,
+        #[source]
+        source: SchemaError,
+    },
+    #[error("definition {position} added through cn=schema,cn=config is not usable: {source}")]
+    Definition {
+        position: usize,
+        #[source]
+        source: SchemaError,
+    },
+}
+
 /// Value syntaxes that the validator understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Syntax {
@@ -342,6 +370,49 @@ impl Schema {
             }
         }
         Ok(())
+    }
+
+    /// Builds the schema a server runs with: the built-in core, then files, then what the
+    /// protocol added.
+    ///
+    /// One builder for both callers. Startup and a schema reload have to agree on the order and
+    /// on what a failure means, and two copies of this loop is how they stop agreeing: the
+    /// reload would eventually miss a source that startup had learned about, and the difference
+    /// would show up as a definition that works until the server restarts.
+    ///
+    /// The order is a precedence: a later source may only add names still free, because a
+    /// duplicate is refused rather than replaced. Inline definitions come last, so a definition
+    /// added through `cn=schema,cn=config` is not shadowed by a file; a clash is reported either
+    /// way and never resolved silently in favour of one source.
+    pub fn from_sources(
+        files: &[std::path::PathBuf],
+        definitions: &[String],
+    ) -> Result<Self, SchemaSource> {
+        let mut schema = Self::core();
+
+        for path in files {
+            let text = std::fs::read_to_string(path).map_err(|source| SchemaSource::Read {
+                path: path.display().to_string(),
+                source,
+            })?;
+
+            schema.extend(&text).map_err(|source| SchemaSource::Parse {
+                path: path.display().to_string(),
+                source,
+            })?;
+        }
+
+        for (position, definition) in definitions.iter().enumerate() {
+            // Numbered from one: whoever added it counted the values they sent starting at one.
+            schema
+                .extend(definition)
+                .map_err(|source| SchemaSource::Definition {
+                    position: position + 1,
+                    source,
+                })?;
+        }
+
+        Ok(schema)
     }
 
     fn insert_attribute(&mut self, attribute: AttributeType) -> Result<(), SchemaError> {
@@ -1500,5 +1571,57 @@ attributetype ( 2.5.4.41 NAME 'name'
         ] {
             assert!(schema.class(class).is_some(), "{class} must be defined");
         }
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    const DRINK: &str = "attributeType ( 1.3.6.1.4.1.59999.2.1 NAME 'favouriteDrink' \
+         SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )";
+
+    #[test]
+    fn definitions_follow_the_files_and_are_counted_from_one() {
+        let schema = Schema::from_sources(&[], &[DRINK.to_string()]).expect("built");
+        assert!(schema.attribute("favouritedrink").is_some());
+    }
+
+    #[test]
+    fn a_broken_definition_is_reported_by_position() {
+        // The number a client counts to, not a byte offset: the operator has to be able to point
+        // at the value in the request that caused it.
+        let err = Schema::from_sources(
+            &[],
+            &[
+                DRINK.to_string(),
+                "attributeType ( NAME 'noOid' )".to_string(),
+            ],
+        )
+        .expect_err("the second definition is not usable");
+
+        let text = err.to_string();
+        assert!(text.contains("definition 2"), "{text}");
+        assert!(text.contains("cn=schema,cn=config"), "{text}");
+    }
+
+    #[test]
+    fn a_definition_that_collides_with_a_file_is_reported_rather_than_replacing_it() {
+        // Order decides nothing about a duplicate: the file is already in, and `extend` refuses
+        // the newcomer, so the clash is visible instead of one source silently winning.
+        let schema = Schema::from_sources(&[], &[DRINK.to_string(), DRINK.to_string()]);
+        assert!(
+            schema.is_err(),
+            "the same name twice is an error, not a replacement"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_names_the_path() {
+        let err = Schema::from_sources(&[std::path::PathBuf::from("/nonexistent/x.schema")], &[])
+            .expect_err("the file is not there");
+
+        let text = err.to_string();
+        assert!(text.contains("/nonexistent/x.schema"), "{text}");
     }
 }

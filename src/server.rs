@@ -380,7 +380,7 @@ pub async fn serve_connection_as(
                     message_id,
                 } = *committed;
 
-                let adopted = adopt_configuration(&security, &document);
+                let adopted = adopt_configuration(&source, &security, &document).await;
 
                 // Rebuilt, never mutated: `response` carries the message id of the request.
                 let answer = crate::ldap::FailureResponse::Modify.message(
@@ -482,7 +482,18 @@ pub async fn serve(
 /// A failure here does not undo the commit: the generation is on disk, the running server keeps
 /// the policy it has, and the answer says so. Undoing a committed generation would mean the
 /// store and the history disagree about what happened.
-fn adopt_configuration(security: &crate::security::Shared, document: &str) -> String {
+/// Adopts a committed configuration, and the schema it describes.
+///
+/// The schema is a separate step on purpose. Everything else a commit changes is policy this
+/// process holds; the schema is a handle shared with every connection, and a reload through the
+/// `Source` is the only thing that replaces what that handle points at. Adopting the document
+/// without it would leave a server enforcing definitions nobody can see any more - and saying
+/// "committed" while it did.
+async fn adopt_configuration(
+    source: &crate::reload::Source,
+    security: &crate::security::Shared,
+    document: &str,
+) -> String {
     let config =
         match crate::config::resolve(crate::config::Args::default(), Some(document), |name| {
             std::env::var(name).ok()
@@ -500,18 +511,138 @@ fn adopt_configuration(security: &crate::security::Shared, document: &str) -> St
             }
         };
 
+    // The document the server was configured from carries the store path and the origin, and a
+    // document built by `resolve` has neither: publishing it as it is would leave the subtree
+    // readable but unwritable, because the next change would find no generation to commit to.
+    let previous = security.running().document.clone();
+    let sources = crate::reload::SchemaSources::from_config(&config);
+
+    // Read before `apply`, which replaces the record of what is in force.
+    let schema_sources_moved = {
+        let before = security.running();
+        before.schema_files != config.schema_files
+            || before.schema_definitions != config.schema_definitions
+    };
+
     let applied = security.apply(&config);
+
+    // A committed document is what `cn=config` publishes from now on. Without this the subtree
+    // would keep showing the settings the server started with, so a client that just added a
+    // value would read its entry back and not find it - and would have no way to tell a refused
+    // change from a change the server accepted and forgot.
+    security.publish_document(crate::config::Document {
+        text: document.to_string(),
+        origin: previous
+            .as_ref()
+            .map(|document| document.origin.clone())
+            .unwrap_or_default(),
+        store: previous
+            .as_ref()
+            .and_then(|document| document.store.clone()),
+    });
+
+    // A schema that cannot be adopted takes the whole change back.
+    //
+    // The commit is already written by the time this runs, and leaving it there would be worse
+    // than a refusal: the document would say a definition is gone while the server still enforces
+    // it, and the next start would refuse to come up at all - a change that reports success and
+    // produces a server which cannot be restarted. The store keeps the previous generation, so
+    // the way back is a new commit of the previous text, and the history shows both.
+    let schema_note = if schema_sources_moved {
+        match source.adopt_schema_sources(sources).await {
+            Ok(reloaded) => Some(crate::i18n::t(
+                "config.schema_applied",
+                &[
+                    ("attributes", &reloaded.attributes.to_string()),
+                    ("classes", &reloaded.classes.to_string()),
+                ],
+            )),
+            Err(err) => {
+                let restored = restore_previous(security, previous.as_ref(), document);
+                Some(crate::i18n::t(
+                    "config.schema_refused",
+                    &[("detail", &err.to_string()), ("restored", &restored)],
+                ))
+            }
+        }
+    } else {
+        None
+    };
 
     // Two messages rather than one with a placeholder that has to be filled with "yes" or
     // "no": the wording differs, and a translator should see both.
-    if applied.needs_restart.is_empty() {
+    let adopted = if applied.needs_restart.is_empty() {
         crate::i18n::t("config.committed", &[])
     } else {
         crate::i18n::t(
             "config.committed_needs_restart",
             &[("settings", &applied.needs_restart.join(", "))],
         )
+    };
+
+    match schema_note {
+        Some(note) => format!("{adopted} {note}"),
+        None => adopted,
     }
+}
+
+/// Puts the settings that were in force before a commit back into force.
+///
+/// Two things have to move together, and the order is deliberate: the running server first, so it
+/// stops enforcing nothing, then the store, which is what a restart reads. A reader of the
+/// history sees the change and its reversal as two generations, which is the honest record - the
+/// change did happen, and it was taken back because the schema could not follow it.
+fn restore_previous(
+    security: &crate::security::Shared,
+    previous: Option<&crate::config::Document>,
+    attempted: &str,
+) -> String {
+    let Some(previous) = previous else {
+        return crate::i18n::t("config.restore_no_previous", &[]);
+    };
+
+    // The policy the document described, back in force. A document that no longer resolves is
+    // the one case where nothing can be restored, and it is reported rather than guessed at.
+    match crate::config::resolve(
+        crate::config::Args::default(),
+        Some(&previous.text),
+        |name| std::env::var(name).ok(),
+    ) {
+        Ok(config) => {
+            security.apply(&config);
+        }
+        Err(err) => {
+            return crate::i18n::t("config.restore_failed", &[("detail", &err.to_string())]);
+        }
+    }
+
+    security.publish_document(previous.clone());
+
+    let Some(store_path) = previous.store.as_deref() else {
+        return crate::i18n::t("config.restore_no_store", &[]);
+    };
+
+    let store = crate::config_store::Store::open(store_path);
+    match store.commit(
+        &previous.text,
+        "server",
+        &format!("schema refused: {}", first_line(attempted)),
+    ) {
+        Ok(generation) => crate::i18n::t(
+            "config.restore_committed",
+            &[("generation", &generation.number.to_string())],
+        ),
+        Err(err) => crate::i18n::t("config.restore_failed", &[("detail", &err.to_string())]),
+    }
+}
+
+/// The first line of a document, for a note that stays readable in `--config-history`.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// What the server reports to: counters and the change journal.
@@ -782,6 +913,7 @@ mod tests {
             schema: crate::schema::Schema::core(),
             schema_mode: crate::schema::Mode::Strict,
             schema_files: Vec::new(),
+            schema_definitions: Vec::new(),
             indexes: crate::index::IndexConfig::default(),
             referrals: Default::default(),
             server_id: 0,

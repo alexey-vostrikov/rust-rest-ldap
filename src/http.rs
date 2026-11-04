@@ -206,6 +206,7 @@ mod tests {
             schema: crate::schema::Schema::core(),
             schema_mode: crate::schema::Mode::Strict,
             schema_files: Vec::new(),
+            schema_definitions: Vec::new(),
             indexes: crate::index::IndexConfig::default(),
             referrals: Default::default(),
             server_id: 0,

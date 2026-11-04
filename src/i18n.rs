@@ -603,6 +603,42 @@ const ENGLISH: &[(&str, &str)] = &[
         "error loading the schema from '{path}': {detail}",
     ),
     (
+        "config.schema_applied",
+        "The schema was reloaded: {attributes} attribute types and {classes} classes are in force.",
+    ),
+    (
+        "config.schema_not_applied",
+        "The schema was NOT reloaded and the previous definitions are still in force: {detail}. \
+         The committed definitions take effect at the next start.",
+    ),
+    (
+        "config.schema_refused",
+        "The schema could not be adopted, so the change was taken back: {detail}. {restored}",
+    ),
+    (
+        "config.restore_committed",
+        "The settings of generation {generation} were in force before this change and are in \
+         force again, committed as a new generation.",
+    ),
+    (
+        "config.restore_no_store",
+        "The previous settings are in force in this process, but they came from a file rather \
+         than a store, so nothing was committed: editing that file is what keeps them after a \
+         restart.",
+    ),
+    (
+        "config.restore_no_previous",
+        "There were no previous settings to restore.",
+    ),
+    (
+        "config.restore_failed",
+        "Restoring the previous settings failed: {detail}",
+    ),
+    (
+        "config.schema_definition",
+        "definition {position} added through cn=schema,cn=config is not usable: {detail}",
+    ),
+    (
         "config.schema_mode",
         "unknown schema mode '{value}'; expected strict, warn or off",
     ),

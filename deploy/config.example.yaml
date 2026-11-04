@@ -55,6 +55,14 @@ schema:
   mode: strict
   #files:
   #  - /etc/rust-rest-ldap/local.schema
+  # Definitions added at run time through `cn=schema,cn=config` are written here by the server,
+  # in the same syntax as the files above. There is no need to edit this by hand: the entry is
+  # what a client writes, and this is where the result is kept so it survives a restart.
+  #definitions:
+  #  - >
+  #    attributeType ( 1.3.6.1.4.1.99999.1.1 NAME 'favouriteDrink'
+  #        EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+  #        SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
 
 # Uniqueness and referential integrity: one `uid`, one `cn` per unit, and no group listing
 # a user that does not exist.

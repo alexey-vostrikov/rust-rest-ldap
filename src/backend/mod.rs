@@ -168,6 +168,29 @@ pub enum BackendError {
     },
     #[error("the schema file '{path}' is not valid: {detail}")]
     SchemaParse { path: String, detail: String },
+    #[error("definition {position} added through cn=schema,cn=config is not usable: {detail}")]
+    SchemaDefinition { position: usize, detail: String },
+}
+
+/// A schema that could not be built, as a backend error.
+///
+/// The reload rebuilds the schema from the same three sources startup reads, so it reports the
+/// same three kinds of failure; only the vocabulary of the caller differs.
+impl From<crate::schema::SchemaSource> for BackendError {
+    fn from(err: crate::schema::SchemaSource) -> Self {
+        use crate::schema::SchemaSource as Source;
+        match err {
+            Source::Read { path, source } => BackendError::SchemaRead { path, source },
+            Source::Parse { path, source } => BackendError::SchemaParse {
+                path,
+                detail: source.to_string(),
+            },
+            Source::Definition { position, source } => BackendError::SchemaDefinition {
+                position,
+                detail: source.to_string(),
+            },
+        }
+    }
 }
 
 /// Selected backend.

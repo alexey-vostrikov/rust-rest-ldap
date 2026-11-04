@@ -170,6 +170,11 @@ impl ConfigError {
                 owned.push(("path".to_string(), path.clone()));
                 owned.push(("detail".to_string(), source.to_string()));
             }
+            Self::SchemaDefinition { position, detail } => {
+                key = "config.schema_definition";
+                owned.push(("position".to_string(), position.to_string()));
+                owned.push(("detail".to_string(), detail.clone()));
+            }
             Self::Interval { value, source } => {
                 key = "config.interval";
                 owned.push(("value".to_string(), value.clone()));
@@ -277,6 +282,14 @@ pub struct Config {
     /// The schema itself is a parsed value and cannot be re-derived from it: a reload needs
     /// the paths, not the result.
     pub schema_files: Vec<PathBuf>,
+    /// Definitions written through `cn=schema,cn=config` rather than into a file.
+    ///
+    /// Kept beside the files for the same reason: a reload rebuilds the schema from its
+    /// sources, and these are one of them. They are stored in the configuration document, so a
+    /// definition added over the protocol survives a restart without anybody editing a file -
+    /// which is the point of a writable `cn=schema`, and the reason it cannot live only in the
+    /// running schema.
+    pub schema_definitions: Vec<String>,
     pub indexes: IndexConfig,
     pub acl: Acl,
     /// Simple bind over an unencrypted connection.
@@ -384,6 +397,8 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("definition {position} added through cn=schema,cn=config is not usable: {detail}")]
+    SchemaDefinition { position: usize, detail: String },
     #[error("unknown schema mode: {0}")]
     SchemaMode(String),
     #[error(
@@ -523,6 +538,13 @@ pub struct SchemaConfig {
     pub mode: Option<String>,
     /// Extra `.schema` files, read after the built-in definitions.
     pub files: Vec<PathBuf>,
+    /// Definitions added at run time through `cn=schema,cn=config`, each in RFC 4512 syntax and
+    /// beginning with its keyword (`attributeType` or `objectClass`).
+    ///
+    /// Same shape as the contents of a `.schema` file, so the two are interchangeable: a
+    /// definition can be moved between the file and the entry without being rewritten, and one
+    /// parser reads both.
+    pub definitions: Vec<String>,
 }
 
 /// One `referrals:` entry: a subtree this server does not hold, and where it lives.
@@ -865,6 +887,7 @@ pub fn resolve(
             schema
         },
         schema_files: file.schema.files.clone(),
+        schema_definitions: file.schema.definitions.clone(),
         schema_mode: match file.schema.mode.as_deref() {
             None => SchemaMode::Strict,
             Some(text) => text
@@ -936,22 +959,31 @@ pub fn resolve(
     Ok(config)
 }
 
-/// Builds the schema: built-in definitions first, then every configured file.
+/// Builds the schema from its three sources, in the one order that is defined somewhere else.
+///
+/// The order, the failure and the numbering live in [`Schema::from_sources`], because a reload
+/// builds the same schema and must not learn the rules a second time.
 fn load_schema(config: &SchemaConfig) -> Result<Schema, ConfigError> {
-    let mut schema = Schema::core();
+    Ok(Schema::from_sources(&config.files, &config.definitions)?)
+}
 
-    for path in &config.files {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::SchemaRead {
-            path: path.display().to_string(),
-            source,
-        })?;
-        schema.extend(&text).map_err(|source| ConfigError::Schema {
-            path: path.display().to_string(),
-            source,
-        })?;
+/// A schema that could not be built, expressed as a configuration error.
+///
+/// The three sources fail with the same parse error and differ only in the address, so the
+/// mapping is mechanical - and it lives in one place so the i18n keys stay attached to the
+/// variant they belong to.
+impl From<crate::schema::SchemaSource> for ConfigError {
+    fn from(err: crate::schema::SchemaSource) -> Self {
+        use crate::schema::SchemaSource as Source;
+        match err {
+            Source::Read { path, source } => ConfigError::SchemaRead { path, source },
+            Source::Parse { path, source } => ConfigError::Schema { path, source },
+            Source::Definition { position, source } => ConfigError::SchemaDefinition {
+                position,
+                detail: source.to_string(),
+            },
+        }
     }
-
-    Ok(schema)
 }
 
 fn pick(cli: Option<String>, env: Option<String>, file: Option<String>) -> Option<String> {
@@ -981,6 +1013,45 @@ mod tests {
                 .find(|(key, _)| key == name)
                 .map(|(_, value)| value.clone())
         }
+    }
+
+    #[test]
+    fn a_definition_written_into_the_document_reaches_the_schema() {
+        // The document is the source of truth for definitions added over the protocol, so
+        // parsing it has to produce them - that is what makes them survive a restart, and what
+        // makes the commit path's own validation refuse a definition that does not parse.
+        let cfg = resolve(
+            Args::default(),
+            Some(
+                "schema:\n  mode: strict\n  definitions:\n    - \"attributeType ( \
+                 1.3.6.1.4.1.59999.3.1 NAME 'favouriteDrink' SYNTAX \
+                 1.3.6.1.4.1.1466.115.121.1.15 )\"\n",
+            ),
+            no_env,
+        )
+        .expect("a document with a definition is a valid configuration");
+
+        assert_eq!(cfg.schema_definitions.len(), 1);
+        assert!(
+            cfg.schema.attribute("favouritedrink").is_some(),
+            "the definition is part of the schema the server starts with"
+        );
+    }
+
+    #[test]
+    fn a_definition_that_does_not_parse_fails_the_whole_configuration() {
+        // Loudly, before anything is committed: a definition accepted here but not at startup
+        // would be a server that starts and then refuses to.
+        let err = resolve(
+            Args::default(),
+            Some("schema:\n  definitions:\n    - \"attributeType ( NAME 'noOid' )\"\n"),
+            no_env,
+        )
+        .expect_err("a definition without an OID is not usable");
+
+        let text = err.to_string();
+        assert!(text.contains("cn=schema,cn=config"), "{text}");
+        assert!(text.contains("definition 1"), "{text}");
     }
 
     #[test]

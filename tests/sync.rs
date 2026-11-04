@@ -74,6 +74,7 @@ async fn serve(entries: Vec<Entry>) -> String {
         schema: rust_rest_ldap::schema::Schema::core(),
         schema_mode: rust_rest_ldap::schema::Mode::Off,
         schema_files: Vec::new(),
+        schema_definitions: Vec::new(),
         indexes: Default::default(),
         referrals: Default::default(),
         server_id: 0,
