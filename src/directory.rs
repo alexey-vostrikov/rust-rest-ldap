@@ -376,6 +376,127 @@ impl Directory {
         Ok(self)
     }
 
+    /// Adds an entry without reloading the directory.
+    ///
+    /// The entry is placed where a full rebuild would have placed it - the users range keeps DN
+    /// order, the groups range its own, anything else goes after both - and the index learns it
+    /// under a fresh id. What moves is positions, not ids: every posting that pointed at an entry
+    /// still points at it, so the index does not have to be rewritten for the entries the
+    /// insertion shifted.
+    ///
+    /// Returns `false` when an entry with this DN is already present, which is the case a caller
+    /// has to handle as a modify rather than an add.
+    pub fn insert_entry_in_place(
+        &mut self,
+        entry: Entry,
+        config: &IndexConfig,
+    ) -> Result<bool, crate::index::IndexError> {
+        let entry_dn = entry.dn().to_string();
+        if self.by_dn.contains_key(&entry_dn) {
+            return Ok(false);
+        }
+
+        let id = self.next_id;
+        let position = self.place_of(&entry_dn);
+
+        self.entries.insert(position, entry);
+        self.ids.insert(position, id);
+        self.next_id += 1;
+
+        // The three ranges are one contiguous layout, so an insertion inside one of them moves
+        // the end of every range that starts at or after it.
+        if position < self.users.start {
+            self.users = (self.users.start + 1)..(self.users.end + 1);
+            self.groups = (self.groups.start + 1)..(self.groups.end + 1);
+        } else if position < self.users.end {
+            self.users = self.users.start..(self.users.end + 1);
+            self.groups = (self.groups.start + 1)..(self.groups.end + 1);
+        } else if position < self.groups.end {
+            self.groups = self.groups.start..(self.groups.end + 1);
+        }
+
+        self.reindex_positions();
+
+        // The same copy-on-write as a replace: unique here means patched in place, shared means
+        // the reader keeps the view it had.
+        let index = Arc::make_mut(&mut self.index);
+        index.add(id, &self.entries[position], config)?;
+        Ok(true)
+    }
+
+    /// Removes an entry without reloading the directory.
+    ///
+    /// Returns the entry that was removed, or `None` when there was none - and its postings go
+    /// with it, under the id it kept until now.
+    pub fn remove_entry_in_place(
+        &mut self,
+        entry_dn: &str,
+        config: &IndexConfig,
+    ) -> Result<Option<Entry>, crate::index::IndexError> {
+        let Some(position) = self.position(entry_dn) else {
+            return Ok(None);
+        };
+
+        let id = self.ids[position];
+        let removed = self.entries.remove(position);
+        self.ids.remove(position);
+
+        if position < self.users.end {
+            self.users = self.users.start..(self.users.end - 1);
+            self.groups = (self.groups.start - 1)..(self.groups.end - 1);
+        } else if position < self.groups.end {
+            self.groups = self.groups.start..(self.groups.end - 1);
+        }
+
+        self.reindex_positions();
+
+        let index = Arc::make_mut(&mut self.index);
+        index.remove(id, &removed, config)?;
+        Ok(Some(removed))
+    }
+
+    /// Where a new entry with this DN belongs in the canonical order.
+    ///
+    /// The same rule [`Self::from_entries`] applies when it sorts, expressed as a position: a
+    /// users entry between the other users, a group between the other groups, anything else at
+    /// the end. Two implementations of one rule is a risk, so the ranges this reads are the ones
+    /// that rebuild produced.
+    fn place_of(&self, entry_dn: &str) -> usize {
+        let users_ou = self.ou_dn(&self.users_ou_name);
+        let groups_ou = self.ou_dn(&self.groups_ou_name);
+
+        if is_descendant(entry_dn, &users_ou) {
+            return self.sorted_position(self.users.clone(), entry_dn);
+        }
+        if is_descendant(entry_dn, &groups_ou) {
+            return self.sorted_position(self.groups.clone(), entry_dn);
+        }
+
+        self.entries.len()
+    }
+
+    /// The first position in `range` whose DN is greater, which is where an insert keeps order.
+    fn sorted_position(&self, range: Range<usize>, entry_dn: &str) -> usize {
+        range
+            .clone()
+            .find(|position| self.entries[*position].dn() > entry_dn)
+            .unwrap_or(range.end)
+    }
+
+    /// Rebuilds the two maps that translate, after the vector moved.
+    ///
+    /// Both are derived from the vector and the id list, so they are recomputed rather than
+    /// patched: a map patched in one place and not another answers about the wrong entry, and the
+    /// defect shows up as a search that returns something it should not.
+    fn reindex_positions(&mut self) {
+        self.by_dn.clear();
+        self.by_id.clear();
+        for (position, (entry, id)) in self.entries.iter().zip(self.ids.iter()).enumerate() {
+            self.by_dn.insert(entry.dn().to_string(), position);
+            self.by_id.insert(*id, position);
+        }
+    }
+
     /// The stable id of an entry, which is what its postings point at.
     pub fn id_of(&self, entry_dn: &str) -> Option<u32> {
         self.position(entry_dn).map(|position| self.ids[position])

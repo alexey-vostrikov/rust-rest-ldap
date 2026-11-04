@@ -186,6 +186,15 @@ pub struct Index {
     built: BTreeMap<Arc<str>, BTreeSet<Kind>>,
 }
 
+/// The per-attribute plan, without the pseudo-attribute that carries the default.
+fn plan_of(config: &IndexConfig) -> Result<BTreeMap<String, BTreeSet<Kind>>, IndexError> {
+    let plan = config.resolve()?;
+    Ok(plan
+        .into_iter()
+        .filter(|(attribute, _)| !attribute.is_empty())
+        .collect())
+}
+
 /// Marks a snapshot written by this format, so a foreign or older blob is refused rather than
 /// misread as postings.
 const MAGIC: &[u8; 4] = b"RRIX";
@@ -499,6 +508,17 @@ impl Index {
         }
 
         Ok(index)
+    }
+
+    /// Drops the posting lists that lost their last id.
+    ///
+    /// A server written to for months would otherwise keep one empty bitmap per value it has ever
+    /// seen, and the memory would grow with the history instead of with the data.
+    fn prune_attributes(&mut self, entry: &Entry) {
+        for attribute in entry.attributes().values() {
+            let name: Arc<str> = crate::model::attribute_name(&attribute.name.to_lowercase());
+            self.prune(&name);
+        }
     }
 
     /// The bytes that let the next start skip building this index.
@@ -828,6 +848,30 @@ impl Index {
     /// when the id is the same before and after, which is true for a replace: the position in
     /// canonical order depends on the DN, and a modify does not change the DN. Adding or
     /// deleting an entry moves every id after it, and that still rebuilds the whole index.
+    /// Adds one entry's postings under `id`, without touching any other entry.
+    ///
+    /// The half of [`Self::replace`] an insertion needs, and the reason a write no longer costs
+    /// the directory: the entries already indexed keep their postings, because their ids did not
+    /// change when the new entry took a position.
+    pub fn add(&mut self, id: u32, entry: &Entry, config: &IndexConfig) -> Result<(), IndexError> {
+        let per_attribute = plan_of(config)?;
+        self.touch(id, entry, &per_attribute, Touch::Add);
+        Ok(())
+    }
+
+    /// Removes one entry's postings, pruning what is left empty.
+    pub fn remove(
+        &mut self,
+        id: u32,
+        entry: &Entry,
+        config: &IndexConfig,
+    ) -> Result<(), IndexError> {
+        let per_attribute = plan_of(config)?;
+        self.touch(id, entry, &per_attribute, Touch::Remove);
+        self.prune_attributes(entry);
+        Ok(())
+    }
+
     pub fn replace(
         &mut self,
         id: u32,
@@ -835,22 +879,12 @@ impl Index {
         new: &Entry,
         config: &IndexConfig,
     ) -> Result<(), IndexError> {
-        let plan = config.resolve()?;
-        let per_attribute: BTreeMap<String, BTreeSet<Kind>> = plan
-            .into_iter()
-            .filter(|(attribute, _)| !attribute.is_empty())
-            .collect();
+        let per_attribute = plan_of(config)?;
 
         self.touch(id, old, &per_attribute, Touch::Remove);
         self.touch(id, new, &per_attribute, Touch::Add);
 
-        // A posting list that lost its last id is removed rather than left empty: a server that
-        // is written to for months would otherwise keep one empty bitmap per value it has ever
-        // seen, and the memory would grow with the history instead of with the data.
-        for attribute in old.attributes().values() {
-            let name: Arc<str> = crate::model::attribute_name(&attribute.name.to_lowercase());
-            self.prune(&name);
-        }
+        self.prune_attributes(old);
 
         Ok(())
     }

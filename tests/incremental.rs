@@ -6,6 +6,7 @@
 
 use rust_rest_ldap::backend::{Backend, EntryChange};
 use rust_rest_ldap::directory::Scope;
+use rust_rest_ldap::index::Query;
 use rust_rest_ldap::model::{Attribute, Attributes, Entry};
 use rust_rest_ldap::reload::Source;
 
@@ -171,8 +172,89 @@ async fn what_an_in_place_write_leaves_is_what_a_reload_would_have_read() {
     assert_eq!(patched_index, *reloaded.index(), "and the index with it");
 }
 
+/// What the index answers for a query, as the DNs of the entries it points at.
+///
+/// The ids cannot be compared: an in-place write keeps the ids it issued, and a rebuild issues
+/// them again in canonical order, so the same index over the same directory carries different
+/// numbers. What a client sees is which entries the answer names, and that has to match.
+fn answered_dns(directory: &rust_rest_ldap::directory::Directory, query: &Query) -> Vec<String> {
+    let Some(candidates) = directory.index().candidates(query) else {
+        return Vec::new();
+    };
+
+    let mut dns: Vec<String> = candidates
+        .iter()
+        .filter_map(|id| {
+            directory
+                .entry_by_id(id)
+                .map(|entry| entry.dn().to_string())
+        })
+        .collect();
+    dns.sort();
+    dns
+}
+
+/// The queries the comparison runs: one per index kind, plus a conjunction.
+fn probes() -> Vec<Query> {
+    vec![
+        Query::Equality {
+            attribute: "sn".into(),
+            value: "original".into(),
+        },
+        Query::Presence("cn".into()),
+        Query::Substring {
+            attribute: "mail".into(),
+            initial: Some("u1".to_string()),
+            any: Vec::new(),
+            final_part: None,
+        },
+        Query::And(vec![
+            Query::Presence("cn".into()),
+            Query::Equality {
+                attribute: "mail".into(),
+                value: "u1@example.com".into(),
+            },
+        ]),
+    ]
+}
+
+/// Every probe's answer, taken from one snapshot before it is let go.
+fn answers(directory: &rust_rest_ldap::directory::Directory) -> Vec<(Query, Vec<String>)> {
+    probes()
+        .into_iter()
+        .map(|query| {
+            let answered = answered_dns(directory, &query);
+            (query, answered)
+        })
+        .collect()
+}
+
+fn assert_same_answers(
+    in_place: &[(Query, Vec<String>)],
+    reloaded: &rust_rest_ldap::directory::Directory,
+) {
+    for (query, expected) in in_place {
+        assert_eq!(
+            reloaded_answers(reloaded, query),
+            expected.clone(),
+            "an in-place write must answer {query:?} exactly as a reload would"
+        );
+    }
+}
+
+fn reloaded_answers(
+    directory: &rust_rest_ldap::directory::Directory,
+    query: &Query,
+) -> Vec<String> {
+    answered_dns(directory, query)
+}
+
 #[tokio::test]
-async fn an_add_still_reloads_because_it_moves_every_id_after_it() {
+async fn an_add_is_applied_without_reading_the_store_and_the_index_matches_a_reload() {
+    // This used to reload, on the premise that a new entry moves the id of every entry after it.
+    // Ids no longer move - a position does - so the premise is gone and the write stops costing
+    // the directory. What still has to hold is the property the reload gave for free: the index
+    // answers exactly as an index rebuilt from scratch would.
     let dir = tempfile::tempdir().expect("tempdir");
     let source = seeded(dir.path(), 20).await;
 
@@ -187,22 +269,37 @@ async fn an_add_still_reloads_because_it_moves_every_id_after_it() {
 
     assert_eq!(
         source.store_reads(),
-        reads_before + 1,
-        "a new entry changes the id of every entry after it, so the index is rebuilt"
+        reads_before,
+        "an add must not read the store back: that is the cost this path exists to remove"
     );
+
+    let patched = source.directory().await;
     assert!(
         dn_of(&source, "cn=brand-new,ou=users,dc=example,dc=com")
             .await
             .is_some(),
         "and the entry is there"
     );
+
+    let patched_entries = patched.all().to_vec();
+    let patched_answers = answers(&patched);
+    drop(patched);
+
+    source.reload().await.expect("reload");
+    let reloaded = source.directory().await;
+
+    assert_eq!(
+        patched_entries,
+        reloaded.all().to_vec(),
+        "an in-place add must leave the directory where a reload would, order included"
+    );
+    assert_same_answers(&patched_answers, &reloaded);
 }
 
 #[tokio::test]
-async fn a_delete_still_reloads() {
+async fn a_delete_is_applied_without_reading_the_store_and_the_index_matches_a_reload() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = seeded(dir.path(), 20).await;
-
     let reads_before = source.store_reads();
 
     source
@@ -213,13 +310,32 @@ async fn a_delete_still_reloads() {
         .await
         .expect("apply");
 
-    assert_eq!(source.store_reads(), reads_before + 1);
+    assert_eq!(
+        source.store_reads(),
+        reads_before,
+        "no store read for a delete"
+    );
+    let patched = source.directory().await;
     assert!(
         dn_of(&source, "cn=u4,ou=users,dc=example,dc=com")
             .await
             .is_none(),
         "the entry is gone"
     );
+
+    let patched_entries = patched.all().to_vec();
+    let patched_answers = answers(&patched);
+    drop(patched);
+
+    source.reload().await.expect("reload");
+    let reloaded = source.directory().await;
+
+    assert_eq!(
+        patched_entries,
+        reloaded.all().to_vec(),
+        "an in-place delete leaves the same directory a reload would"
+    );
+    assert_same_answers(&patched_answers, &reloaded);
 }
 
 #[tokio::test]
