@@ -36,6 +36,15 @@ static CSN_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// tests can pin it. The result is a new entry: the caller persists it, and the
 /// previous snapshot stays as it was.
 pub fn stamp_write(entry: &Entry, actor: &str, now: SystemTime) -> Entry {
+    stamp_write_for(entry, actor, now, crate::replication::server_id())
+}
+
+/// Stamps a write for a particular server id.
+///
+/// Separate from [`stamp_write`] so a test can name the id instead of changing a process-global
+/// and hoping no other test runs at the same moment. Replication needs the id in the CSN: without
+/// it two nodes' changes at the same microsecond are indistinguishable.
+pub fn stamp_write_for(entry: &Entry, actor: &str, now: SystemTime, server: u16) -> Entry {
     let timestamp = generalized_time(now);
     let mut attributes = entry.attributes().clone();
 
@@ -51,7 +60,9 @@ pub fn stamp_write(entry: &Entry, actor: &str, now: SystemTime) -> Entry {
     attributes = attributes
         .replace(Attribute::single(ATTR_MODIFY_TIMESTAMP, &timestamp).operational())
         .replace(Attribute::single(ATTR_MODIFIERS_NAME, actor).operational())
-        .replace(Attribute::single(ATTR_ENTRY_CSN, &change_sequence_number(now)).operational());
+        .replace(
+            Attribute::single(ATTR_ENTRY_CSN, &change_sequence_number(now, server)).operational(),
+        );
 
     Entry::new(entry.dn(), attributes)
 }
@@ -125,12 +136,12 @@ pub fn parse_generalized_time(text: &str) -> Option<SystemTime> {
 ///
 /// Public because the journal needs an ordering key for a change whose subject no longer exists.
 pub fn next_csn() -> String {
-    change_sequence_number(SystemTime::now())
+    change_sequence_number(SystemTime::now(), crate::replication::server_id())
 }
 
-fn change_sequence_number(at: SystemTime) -> String {
+fn change_sequence_number(at: SystemTime, server: u16) -> String {
     let counter = CSN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}#{counter:06}#{:03}#000000", generalized_time(at), 0)
+    format!("{}#{counter:06}#{:03}#000000", generalized_time(at), server)
 }
 
 /// Civil date from days since the epoch (Howard Hinnant's algorithm).
@@ -187,6 +198,37 @@ mod tests {
                 .push(Attribute::single("cn", "ann"))
                 .push(Attribute::single("sn", "Doe")),
         )
+    }
+
+    #[test]
+    fn a_write_carries_the_server_id_it_was_made_on() {
+        // The third field is what tells two nodes' changes apart. A stamp that writes zero there
+        // makes every change look like it came from nowhere, and a merge cannot order them.
+        let stamped = stamp_write_for(
+            &entry(),
+            "cn=admin,dc=example,dc=com",
+            at("20261102143012.000001Z"),
+            7,
+        );
+
+        let csn = value(&stamped, ATTR_ENTRY_CSN).expect("a csn");
+        let parsed = crate::replication::Csn::parse(&csn).expect("a parseable csn");
+        assert_eq!(parsed.server, 7);
+    }
+
+    #[test]
+    fn a_single_node_keeps_writing_the_zero_it_always_wrote() {
+        // Zero means "this node does not replicate", which is what an unconfigured server is. Its
+        // stored CSNs must not change shape over a version boundary, or every replica of it would
+        // see the whole directory as new.
+        let stamped = stamp_write_for(
+            &entry(),
+            "cn=admin,dc=example,dc=com",
+            at("20261102143012.000001Z"),
+            0,
+        );
+        let csn = value(&stamped, ATTR_ENTRY_CSN).expect("a csn");
+        assert!(csn.contains("#000#"), "{csn}");
     }
 
     fn value(entry: &Entry, name: &str) -> Option<String> {
@@ -304,9 +346,9 @@ mod tests {
 
     #[test]
     fn the_change_sequence_numbers_sort() {
-        let first = change_sequence_number(at("20261102143012.000001Z"));
-        let second = change_sequence_number(at("20261102143012.000001Z"));
-        let later = change_sequence_number(at("20261102143012.000002Z"));
+        let first = change_sequence_number(at("20261102143012.000001Z"), 0);
+        let second = change_sequence_number(at("20261102143012.000001Z"), 0);
+        let later = change_sequence_number(at("20261102143012.000002Z"), 0);
 
         assert!(
             first < second,

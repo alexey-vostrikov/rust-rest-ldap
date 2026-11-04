@@ -41,6 +41,7 @@ error.shutdown_timeout: "плавная остановка не уложилас
 warn.schema: "предупреждение схемы: {detail}"
 
 # Диагностика конфигурации
+config.server_id: "некорректный server id: {detail}"
 config.referral: "ошибка в разделе referrals: {detail}"
 config.tls_material: "use_tls включён, но server_cert и server_key заданы не оба"
 config.schema_read: "не удаётся прочитать файл схемы '{path}': {detail}"

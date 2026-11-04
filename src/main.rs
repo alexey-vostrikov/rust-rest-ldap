@@ -397,6 +397,10 @@ async fn main() {
         }
     }
 
+    // Before the first write, because a change stamped before this point carries the id of
+    // "no node" and a peer could not tell it from its own.
+    rust_rest_ldap::replication::set_server_id(config.server_id);
+
     let (source, directory) = match rust_rest_ldap::reload::Source::load(&config, backend).await {
         Ok(loaded) => loaded,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),

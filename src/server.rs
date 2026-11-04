@@ -784,6 +784,7 @@ mod tests {
             schema_files: Vec::new(),
             indexes: crate::index::IndexConfig::default(),
             referrals: Default::default(),
+            server_id: 0,
             acl: Default::default(),
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),
