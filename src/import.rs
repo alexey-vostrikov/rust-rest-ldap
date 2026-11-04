@@ -61,6 +61,12 @@ pub struct Outcome {
     pub warnings: Vec<String>,
 }
 
+/// Who an import is attributed to.
+///
+/// A DN, because `creatorsName` is one, and not a real account, because an import is not a person
+/// logging in: an entry that says `cn=import` is one whose origin is never in doubt.
+pub const IMPORT_ACTOR: &str = "cn=import";
+
 /// Loads the entries of an LDIF document into the backend.
 pub async fn import(
     backend: &Backend,
@@ -106,6 +112,28 @@ pub async fn import(
     if entries.is_empty() {
         return Err(Error::Empty);
     }
+
+    // An imported entry gets the same stamp a written one gets. Without `entryCSN` there is
+    // nothing for a resumed refresh to compare against, so a replica would be sent the whole
+    // directory on every poll - and an import is exactly when a directory is largest.
+    //
+    // A value already in the LDIF is kept: an import preserves what the file says, which is what
+    // makes a dump and a restore round-trip.
+    let now = std::time::SystemTime::now();
+    let entries: Vec<Entry> = entries
+        .into_iter()
+        .map(|entry| {
+            if entry
+                .attributes()
+                .get(crate::operational::ATTR_ENTRY_CSN)
+                .is_some()
+            {
+                entry
+            } else {
+                crate::operational::stamp_write(&entry, IMPORT_ACTOR, now)
+            }
+        })
+        .collect();
 
     // One call, so the backend writes one transaction: a store that dies halfway through an
     // import holds either all of it or none of it.
@@ -181,6 +209,82 @@ mod tests {
             Some(&serde_json::json!({"path": path.display().to_string()})),
         )
         .expect("backend")
+    }
+
+    #[tokio::test]
+    async fn imported_entries_are_stamped_the_way_written_ones_are() {
+        // Without `entryCSN` a resumed refresh has nothing to compare against, so a replica is
+        // sent the whole directory on every poll - and an import is exactly when a directory is
+        // at its largest.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = backend(&dir.path().join("dir.redb"));
+        let config = config("base_dn: dc=example,dc=com\n");
+
+        import(
+            &backend,
+            &config,
+            "dn: cn=a,dc=example,dc=com\nobjectClass: top\ncn: a\n",
+            false,
+        )
+        .await
+        .expect("import");
+
+        let loaded = backend.load().await.expect("load");
+        let entry = loaded
+            .entries
+            .iter()
+            .find(|entry| entry.dn() == "cn=a,dc=example,dc=com")
+            .expect("the imported entry");
+
+        let csn = entry
+            .attributes()
+            .get(crate::operational::ATTR_ENTRY_CSN)
+            .and_then(|attribute| attribute.values.first());
+        assert!(csn.is_some(), "an imported entry carries entryCSN");
+
+        let creators = entry
+            .attributes()
+            .get(crate::operational::ATTR_CREATORS_NAME)
+            .and_then(|attribute| attribute.values.first());
+        assert_eq!(
+            creators.map(String::as_str),
+            Some(IMPORT_ACTOR),
+            "and says where it came from"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_csn_in_the_file_is_kept_rather_than_replaced() {
+        // A dump and a restore must round-trip: an entry that keeps its own CSN keeps its place
+        // in the change history, which is what a replica resuming from a cookie depends on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = backend(&dir.path().join("dir.redb"));
+        let config = config("base_dn: dc=example,dc=com\n");
+
+        let file_csn = "20260101000000.000001Z#000042#000#000000";
+        import(
+            &backend,
+            &config,
+            &format!("dn: cn=a,dc=example,dc=com\nobjectClass: top\ncn: a\nentryCSN: {file_csn}\n"),
+            false,
+        )
+        .await
+        .expect("import");
+
+        let loaded = backend.load().await.expect("load");
+        let entry = loaded
+            .entries
+            .iter()
+            .find(|entry| entry.dn() == "cn=a,dc=example,dc=com")
+            .expect("the imported entry");
+        assert_eq!(
+            entry
+                .attributes()
+                .get(crate::operational::ATTR_ENTRY_CSN)
+                .and_then(|attribute| attribute.values.first())
+                .map(String::as_str),
+            Some(file_csn)
+        );
     }
 
     #[tokio::test]
