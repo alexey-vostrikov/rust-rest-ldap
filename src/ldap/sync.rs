@@ -41,6 +41,9 @@ pub const SYNC_OID: &str = "1.3.6.1.4.1.4203.1.9.1.1";
 const SEQUENCE_TAG: u8 = 0x30;
 const ENUMERATED_TAG: u8 = 0x0a;
 const OCTET_STRING_TAG: u8 = 0x04;
+/// `SET OF` - a `syncUUIDs` is a set, and its tag says so.
+const SET_TAG: u8 = 0x31;
+
 const BOOLEAN_TAG: u8 = 0x01;
 
 /// What the client asked for.
@@ -455,6 +458,54 @@ pub fn info_refresh_present(cookie: Option<&[u8]>) -> rasn_ldap::LdapMessage {
 
     // `refreshPresent` is `[2]`, context-tagged and constructed.
     let mut inner = vec![0xa2];
+    inner.extend(encode_length(body.len()));
+    inner.extend_from_slice(&body);
+
+    rasn_ldap::LdapMessage::new(
+        0,
+        rasn_ldap::ProtocolOp::IntermediateResponse(rasn_ldap::IntermediateResponse {
+            response_name: Some(LdapOid::from(SYNC_OID.as_bytes())),
+            response_value: Some(rasn::types::OctetString::from(inner)),
+        }),
+    )
+}
+
+/// The `syncIdSet` message: a set of UUIDs instead of one message per entry.
+///
+/// RFC 4533 §1.3.1: "The server may send syncIdSet Sync Info Messages containing the set of UUIDs
+/// of either unchanged present entries or deleted entries, instead of sending multiple individual
+/// messages." With `refresh_deletes` FALSE the UUIDs are entries that are still present and
+/// unchanged - so a resumed refresh over ten thousand untouched entries is a few messages rather
+/// than ten thousand empty ones. With TRUE they are entries no longer in the content.
+///
+/// `syncIdSet ::= [3] SEQUENCE { cookie OPTIONAL, refreshDeletes BOOLEAN DEFAULT FALSE,
+///                               syncUUIDs SET OF syncUUID }`.
+pub fn info_id_set(
+    uuids: &[[u8; 16]],
+    refresh_deletes: bool,
+    cookie: Option<&[u8]>,
+) -> rasn_ldap::LdapMessage {
+    let mut body = Vec::new();
+    if let Some(cookie) = cookie {
+        body.push(OCTET_STRING_TAG);
+        body.extend(encode_length(cookie.len()));
+        body.extend_from_slice(cookie);
+    }
+    if refresh_deletes {
+        body.extend_from_slice(&[BOOLEAN_TAG, 0x01, 0xff]);
+    }
+
+    let mut uuids_body = Vec::new();
+    for uuid in uuids {
+        uuids_body.push(OCTET_STRING_TAG);
+        uuids_body.push(0x10);
+        uuids_body.extend_from_slice(uuid);
+    }
+    body.push(SET_TAG);
+    body.extend(encode_length(uuids_body.len()));
+    body.extend_from_slice(&uuids_body);
+
+    let mut inner = vec![0xa3];
     inner.extend(encode_length(body.len()));
     inner.extend_from_slice(&body);
 

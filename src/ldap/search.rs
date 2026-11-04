@@ -383,65 +383,106 @@ pub fn handle_search(
         .and_then(sync::decode_cookie)
         .and_then(|(_, csn)| csn);
 
-    let mut messages: Vec<LdapMessage> = matched[page_start..page_end]
-        .iter()
-        .map(|(dn, attributes)| {
-            let visible: Vec<Attribute> = attributes
-                .select(dn, &selection)
-                .into_iter()
-                .filter(|attribute| {
-                    security
-                        .acl
-                        .rights(&requester, directory, dn, Some(&*attribute.name))
-                        .read
-                })
-                .collect();
-            let selected = if request.types_only {
-                visible.into_iter().map(without_values).collect()
-            } else {
-                visible
-            };
-            // RFC 4533 §1.3.1: an entry whose content the client does not have goes as `add`
-            // *with* its attributes; an unchanged entry goes as an **empty** entry (no
-            // attributes) with state `present`, which is what lets a resumed refresh cost the
-            // changes rather than the directory.
-            let unchanged = match (&client_csn, &sync_request) {
-                (Some(since), Some(_)) => attributes
-                    .get(crate::operational::ATTR_ENTRY_CSN)
-                    .and_then(|attribute| attribute.values.first())
-                    .is_some_and(|csn| !sync::is_newer(csn, since)),
-                _ => false,
-            };
+    // Whether present entries are collapsed into a `syncIdSet` depends on how many there are,
+    // which is only known once every entry is classified - and an entry cannot be written and then
+    // taken back. Hence two passes: classify, then write.
+    let mut unchanged: Vec<bool> = Vec::with_capacity(page_end.saturating_sub(page_start));
+    let mut unchanged_uuids: Vec<[u8; 16]> = Vec::new();
 
-            let state_controls = match (&sync_request, &sync_cookie) {
-                (Some(_), Some(cookie)) => {
-                    let uuid = attributes
-                        .get(crate::model::ATTR_ENTRY_UUID)
-                        .and_then(|attribute| attribute.values.first().cloned())
-                        .unwrap_or_else(|| crate::directory::entry_uuid(dn));
-                    match sync::uuid_bytes(&uuid) {
-                        Some(uuid) => {
-                            let state = if unchanged {
-                                sync::State::Present
-                            } else {
-                                sync::State::Add
-                            };
-                            vec![sync::state_control(state, &uuid, Some(cookie))]
-                        }
-                        None => Vec::new(),
+    for (dn, attributes) in &matched[page_start..page_end] {
+        let is_unchanged = match (&client_csn, &sync_request) {
+            (Some(since), Some(_)) => attributes
+                .get(crate::operational::ATTR_ENTRY_CSN)
+                .and_then(|attribute| attribute.values.first())
+                .is_some_and(|csn| !sync::is_newer(csn, since)),
+            _ => false,
+        };
+
+        if is_unchanged {
+            let uuid = attributes
+                .get(crate::model::ATTR_ENTRY_UUID)
+                .and_then(|attribute| attribute.values.first().cloned())
+                .unwrap_or_else(|| crate::directory::entry_uuid(dn));
+            if let Some(uuid) = sync::uuid_bytes(&uuid) {
+                unchanged_uuids.push(uuid);
+            }
+        }
+
+        unchanged.push(is_unchanged);
+    }
+
+    // Below the threshold an empty entry per unchanged entry costs less than a set message plus
+    // what it takes to say which entries went into it.
+    let collapse = unchanged_uuids.len() > PRESENT_SET_THRESHOLD;
+
+    let mut messages: Vec<LdapMessage> = Vec::with_capacity(page_end.saturating_sub(page_start));
+
+    for (index, (dn, attributes)) in matched[page_start..page_end].iter().enumerate() {
+        let is_unchanged = unchanged[index];
+
+        // A collapsed present entry is not written at all: its UUID went into the set below.
+        if is_unchanged && collapse {
+            continue;
+        }
+
+        let visible: Vec<Attribute> = attributes
+            .select(dn, &selection)
+            .into_iter()
+            .filter(|attribute| {
+                security
+                    .acl
+                    .rights(&requester, directory, dn, Some(&*attribute.name))
+                    .read
+            })
+            .collect();
+        let selected = if request.types_only {
+            visible.into_iter().map(without_values).collect()
+        } else {
+            visible
+        };
+
+        // RFC 4533 §1.3.1: an entry whose content the client does not have goes as `add` *with*
+        // its attributes; an unchanged entry goes as an **empty** entry (no attributes) with state
+        // `present`, which is what lets a resumed refresh cost the changes rather than the
+        // directory.
+        let state_controls = match (&sync_request, &sync_cookie) {
+            (Some(_), Some(cookie)) => {
+                let uuid = attributes
+                    .get(crate::model::ATTR_ENTRY_UUID)
+                    .and_then(|attribute| attribute.values.first().cloned())
+                    .unwrap_or_else(|| crate::directory::entry_uuid(dn));
+                match sync::uuid_bytes(&uuid) {
+                    Some(uuid) => {
+                        let state = if is_unchanged {
+                            sync::State::Present
+                        } else {
+                            sync::State::Add
+                        };
+                        vec![sync::state_control(state, &uuid, Some(cookie))]
                     }
+                    None => Vec::new(),
                 }
-                _ => Vec::new(),
-            };
+            }
+            _ => Vec::new(),
+        };
 
-            // An unchanged entry is reported as an empty entry: the client already has the
-            // content, and sending it again would make a poll cost the directory rather than the
-            // changes.
-            let selected = if unchanged { Vec::new() } else { selected };
+        let selected = if is_unchanged { Vec::new() } else { selected };
 
-            responses::search_result_entry_with_controls(message_id, dn, &selected, state_controls)
-        })
-        .collect();
+        messages.push(responses::search_result_entry_with_controls(
+            message_id,
+            dn,
+            &selected,
+            state_controls,
+        ));
+    }
+
+    if collapse {
+        for batch in unchanged_uuids.chunks(SYNC_ID_SET_BATCH) {
+            let mut message = sync::info_id_set(batch, false, sync_cookie.as_deref());
+            message.message_id = message_id;
+            messages.push(message);
+        }
+    }
 
     let mut controls_out: Controls = Vec::new();
 
@@ -534,6 +575,16 @@ fn without_values(attribute: crate::model::Attribute) -> crate::model::Attribute
         ..attribute
     }
 }
+
+/// How many unchanged entries justify a `syncIdSet` instead of one empty entry each.
+const PRESENT_SET_THRESHOLD: usize = 8;
+
+/// How many UUIDs go into one `syncIdSet` message.
+///
+/// Two hundred and fifty-six UUIDs is four kilobytes of payload: small enough that a set message
+/// still fits an ordinary frame, large enough that a ten thousand entry refresh is forty messages
+/// rather than ten thousand.
+const SYNC_ID_SET_BATCH: usize = 256;
 
 /// A search that stays open: what it asked for, and who asked.
 ///
