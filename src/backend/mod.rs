@@ -208,6 +208,14 @@ impl Backend {
         }
     }
 
+    /// The oldest journal CSN still remembered; a resume older than this has lost changes.
+    pub fn journal_floor(&self) -> Result<Option<String>, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.journal_floor(),
+            _ => Ok(None),
+        }
+    }
+
     /// The newest journal CSN, if this backend keeps one.
     pub fn journal_head(&self) -> Result<Option<String>, BackendError> {
         match self {

@@ -1,0 +1,739 @@
+//! The exchange half of multi-master, level 1: each node listens to its peers.
+//!
+//! [`crate::replication`] decides *what* to do with a peer's change; this module carries the
+//! changes in and out. The transport is the one every LDAP client already has - RFC 4533
+//! `refreshAndPersist` - so a peer is an ordinary LDAP server and not a bespoke protocol peer. That
+//! is not a convenience: it means a node can replicate from something that is not this server, and
+//! an operator can watch the whole exchange with `ldapsearch -E sync=rp`.
+//!
+//! # Why persist and not poll
+//!
+//! A poll reports what the directory holds; it cannot report what it no longer holds. In a
+//! full-mesh multi-master nobody is authoritative for a subtree, so "you did not name it, so it is
+//! gone" would delete entries another node created a moment ago - this node's own new record, in
+//! the worst case. A persistent search reports deletions as they happen, and that is the only
+//! honest source for them.
+//!
+//! # What is deliberately missing
+//!
+//! - **No re-announcement of our own writes.** An applied remote change goes to the store with the
+//!   remote `entryCSN` intact, so it is the same change on every node and a peer will ignore it as
+//!   not newer. A node that stamped what it received would replicate for ever.
+//! - **No transaction across nodes.** A change is written here when it arrives; if this node is
+//!   down, the peer's journal holds it and the next connection resumes from the cookie.
+//! - **No schema or configuration replication.** Entries only. A node with a different schema will
+//!   accept what it can and report the rest, which is a real limitation and is written down rather
+//!   than left to be discovered.
+use std::time::Duration;
+
+use rasn_ldap::{LdapDn, LdapMessage, ProtocolOp};
+
+use crate::backend::redb_store::ChangeKind;
+use crate::model::Entry;
+
+/// One configured peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    /// `ldap://host:port` or `ldaps://host:port`.
+    pub url: String,
+    /// The peer's server id, when the operator declared one.
+    ///
+    /// Optional because a peer's id is only needed to detect the one mistake that cannot be
+    /// repaired - two nodes sharing an id - and an operator who has not set it on the other side
+    /// yet should not be blocked from starting.
+    pub server_id: Option<u16>,
+    pub bind_dn: Option<String>,
+    pub password: Option<String>,
+}
+
+/// A peer's change, ready for [`crate::replication::merge`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pushed {
+    pub dn: String,
+    pub kind: ChangeKind,
+    /// The change's own CSN, from the entry's `entryCSN`, or from the state control for a
+    /// deletion - which is the only thing a deletion has left.
+    pub csn: Option<String>,
+    /// `entryUUID` in the text form the state control carries as sixteen octets.
+    pub uuid: Option<String>,
+    /// The entry as the peer has it. `None` for a deletion.
+    pub entry: Option<Entry>,
+}
+
+/// The configuration section as written.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct PeerConfig {
+    pub url: String,
+    #[serde(default)]
+    pub server_id: Option<u16>,
+    #[serde(default)]
+    pub bind_dn: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerError {
+    /// A peer with the same id as this node: every later change looks like it might be the same
+    /// change, and the history cannot be untangled afterwards.
+    SameServerId { url: String, id: u16 },
+    /// Peers configured on a node that has no id of its own.
+    NoOwnServerId,
+    /// A URL this server cannot open, named rather than silently skipped.
+    BadUrl { url: String, why: String },
+    /// The same peer twice, which would apply every change twice and double the traffic.
+    Duplicate { url: String },
+    /// A bind DN without a password, or the other way round: half a credential is a mistake.
+    HalfCredentials { url: String },
+}
+
+impl std::fmt::Display for PeerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SameServerId { url, id } => write!(
+                formatter,
+                "peer {url} declares server id {id}, which is this node's own: two nodes \
+                 sharing an id produce changes that cannot be told apart, and the order between \
+                 them cannot be recovered afterwards"
+            ),
+            Self::NoOwnServerId => write!(
+                formatter,
+                "peers are configured but server_id is not: without an id this node cannot tell \
+                 its own changes from its peers', so replication would be a loop"
+            ),
+            Self::BadUrl { url, why } => write!(formatter, "peer url '{url}' is unusable: {why}"),
+            Self::Duplicate { url } => {
+                write!(formatter, "peer {url} is configured twice")
+            }
+            Self::HalfCredentials { url } => write!(
+                formatter,
+                "peer {url} has a bind DN or a password but not both"
+            ),
+        }
+    }
+}
+
+/// Checks the `peers:` section against this node's own id.
+pub fn from_config(peers: &[PeerConfig], own: u16) -> Result<Vec<Peer>, PeerError> {
+    if peers.is_empty() {
+        return Ok(Vec::new());
+    }
+    if own == 0 {
+        return Err(PeerError::NoOwnServerId);
+    }
+
+    let mut resolved: Vec<Peer> = Vec::with_capacity(peers.len());
+
+    for peer in peers {
+        let url = peer.url.trim().to_string();
+        check_url(&url)?;
+
+        if let Some(id) = peer.server_id
+            && id == own
+        {
+            return Err(PeerError::SameServerId { url, id });
+        }
+
+        match (&peer.bind_dn, &peer.password) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(PeerError::HalfCredentials { url });
+            }
+            _ => {}
+        }
+
+        if resolved.iter().any(|known| known.url == url) {
+            return Err(PeerError::Duplicate { url });
+        }
+
+        resolved.push(Peer {
+            url,
+            server_id: peer.server_id,
+            bind_dn: peer.bind_dn.clone(),
+            password: peer.password.clone(),
+        });
+    }
+
+    Ok(resolved)
+}
+
+fn check_url(url: &str) -> Result<(), PeerError> {
+    let bad = |why: &str| PeerError::BadUrl {
+        url: url.to_string(),
+        why: why.to_string(),
+    };
+
+    let rest = url
+        .strip_prefix("ldap://")
+        .or_else(|| url.strip_prefix("ldaps://"))
+        .ok_or_else(|| bad("the scheme must be ldap:// or ldaps://"))?;
+
+    // A host is required: `ldap:///` with an empty host means the client's own machine, which is
+    // never what a peer is, and silently connecting to localhost would replicate a node with
+    // itself.
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() || host.starts_with(':') {
+        return Err(bad("a host is required"));
+    }
+    if host.ends_with(':') {
+        return Err(bad("a port is required after ':'"));
+    }
+
+    Ok(())
+}
+
+/// Turns one message from a peer into a change.
+///
+/// `None` for anything that is not an entry: the persistent search's `syncInfo` and the controls
+/// that end a refresh are not changes, and reporting them as such would make every connection
+/// start with a spurious write.
+pub fn pushed(message: &LdapMessage) -> Option<Pushed> {
+    let entry = match &message.protocol_op {
+        ProtocolOp::SearchResEntry(entry) => entry,
+        _ => return None,
+    };
+
+    let state = message
+        .controls
+        .as_ref()?
+        .iter()
+        .find(|control| control.control_type.as_ref() == crate::ldap::sync::SYNC_OID.as_bytes())
+        .and_then(|control| control.control_value.as_ref())
+        .and_then(|value| crate::ldap::sync::decode_state(value.as_ref()).ok())?;
+
+    let dn = entry.object_name.0.to_string();
+    let uuid = Some(text_uuid(&state.uuid));
+
+    match state.state {
+        crate::ldap::sync::State::Delete => Some(Pushed {
+            dn,
+            kind: ChangeKind::Delete,
+            // A deletion has no attributes left, so its CSN can only come from the cookie -
+            // `<snapshot>:<csn>` as this server issues it. A peer that sends no cookie leaves the
+            // deletion unordered, and `merge` will say so rather than guess.
+            csn: cookie_csn(state.cookie.as_deref()),
+            uuid,
+            entry: None,
+        }),
+        // A `present` entry is one the peer did not resend because it is unchanged: there is
+        // nothing to merge, and writing it would put an empty entry over a full one.
+        crate::ldap::sync::State::Present => None,
+        _ => {
+            let model = crate::client::entry_of(message)?;
+            let csn = model
+                .attributes()
+                .get(crate::operational::ATTR_ENTRY_CSN)
+                .and_then(|attribute| attribute.values.first())
+                .cloned();
+
+            Some(Pushed {
+                dn,
+                kind: match state.state {
+                    crate::ldap::sync::State::Add => ChangeKind::Add,
+                    _ => ChangeKind::Modify,
+                },
+                csn,
+                uuid,
+                entry: Some(model),
+            })
+        }
+    }
+}
+
+/// The CSN a sync cookie carries, if it carries one.
+fn cookie_csn(cookie: Option<&[u8]>) -> Option<String> {
+    let text = std::str::from_utf8(cookie?).ok()?;
+    let (_, csn) = crate::ldap::sync::decode_cookie(text.as_bytes())?;
+    csn
+}
+
+/// `entryUUID` text from the sixteen octets of a `syncUUID`.
+fn text_uuid(bytes: &[u8; 16]) -> String {
+    let hex = |slice: &[u8]| {
+        slice
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(&bytes[0..4]),
+        hex(&bytes[4..6]),
+        hex(&bytes[6..8]),
+        hex(&bytes[8..10]),
+        hex(&bytes[10..16])
+    )
+}
+
+/// The request a peer is asked, and the control that makes it a persistent search.
+///
+/// `refreshAndPersist` (mode 3), resuming from `cookie` when the connection has been here before.
+/// A node that reconnects therefore gets the changes it missed rather than the whole directory -
+/// and, more importantly, learns about the deletions that happened while it was away.
+pub fn request(
+    base: &str,
+    cookie: Option<&[u8]>,
+) -> (rasn_ldap::SearchRequest, Vec<rasn_ldap::Control>) {
+    use rasn_ldap::{LdapString, SearchRequest, SearchRequestDerefAliases, SearchRequestScope};
+
+    let control =
+        crate::ldap::sync::request_control(crate::ldap::sync::Mode::RefreshAndPersist, cookie);
+
+    let search = SearchRequest::new(
+        LdapDn::from(base),
+        SearchRequestScope::WholeSubtree,
+        SearchRequestDerefAliases::NeverDerefAliases,
+        0,
+        0,
+        false,
+        crate::ldap::filter_parse::parse("(objectClass=*)")
+            .expect("a filter that cannot fail to parse"),
+        vec![LdapString::from("*"), LdapString::from("+")],
+    );
+
+    (search, vec![control])
+}
+
+/// How long to wait before trying a peer again after it failed.
+///
+/// A fixed interval and not exponential backoff on purpose: a peer that comes back should be
+/// picked up within seconds, and a directory is not a queue of retries where backing off protects
+/// anything. A storm is bounded by the number of peers, which is small.
+pub const RETRY: Duration = Duration::from_secs(5);
+
+/// Follows one peer for as long as this server runs.
+///
+/// Reconnects after any failure, resuming from the last cookie seen, so a peer that restarts or a
+/// network that drops out costs the changes made while it was away and not the directory.
+///
+/// The loop applies what the peer sends and nothing else: it does not announce its own writes, and
+/// a change received keeps the peer's `entryCSN`, so the same change is the same change on every
+/// node and a peer will ignore it as not newer. A node that stamped what it received would
+/// replicate for ever.
+pub async fn follow(
+    peer: Peer,
+    source: std::sync::Arc<crate::reload::Source>,
+    base_dn: String,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut cookie: Option<Vec<u8>> = None;
+
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+
+        match exchange(&peer, &source, &base_dn, &mut cookie, &mut shutdown).await {
+            Ok(()) => {}
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    crate::i18n::t("error.peer", &[("url", &peer.url), ("detail", &err)])
+                );
+            }
+        }
+
+        // A peer that went away is retried, but not while the server is stopping: shutdown must
+        // not wait out a retry interval.
+        tokio::select! {
+            _ = tokio::time::sleep(RETRY) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One connection's worth of exchange.
+async fn exchange(
+    peer: &Peer,
+    source: &std::sync::Arc<crate::reload::Source>,
+    base_dn: &str,
+    cookie: &mut Option<Vec<u8>>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let client = crate::client::Client::connect(&peer.url, crate::client::Options::default())
+        .await
+        .map_err(|err| err.to_string())?;
+
+    if let (Some(dn), Some(password)) = (&peer.bind_dn, &peer.password) {
+        client
+            .bind(dn, password)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+
+    let (request, controls) = request(base_dn, cookie.as_deref());
+    let (refresh, _id) = client
+        .search_persist(request, controls)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    // The refresh itself is merged like any other change: a node that has been away needs what
+    // happened while it was away, and the cookie only orders it - it does not replace it.
+    for message in &refresh {
+        absorb(peer, source, message).await?;
+
+        // The connection's cookie moves forward with the answer, so a reconnect after a failure
+        // in the middle of a refresh does not start from the beginning.
+        if let Some(next) = cookie_of(message) {
+            *cookie = Some(next);
+        }
+    }
+
+    loop {
+        let message = tokio::select! {
+            message = client.next_change() => message.map_err(|err| err.to_string())?,
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+
+        match message {
+            Some(message) => {
+                absorb(peer, source, &message).await?;
+                if let Some(next) = cookie_of(&message) {
+                    *cookie = Some(next);
+                }
+            }
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Merges one message from a peer into this directory.
+async fn absorb(
+    peer: &Peer,
+    source: &std::sync::Arc<crate::reload::Source>,
+    message: &LdapMessage,
+) -> Result<(), String> {
+    let change = match pushed(message) {
+        Some(change) => change,
+        // Not an entry: `syncInfo`, the end of a refresh, or something this server has no
+        // business turning into a write.
+        None => return Ok(()),
+    };
+
+    // A peer that says which node it is, when the operator expected another id, is a node
+    // replicating under somebody else's name - and every change it sends would be misordered.
+    if let (Some(expected), Some(csn)) = (peer.server_id, change.csn.as_deref())
+        && let Some(actual) = declared_id(csn)
+        && actual != expected
+    {
+        return Err(crate::i18n::t(
+            "error.peer_id",
+            &[
+                ("url", &peer.url),
+                ("expected", &expected.to_string()),
+                ("actual", &actual.to_string()),
+            ],
+        ));
+    }
+
+    let directory = source.directory().await;
+    let local = match directory.find(&change.dn) {
+        Some(entry) => crate::replication::Local::Present {
+            csn: entry
+                .attributes()
+                .get(crate::operational::ATTR_ENTRY_CSN)
+                .and_then(|attribute| attribute.values.first())
+                .cloned(),
+            uuid: entry
+                .attributes()
+                .get(crate::model::ATTR_ENTRY_UUID)
+                .and_then(|attribute| attribute.values.first())
+                .cloned(),
+        },
+        None => match source
+            .tombstone(&change.dn)
+            .map_err(|err| err.to_string())?
+        {
+            Some(csn) => crate::replication::Local::Tombstone { csn },
+            None => crate::replication::Local::Absent,
+        },
+    };
+
+    let incoming = crate::replication::Incoming {
+        csn: change.csn.clone().unwrap_or_default(),
+        kind: change.kind,
+        uuid: change.uuid.clone(),
+    };
+
+    let decision = crate::replication::merge(&local, &incoming);
+
+    match decision {
+        crate::replication::Decision::Apply { .. } => {
+            let entry_change = match change.entry {
+                Some(entry) => crate::backend::EntryChange::Upsert { entry },
+                None => crate::backend::EntryChange::delete(change.dn, None),
+            };
+
+            source
+                .apply(&[entry_change])
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        crate::replication::Decision::Ignore { .. } => {}
+        crate::replication::Decision::Conflict { why } => {
+            // Named, not swallowed: a conflict is the one outcome an operator has to see, because
+            // a directory that diverges quietly is discovered by its effects.
+            eprintln!(
+                "{}",
+                crate::i18n::t(
+                    "error.peer_conflict",
+                    &[("url", &peer.url), ("dn", &change.dn), ("why", why)]
+                )
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// The cookie a message carries, if it carries one.
+fn cookie_of(message: &LdapMessage) -> Option<Vec<u8>> {
+    let controls = message.controls.as_ref()?;
+
+    for control in controls {
+        if control.control_type.as_ref() != crate::ldap::sync::SYNC_OID.as_bytes() {
+            continue;
+        }
+        let value = control.control_value.as_ref()?.as_ref();
+
+        // A `syncState` control on an entry, or a `syncDone` on the end of the answer: both carry
+        // the cookie in the same first optional octet string, and either is a better starting
+        // point than the one before it.
+        if let Ok(state) = crate::ldap::sync::decode_state(value) {
+            if let Some(cookie) = state.cookie {
+                return Some(cookie);
+            }
+            continue;
+        }
+    }
+
+    None
+}
+
+/// A peer's own id, as its CSN says, for the check that cannot wait for the operator.
+///
+/// Returns `None` when the peer says nothing, which is not a failure: a peer with no id is a
+/// single node that someone pointed at this one.
+pub fn declared_id(csn: &str) -> Option<u16> {
+    crate::replication::Csn::parse(csn).map(|csn| csn.server)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(url: &str, id: Option<u16>) -> PeerConfig {
+        PeerConfig {
+            url: url.to_string(),
+            server_id: id,
+            bind_dn: None,
+            password: None,
+        }
+    }
+
+    #[test]
+    fn a_peer_with_this_nodes_id_is_refused() {
+        // The one mistake that cannot be repaired later: two nodes with one id produce changes
+        // that look identical, and the merge that follows is a coin toss.
+        let err = from_config(&[config("ldap://peer:389", Some(3))], 3).expect_err("must refuse");
+        assert_eq!(
+            err,
+            PeerError::SameServerId {
+                url: "ldap://peer:389".to_string(),
+                id: 3
+            }
+        );
+    }
+
+    #[test]
+    fn peers_without_a_node_id_are_refused() {
+        let err = from_config(&[config("ldap://peer:389", None)], 0).expect_err("must refuse");
+        assert_eq!(err, PeerError::NoOwnServerId);
+    }
+
+    #[test]
+    fn an_empty_section_is_not_an_error() {
+        // Every single-node deployment: no peers, no id, nothing to check.
+        assert!(from_config(&[], 0).expect("no peers").is_empty());
+    }
+
+    #[test]
+    fn a_url_that_cannot_be_opened_is_refused_with_the_reason() {
+        for url in [
+            "",
+            "peer:389",
+            "https://peer:389",
+            // An empty host means the local machine, which would be this node talking to itself.
+            "ldap:///:389",
+            "ldap://:389",
+            "ldap://peer:",
+        ] {
+            let result = from_config(&[config(url, Some(2))], 1);
+            assert!(
+                matches!(result, Err(PeerError::BadUrl { .. })),
+                "{url:?} must be refused: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_usable_url_passes_both_schemes() {
+        for url in [
+            "ldap://peer:389",
+            "ldaps://peer:636",
+            "ldap://10.0.0.5:1389",
+        ] {
+            let peers = from_config(&[config(url, Some(2))], 1).expect("config");
+            assert_eq!(peers[0].url, url);
+        }
+    }
+
+    #[test]
+    fn the_same_peer_twice_is_refused() {
+        // Applied twice and polled twice is not a slow node, it is a mistake in the file.
+        let err = from_config(
+            &[
+                config("ldap://peer:389", Some(2)),
+                config("ldap://peer:389", Some(2)),
+            ],
+            1,
+        )
+        .expect_err("must refuse");
+        assert!(matches!(err, PeerError::Duplicate { .. }));
+    }
+
+    #[test]
+    fn half_a_credential_is_refused() {
+        let mut peer = config("ldap://peer:389", Some(2));
+        peer.bind_dn = Some("cn=reader,dc=example,dc=com".to_string());
+        let err = from_config(&[peer], 1).expect_err("must refuse");
+        assert!(matches!(err, PeerError::HalfCredentials { .. }));
+    }
+
+    #[test]
+    fn a_state_control_names_the_entry_it_is_about() {
+        // The conversion the exchange lives or dies by: a message that is not an entry must not
+        // become a change, or every connection starts by writing nonsense.
+        let message = binding_message();
+        let change = pushed(&message).expect("a change");
+
+        assert_eq!(change.dn, "cn=alice,ou=users,dc=example,dc=com");
+        assert_eq!(change.kind, ChangeKind::Add);
+        assert_eq!(
+            change.uuid.as_deref(),
+            Some("00112233-4455-6677-8899-aabbccddeeff")
+        );
+        assert_eq!(
+            change.csn.as_deref(),
+            Some("20261104005712.352052Z#000012#003#000000"),
+            "the entry's own entryCSN, not the connection's"
+        );
+    }
+
+    #[test]
+    fn a_sync_info_message_is_not_a_change() {
+        let message = crate::ldap::sync::info_refresh_present(Some(b"0:csn"));
+        assert_eq!(pushed(&message), None);
+    }
+
+    #[test]
+    fn an_unchanged_entry_is_not_written_over() {
+        // `present` means "you already have this". Writing it would put an empty entry over a full
+        // one - a replica that empties itself on every poll.
+        let mut message = binding_message();
+        set_state(&mut message, crate::ldap::sync::State::Present);
+        assert_eq!(pushed(&message), None);
+    }
+
+    #[test]
+    fn a_deletion_carries_no_entry_and_its_csn_comes_from_the_cookie() {
+        let mut message = binding_message();
+        set_state(&mut message, crate::ldap::sync::State::Delete);
+        if let ProtocolOp::SearchResEntry(entry) = &mut message.protocol_op {
+            entry.attributes = Vec::new();
+        }
+
+        let change = pushed(&message).expect("a change");
+        assert_eq!(change.kind, ChangeKind::Delete);
+        assert_eq!(change.entry, None);
+        assert!(
+            change.csn.is_some(),
+            "a deletion has nothing but its CSN to be ordered by"
+        );
+    }
+
+    fn set_state(message: &mut LdapMessage, state: crate::ldap::sync::State) {
+        let uuid = uuid_bytes();
+        let value = crate::ldap::sync::encode_state(
+            state,
+            &uuid,
+            Some(b"0:20261104005712.352052Z#000012#003#000000"),
+        );
+        if let Some(controls) = &mut message.controls {
+            controls[0].control_value = Some(rasn::types::OctetString::from(value));
+        }
+    }
+
+    fn uuid_bytes() -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(0x11);
+        }
+        bytes
+    }
+
+    fn binding_message() -> LdapMessage {
+        use rasn::types::SetOf;
+        use rasn_ldap::{
+            AttributeDescription, AttributeValue, PartialAttribute, SearchResultEntry,
+        };
+
+        let uuid = uuid_bytes();
+        let control = rasn_ldap::Control::new(
+            rasn_ldap::LdapOid::from(crate::ldap::sync::SYNC_OID.as_bytes()),
+            false,
+            Some(rasn::types::OctetString::from(
+                crate::ldap::sync::encode_state(
+                    crate::ldap::sync::State::Add,
+                    &uuid,
+                    Some(b"0:20261104005712.352052Z#000012#003#000000"),
+                ),
+            )),
+        );
+
+        let attributes = vec![
+            PartialAttribute::new(
+                AttributeDescription::from("objectClass"),
+                SetOf::from_vec(vec![AttributeValue::from(b"top".to_vec())]),
+            ),
+            PartialAttribute::new(
+                AttributeDescription::from("cn"),
+                SetOf::from_vec(vec![AttributeValue::from(b"alice".to_vec())]),
+            ),
+            PartialAttribute::new(
+                AttributeDescription::from("entryCSN"),
+                SetOf::from_vec(vec![AttributeValue::from(
+                    b"20261104005712.352052Z#000012#003#000000".to_vec(),
+                )]),
+            ),
+        ];
+
+        let mut message = LdapMessage::new(
+            3,
+            ProtocolOp::SearchResEntry(SearchResultEntry::new(
+                LdapDn::from("cn=alice,ou=users,dc=example,dc=com"),
+                attributes,
+            )),
+        );
+        message.controls = Some(vec![control]);
+        message
+    }
+}

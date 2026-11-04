@@ -586,6 +586,22 @@ async fn main() {
         None => None,
     };
 
+    // One task per peer, each holding its own persistent connection. Spawned before the listener
+    // accepts anything, so a change made here in the first moment of serving is not missed by a
+    // peer that was already listening.
+    let peer_tasks: Vec<tokio::task::JoinHandle<()>> = config
+        .peers
+        .iter()
+        .map(|peer| {
+            tokio::spawn(rust_rest_ldap::peers::follow(
+                peer.clone(),
+                Arc::clone(&source),
+                config.base_dn.clone(),
+                shutdown_tx.subscribe(),
+            ))
+        })
+        .collect();
+
     let serving = tokio::spawn(rust_rest_ldap::server::serve_with(
         listener,
         rust_rest_ldap::server::Listener {
@@ -617,6 +633,9 @@ async fn main() {
         ),
     }
     reloading.abort();
+    for task in peer_tasks {
+        task.abort();
+    }
     if let Some(task) = http_task {
         task.abort();
     }

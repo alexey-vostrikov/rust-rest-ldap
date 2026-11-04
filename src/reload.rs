@@ -204,6 +204,41 @@ impl Source {
         }
     }
 
+    /// The oldest change the journal still holds.
+    ///
+    /// A resuming client whose cookie is older than this has missed changes nobody will send it:
+    /// the journal was pruned, and the surviving records start later without saying so. The caller
+    /// answers with a full refresh, which is expensive and correct - the alternative is a replica
+    /// that is wrong and looks healthy.
+    pub fn journal_floor(&self) -> Result<Option<String>, BackendError> {
+        self.backend.journal_floor()
+    }
+
+    /// The newest deletion this store remembers for `dn`, if it remembers one.
+    ///
+    /// Scans the journal, because the journal is keyed by CSN and not by DN - a tombstone is a
+    /// record like any other and there is one index. That is the honest cost at this size: a
+    /// replication round asks about the handful of DNs a peer named, not about the directory. An
+    /// index by DN is the next step if a directory makes the scan visible, and this comment is
+    /// where that will be remembered.
+    pub fn tombstone(&self, dn: &str) -> Result<Option<String>, BackendError> {
+        let mut newest: Option<String> = None;
+
+        for record in self.backend.journal_since(None)? {
+            if record.dn != dn || record.kind != crate::backend::redb_store::ChangeKind::Delete {
+                continue;
+            }
+            if newest
+                .as_deref()
+                .is_none_or(|seen| record.csn.as_str() > seen)
+            {
+                newest = Some(record.csn);
+            }
+        }
+
+        Ok(newest)
+    }
+
     /// Whether a password-hash upgrade could be persisted by this backend.
     ///
     /// Asked by the server once, at startup, so that a bind does not attempt a write the
@@ -573,6 +608,7 @@ mod tests {
             indexes: crate::index::IndexConfig::default(),
             referrals: Default::default(),
             server_id: 0,
+            peers: Vec::new(),
             acl: Default::default(),
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),

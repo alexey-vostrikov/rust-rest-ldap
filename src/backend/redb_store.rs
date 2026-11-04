@@ -511,6 +511,39 @@ impl RedbBackend {
         Ok(last.map(|(key, _)| key.value().to_string()))
     }
 
+    /// The oldest CSN the journal still remembers.
+    ///
+    /// A client resuming from a cookie older than this has missed changes that were pruned, and
+    /// nothing in the surviving records says so: the range simply starts later. That is silent
+    /// divergence, so the caller compares against this and starts a full refresh instead.
+    pub fn journal_floor(&self) -> Result<Option<String>, BackendError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+
+        let table = match transaction.open_table(CHANGES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(source) => {
+                return Err(BackendError::Redb {
+                    path: "<changes>".to_string(),
+                    reason: source.to_string(),
+                });
+            }
+        };
+
+        let first = table.first().map_err(|source| BackendError::Redb {
+            path: "<changes>".to_string(),
+            reason: source.to_string(),
+        })?;
+
+        Ok(first.map(|(key, _)| key.value().to_string()))
+    }
+
     /// How many records the journal holds.
     pub fn journal_len(&self) -> Result<usize, BackendError> {
         Ok(self.journal_since(None)?.len())

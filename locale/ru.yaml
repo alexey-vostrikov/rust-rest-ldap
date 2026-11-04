@@ -35,6 +35,9 @@ error.starttls_handshake: "клиент {peer}: StartTLS-рукопожатие 
 error.malformed: "клиент {peer} прислал некорректное сообщение, соединение закрыто"
 error.client: "клиент {peer}: {detail}"
 error.sync_lagged: "соединение {peer} отстало на {missed} изменений; постоянные поиски на нём сняты"
+error.peer: "сосед {url}: {detail}; повтор"
+error.peer_id: "сосед {url} представился сервером {actual}, а в конфигурации указан {expected}: два узла не должны иметь один id, и этот сосед реплицируется под чужим именем"
+error.peer_conflict: "сосед {url} и этот узел расходятся по {dn}: {why}; оставлена местная версия"
 error.panic: "соединение {peer} оборвалось внутренней ошибкой; слушатели не затронуты"
 error.journal: "не удаётся записать журнал изменений: {detail}"
 error.shutdown_timeout: "плавная остановка не уложилась в {grace}, закрываю оставшиеся соединения"
@@ -42,6 +45,7 @@ warn.schema: "предупреждение схемы: {detail}"
 
 # Диагностика конфигурации
 config.server_id: "некорректный server id: {detail}"
+config.peers: "ошибка в разделе peers: {detail}"
 config.referral: "ошибка в разделе referrals: {detail}"
 config.tls_material: "use_tls включён, но server_cert и server_key заданы не оба"
 config.schema_read: "не удаётся прочитать файл схемы '{path}': {detail}"
