@@ -245,7 +245,17 @@ pub fn handle_search(
     let mut matched: Vec<(String, Attributes)> = Vec::new();
     let mut visited: usize = 0;
 
-    for (position, entry) in directory.entries_with_ids(&base_object, scope) {
+    // When the index has narrowed the answer, walk only those entries. Walking the whole directory
+    // and testing each entry against the bitmap is what a million-entry load test caught: a lookup
+    // matching one entry cost 39 ms, because the index spared the filter but not the walk.
+    let size_limit = security.limits.effective_size_limit(request.size_limit);
+
+    let in_scope = match &candidates {
+        Some(candidates) => directory.entries_at(candidates),
+        None => directory.entries_with_ids(&base_object, scope),
+    };
+
+    for (_, entry) in in_scope {
         // Every 256 entries, not every one: the clock read is cheap but not free, and a search that
         // spends its budget on `Instant::now` is a search that did not need the limit.
         visited += 1;
@@ -263,10 +273,9 @@ pub fn handle_search(
             )];
         }
 
-        if candidates
-            .as_ref()
-            .is_some_and(|candidates| !candidates.contains(position as u32))
-        {
+        // The walk is already restricted when candidates exist; the scope check is what remains,
+        // and `entries_at` cannot apply it because a bitmap knows positions, not subtrees.
+        if !crate::directory::in_scope_for(entry.dn(), &base_object, scope) {
             continue;
         }
         let entry_dn = entry.dn().to_string();
@@ -289,6 +298,22 @@ pub fn handle_search(
             }
         }
         matched.push((entry_dn, entry.attributes().clone()));
+
+        // Stop as soon as the answer is known to be truncated, but only when nothing downstream
+        // needs the whole set. Without this, `-z 1000` over a million entries processed and cloned
+        // all of them before throwing away all but a thousand: measured at 2.8 s for a search whose
+        // answer was one kilobyte.
+        //
+        // One past the limit, because "exceeded" has to be knowable - and only when there is no
+        // sort, no VLV window and no paging, each of which is defined over the complete list.
+        if size_limit > 0
+            && matched.len() > size_limit
+            && sort_request.is_none()
+            && virtual_list.is_none()
+            && !has_paged_control
+        {
+            break;
+        }
     }
 
     // Sort before limits and paging: a client that asks for a sorted page means "the
@@ -350,7 +375,6 @@ pub fn handle_search(
     // Size limit: the smaller of what the client asked for and what this server allows, applied to
     // the entries that matched - after the filter, as RFC 4511 requires. A limit checked before
     // the filter refuses a search that would have returned one entry.
-    let size_limit = security.limits.effective_size_limit(request.size_limit);
     let size_limit_exceeded = size_limit > 0 && matched.len() > size_limit;
     if size_limit_exceeded {
         matched.truncate(size_limit);

@@ -328,6 +328,38 @@ impl Reporter {
         }
     }
 
+    /// Declares every configured peer, so its series exist before it is contacted.
+    pub fn register(&self, peers: &[Peer]) {
+        for peer in peers {
+            self.metrics.register_peer(&peer.url);
+        }
+    }
+
+    /// The persistent connection to this peer came up or went down.
+    pub fn connected(&self, peer: &Peer, up: bool) {
+        self.metrics.peer_connected(&peer.url, up);
+    }
+
+    /// An attempt to reach the peer, or to accept its change, failed.
+    pub fn failed(&self, peer: &Peer) {
+        self.metrics.peer_error(&peer.url);
+    }
+
+    /// What the merge decided, counted per peer.
+    pub fn decided(&self, peer: &Peer, decision: &crate::replication::Decision, csn: Option<&str>) {
+        match decision {
+            crate::replication::Decision::Apply { .. } => {
+                self.metrics.peer_change(&peer.url, true, csn)
+            }
+            // A conflict keeps the local version, so from this peer's point of view the change was
+            // not written - counting it as applied would make a diverging node look healthy.
+            crate::replication::Decision::Ignore { .. }
+            | crate::replication::Decision::Conflict { .. } => {
+                self.metrics.peer_change(&peer.url, false, None)
+            }
+        }
+    }
+
     fn conflict(
         &self,
         peer: &Peer,
@@ -398,6 +430,10 @@ pub async fn follow(
         {
             Ok(()) => {}
             Err(err) => {
+                // The connection is down and the peer is behind; both facts belong in the metrics
+                // before the retry, or a silent retry loop looks like a healthy node.
+                reporter.connected(&peer, false);
+                reporter.failed(&peer);
                 eprintln!(
                     "{}",
                     crate::i18n::t("error.peer", &[("url", &peer.url), ("detail", &err)])
@@ -476,6 +512,10 @@ async fn exchange(
         .search_persist(request, controls)
         .await
         .map_err(|err| err.to_string())?;
+
+    // The connection is up once the peer has accepted the search: a socket that opened and refused
+    // the request is not a working peer, and saying so would hide the difference.
+    reporter.connected(peer, true);
 
     // The refresh itself is merged like any other change: a node that has been away needs what
     // happened while it was away, and the cookie only orders it - it does not replace it.
@@ -592,6 +632,11 @@ pub async fn apply(
     };
 
     let decision = crate::replication::merge(&local, &incoming);
+
+    // Counted before it is carried out: an entry that fails to write is still a change the peer
+    // sent and this node tried to apply, and hiding it would make a failing write look like a
+    // peer that had nothing to say.
+    reporter.decided(peer, &decision, change.csn.as_deref());
 
     match &decision {
         crate::replication::Decision::Apply { .. } => {

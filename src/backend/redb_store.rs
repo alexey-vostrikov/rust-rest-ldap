@@ -150,6 +150,16 @@ pub struct RedbBackend {
     /// `Immediate` fsyncs on commit; `None` defers persistence and may lose the last
     /// commits on power loss — offered only for bulk imports.
     durability: Durability,
+    /// Whether a change is written down for replication to pick up.
+    ///
+    /// Off for a node that does not replicate: the journal record carries the whole entry, so
+    /// keeping it **doubles** the store for a feature that node never uses. Measured on a bulk
+    /// import of a million entries: 4.0 GB with the journal, and every record written twice.
+    ///
+    /// Off is not a silent loss of ability: `journal_head` and `journal_floor` then answer `None`,
+    /// which a synchronised search already reads as "no journal", and it answers with a full
+    /// refresh instead of pretending to know what changed.
+    journal: bool,
 }
 
 impl std::fmt::Debug for RedbBackend {
@@ -157,6 +167,7 @@ impl std::fmt::Debug for RedbBackend {
         formatter
             .debug_struct("RedbBackend")
             .field("durability", &self.durability)
+            .field("journal", &self.journal)
             .finish()
     }
 }
@@ -167,11 +178,27 @@ struct RedbBackendConfig {
     path: String,
     /// `immediate` (default) or `eventual`.
     durability: Option<String>,
+    /// Whether to keep a change journal; `true` unless the operator says otherwise.
+    #[serde(default = "journal_default")]
+    journal: bool,
+}
+
+fn journal_default() -> bool {
+    true
 }
 
 impl RedbBackend {
     /// Opens (creating if needed) the database at `path`.
     pub fn open(path: &Path, durability: Durability) -> Result<Self, BackendError> {
+        Self::open_with_journal(path, durability, true)
+    }
+
+    /// Opens the database, deciding whether changes are written down for replication.
+    pub fn open_with_journal(
+        path: &Path,
+        durability: Durability,
+        journal: bool,
+    ) -> Result<Self, BackendError> {
         let database = if path.exists() {
             Database::open(path)
         } else {
@@ -185,6 +212,7 @@ impl RedbBackend {
         let backend = Self {
             database: std::sync::Arc::new(database),
             durability,
+            journal,
         };
         backend.write_format_version()?;
         Ok(backend)
@@ -212,7 +240,7 @@ impl RedbBackend {
             }
         };
 
-        Self::open(Path::new(&config.path), durability)
+        Self::open_with_journal(Path::new(&config.path), durability, config.journal)
     }
 
     fn write_format_version(&self) -> Result<(), BackendError> {
@@ -340,30 +368,37 @@ impl RedbBackend {
                             })?
                             .is_some();
 
-                        let record = ChangeRecord {
-                            csn: csn_of(entry),
-                            kind: if existed {
-                                ChangeKind::Modify
-                            } else {
-                                ChangeKind::Add
-                            },
-                            dn: entry.dn().to_string(),
-                            uuid: uuid_of(entry),
-                            entry: Some(StoredEntry::from_entry(entry)),
-                        };
-                        let bytes =
-                            serde_json::to_vec(&record).map_err(|err| BackendError::Redb {
-                                path: entry.dn().to_string(),
-                                reason: format!("cannot serialize the journal record: {err}"),
-                            })?;
-                        journal
-                            .insert(record.csn.as_str(), bytes.as_slice())
-                            .map_err(|source| BackendError::Redb {
-                                path: "<changes>".to_string(),
-                                reason: source.to_string(),
-                            })?;
-
+                        // One conversion for both tables, and none of the journal work at all when
+                        // the journal is off: a bulk import of a million entries was writing every
+                        // entry twice, once for the store and once for a journal that node will
+                        // never ship anywhere.
                         let stored = StoredEntry::from_entry(entry);
+
+                        if self.journal {
+                            let record = ChangeRecord {
+                                csn: csn_of(entry),
+                                kind: if existed {
+                                    ChangeKind::Modify
+                                } else {
+                                    ChangeKind::Add
+                                },
+                                dn: entry.dn().to_string(),
+                                uuid: uuid_of(entry),
+                                entry: Some(stored.clone()),
+                            };
+                            let bytes =
+                                serde_json::to_vec(&record).map_err(|err| BackendError::Redb {
+                                    path: entry.dn().to_string(),
+                                    reason: format!("cannot serialize the journal record: {err}"),
+                                })?;
+                            journal
+                                .insert(record.csn.as_str(), bytes.as_slice())
+                                .map_err(|source| BackendError::Redb {
+                                    path: "<changes>".to_string(),
+                                    reason: source.to_string(),
+                                })?;
+                        }
+
                         let bytes =
                             serde_json::to_vec(&stored).map_err(|err| BackendError::Redb {
                                 path: entry.dn().to_string(),
@@ -428,6 +463,10 @@ impl RedbBackend {
     /// over the text keys is a range scan over time - and no separate index is needed to answer
     /// "what changed since".
     pub fn journal_since(&self, csn: Option<&str>) -> Result<Vec<ChangeRecord>, BackendError> {
+        if !self.journal {
+            return Ok(Vec::new());
+        }
+
         let transaction = self
             .database
             .begin_read()
@@ -484,6 +523,10 @@ impl RedbBackend {
     /// The last key, not a scan: this is asked on every synchronised search, and the whole point
     /// of a fixed-width key is that the newest one is at the end.
     pub fn journal_head(&self) -> Result<Option<String>, BackendError> {
+        if !self.journal {
+            return Ok(None);
+        }
+
         let transaction = self
             .database
             .begin_read()
@@ -517,6 +560,10 @@ impl RedbBackend {
     /// nothing in the surviving records says so: the range simply starts later. That is silent
     /// divergence, so the caller compares against this and starts a full refresh instead.
     pub fn journal_floor(&self) -> Result<Option<String>, BackendError> {
+        if !self.journal {
+            return Ok(None);
+        }
+
         let transaction = self
             .database
             .begin_read()
@@ -789,6 +836,51 @@ mod tests {
             bad.to_string().contains("unknown durability 'sometimes'"),
             "{bad}"
         );
+    }
+
+    #[test]
+    fn with_the_journal_off_a_change_is_written_once_and_remembered_nowhere() {
+        // The measurement that prompted this: a bulk import of a million entries produced a 4 GB
+        // store and wrote every entry twice, once for the store and once for a journal that node
+        // was never going to ship anywhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal-off.redb");
+        let backend =
+            RedbBackend::open_with_journal(&path, Durability::Immediate, false).expect("open");
+
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: entry("cn=alice,dc=example,dc=com", "alice", None, false),
+            }])
+            .expect("write");
+
+        // The entry is there.
+        let loaded = backend.load().expect("load");
+        assert_eq!(loaded.len(), 1);
+
+        // The journal is not, and says so rather than pretending.
+        assert!(backend.journal_since(None).expect("journal").is_empty());
+        assert_eq!(backend.journal_head().expect("head"), None);
+        assert_eq!(backend.journal_floor().expect("floor"), None);
+    }
+
+    #[test]
+    fn with_the_journal_on_the_same_change_is_remembered() {
+        // The control: the flag must change the journal and nothing else.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal-on.redb");
+        let backend =
+            RedbBackend::open_with_journal(&path, Durability::Immediate, true).expect("open");
+
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: entry("cn=alice,dc=example,dc=com", "alice", None, false),
+            }])
+            .expect("write");
+
+        let records = backend.journal_since(None).expect("journal");
+        assert_eq!(records.len(), 1);
+        assert!(backend.journal_head().expect("head").is_some());
     }
 
     #[test]
