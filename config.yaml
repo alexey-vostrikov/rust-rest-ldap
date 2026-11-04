@@ -101,6 +101,39 @@ indexes:
 #    bind_dn: cn=replicator,dc=example,dc=com   # read access to the whole naming context
 #    password: <secret>
 
+# SASL: proving identity by Kerberos ticket instead of by password.
+#
+# A password bind needs the password on the client machine - in a file, readable by the service
+# that runs as that account. A ticket the client already holds replaces it, and this server never
+# sees a secret that could be reused elsewhere. `ldapsearch -Y GSSAPI` is the client side.
+#
+# The keytab is what `kadmin ktadd -k` produced for this service's principal, typically
+# `ldap/<hostname>@REALM`. It is read once at startup: reading it per bind would turn a file
+# permission mistake into a request-by-request failure. `--check-config` validates the section
+# WITHOUT reading the file, since on a hardened host it belongs to root and the service account.
+#
+# `realms` is not optional when a keytab is set. A ticket from a realm nobody mapped has no
+# honest subtree, and guessing one would put a stranger's principal into somebody's directory.
+# Every value substituted into `dn` is escaped first, so a principal whose name contains a comma
+# cannot address an entry outside the template.
+#
+# With this section present the server also publishes an Active Directory compatible schema
+# (`userPrincipalName`, `sAMAccountName`, `userAccountControl`, `objectGUID`, `servicePrincipalName`
+# and the `user`/`group`/`computer` classes): a client that authenticates by ticket is usually from
+# that world and asks for those names. `userAccountControl` is honoured on a ticket bind -
+# ACCOUNTDISABLE and LOCKOUT are refusals - and an account is looked up by its userPrincipalName
+# before the template, refusing an ambiguous one.
+#
+# A ticket is accepted only over TLS or StartTLS: channel binding is not implemented, so a captured
+# ticket could otherwise be replayed. The SASL security layer is not implemented either - the client
+# must select "none", because TLS is where the encryption belongs.
+#sasl:
+#  keytab: /etc/rust-rest-ldap/ldap.keytab
+#  service_principal: ldap/host.example.com@EXAMPLE.COM
+#  realms:
+#    - name: example.com
+#      dn: "uid={user},ou=users,{base}"
+
 # Subtrees this server does not hold, and where a client is sent for them.
 #
 # A referral is not an error: the server answers `searchResRef` and the client asks the other

@@ -102,6 +102,10 @@ impl ConfigError {
                 key = "config.journal_keep";
                 owned.push(("detail".to_string(), detail.clone()));
             }
+            Self::AdSchema(detail) => {
+                key = "config.ad_schema";
+                owned.push(("detail".to_string(), detail.clone()));
+            }
             Self::Sasl(detail) => {
                 key = "config.sasl";
                 owned.push(("detail".to_string(), detail.clone()));
@@ -349,6 +353,8 @@ pub enum ConfigError {
     Peers(String),
     #[error("invalid sasl: {0}")]
     Sasl(String),
+    #[error("the Active Directory schema extension is unusable: {0}")]
+    AdSchema(String),
     #[error("invalid journal_keep: {0}")]
     JournalKeep(String),
     #[error("invalid referrals: {0}")]
@@ -839,7 +845,19 @@ pub fn resolve(
         },
         callback_auth_token: file.callback_auth_token,
         passwords: PasswordPolicy::from_config(file.passwords.as_ref())?,
-        schema: load_schema(&file.schema)?,
+        schema: {
+            let mut schema = load_schema(&file.schema)?;
+
+            // Kerberos mode and AD vocabulary go together: a server that accepts tickets is
+            // claiming to stand in for a domain controller, and a client from that world asks for
+            // `userPrincipalName` and `userAccountControl` by name. A server without a keytab
+            // publishes neither, so nothing invites a client to rely on flags it does not maintain.
+            if file.sasl.keytab.is_some() {
+                crate::ad_schema::extend(&mut schema).map_err(ConfigError::AdSchema)?;
+            }
+
+            schema
+        },
         schema_files: file.schema.files.clone(),
         schema_mode: match file.schema.mode.as_deref() {
             None => SchemaMode::Strict,

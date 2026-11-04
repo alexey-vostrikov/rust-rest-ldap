@@ -579,6 +579,10 @@ const ENGLISH: &[(&str, &str)] = &[
     ("config.server_id", "invalid server id: {detail}"),
     ("config.journal_keep", "invalid journal_keep: {detail}"),
     ("config.sasl", "invalid sasl: {detail}"),
+    (
+        "config.ad_schema",
+        "the Active Directory schema extension is unusable: {detail}",
+    ),
     ("config.peers", "invalid peers: {detail}"),
     ("config.referral", "invalid referrals: {detail}"),
     (

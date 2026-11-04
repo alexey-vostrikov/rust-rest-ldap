@@ -292,6 +292,13 @@ pub struct ServiceValidator<'a> {
     require_client_address: bool,
     replay_cache: ReplayCache,
     shared_replay_cache: Option<SharedReplayCache>,
+    /// Whether a PAC in the ticket is located and its signature verified.
+    ///
+    /// On by default: an AD deployment's authorization data is only trustworthy if this holds.
+    /// A service that takes no authorization decision from the PAC - and says so - can turn it
+    /// off, because a PAC it neither reads nor trusts is a parse error waiting to refuse a
+    /// perfectly good ticket.
+    validate_pac: bool,
 }
 
 impl<'a> ServiceValidator<'a> {
@@ -310,6 +317,7 @@ impl<'a> ServiceValidator<'a> {
             require_client_address: false,
             replay_cache: ReplayCache::new(),
             shared_replay_cache: None,
+            validate_pac: true,
         }
     }
 
@@ -341,6 +349,16 @@ impl<'a> ServiceValidator<'a> {
     /// Provide the client address observed by the service.
     pub fn with_client_address(mut self, client_address: HostAddress) -> Self {
         self.client_address = Some(client_address);
+        self
+    }
+
+    /// Turns PAC validation off.
+    ///
+    /// For a service that never reads the PAC: the ticket's own signature, checked with the
+    /// service key, is what proves the client. Call this only when the PAC is genuinely not used
+    /// for any decision, and write down why.
+    pub fn without_pac_validation(mut self) -> Self {
+        self.validate_pac = false;
         self
     }
 
@@ -401,13 +419,22 @@ impl<'a> ServiceValidator<'a> {
             .map_err(ticket_error)?;
         self.validate_ticket_times(&ticket_service, &enc_ticket)?;
         self.validate_client_address(&ticket_service, &enc_ticket)?;
-        let pac = match &enc_ticket.authorization_data {
-            Some(authorization_data) => pac::find_pac_in_authorization_data(authorization_data)?,
-            None => None,
+        // PAC validation is opt-out, not opt-in: an AD deployment relies on the PAC's
+        // signature, so dropping it by default would weaken the default. A service that makes
+        // no authorization decision from the PAC at all - this LDAP server takes rights from its
+        // own directory - can turn it off and say so, which is what the builder below is for.
+        let pac = if self.validate_pac {
+            let found = match &enc_ticket.authorization_data {
+                Some(authorization_data) => pac::find_pac_in_authorization_data(authorization_data)?,
+                None => None,
+            };
+            if let Some(pac) = &found {
+                pac.verify(service_key.0)?;
+            }
+            found
+        } else {
+            None
         };
-        if let Some(pac) = &pac {
-            pac.verify(service_key.0)?;
-        }
 
         let session_key = encryption_key_from_rasn(&enc_ticket.key)?;
         let authenticator_usage = crate::ap_req::authenticator_usage_for_ticket(&ap_req.ticket);
