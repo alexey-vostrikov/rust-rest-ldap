@@ -218,6 +218,54 @@ async fn the_journal_is_ordered_by_time_because_the_key_is() {
 }
 
 #[tokio::test]
+async fn pruning_moves_the_floor_so_a_laggard_knows_what_it_lost() {
+    // A client resuming from a cookie older than the floor has missed changes nobody will send
+    // it: the surviving records simply start later, and nothing in them says the gap exists. The
+    // floor is the only thing that can say so.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = store(dir.path());
+
+    for name in ["alice", "bob", "carol"] {
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person(name, "X"),
+            }])
+            .await
+            .expect("write");
+    }
+
+    let before = backend
+        .journal_floor()
+        .expect("floor")
+        .expect("three records, so a floor");
+    let oldest_csn = backend.journal_since(None).expect("journal")[0].csn.clone();
+    assert_eq!(
+        before, oldest_csn,
+        "before pruning the floor is the first record"
+    );
+
+    backend.journal_prune(1).expect("prune");
+
+    let after = backend
+        .journal_floor()
+        .expect("floor")
+        .expect("one record left");
+    assert!(
+        after > before,
+        "pruning moves the floor forward: {after} must be newer than {before}"
+    );
+
+    // A resume from the pruned cookie is exactly the silent loss this protects against: the range
+    // starts after the floor and carries no hint that anything was dropped.
+    let resumed = backend.journal_since(Some(&before)).expect("journal");
+    assert_eq!(resumed.len(), 1, "only what survived comes back");
+    assert!(
+        after > before,
+        "and the caller has no way to see the gap except by comparing with the floor"
+    );
+}
+
+#[tokio::test]
 async fn pruning_keeps_the_newest_and_forgets_the_rest() {
     let dir = tempfile::tempdir().expect("tempdir");
     let backend = store(dir.path());

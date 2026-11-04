@@ -98,6 +98,10 @@ impl ConfigError {
         let mut owned: Vec<(String, String)> = Vec::new();
 
         match self {
+            Self::Peers(detail) => {
+                key = "config.peers";
+                owned.push(("detail".to_string(), detail.clone()));
+            }
             Self::ServerId(detail) => {
                 key = "config.server_id";
                 owned.push(("detail".to_string(), detail.clone()));
@@ -283,6 +287,11 @@ pub struct Config {
     /// cannot be told apart, and the order between them cannot be recovered afterwards. So zero is
     /// allowed only while the server has no peers.
     pub server_id: u16,
+    /// Nodes this one replicates with.
+    ///
+    /// Empty means this node stands alone. Checked against the id at startup: a peer with this
+    /// node's own id is refused, because the damage is permanent.
+    pub peers: Vec<crate::peers::Peer>,
     /// Subtrees held elsewhere, and where a client is sent for them.
     ///
     /// Empty means the server answers `noSuchObject` for anything outside its own tree, which is
@@ -318,6 +327,8 @@ pub enum ConfigError {
     },
     #[error("invalid server id: {0}")]
     ServerId(String),
+    #[error("invalid peers: {0}")]
+    Peers(String),
     #[error("invalid referrals: {0}")]
     Referral(String),
     #[error("use_tls is enabled, but server_cert and server_key are not both set")]
@@ -391,6 +402,9 @@ struct FileConfig {
     referrals: Vec<ReferralConfig>,
     /// See [`Config::server_id`].
     server_id: Option<u16>,
+    /// Nodes this one replicates with, if any.
+    #[serde(default)]
+    peers: Vec<crate::peers::PeerConfig>,
     #[serde(default)]
     observability: ObservabilityConfig,
     /// Language for operator-facing diagnostics: `ru`, `en`. Empty means "ask the
@@ -793,6 +807,8 @@ pub fn resolve(
                 .map(|id| id.value())
                 .map_err(|err| ConfigError::ServerId(err.to_string()))?,
         },
+        peers: crate::peers::from_config(&file.peers, file.server_id.unwrap_or(0))
+            .map_err(|err| ConfigError::Peers(err.to_string()))?,
         referrals,
         acl: crate::acl::from_config(file.access.as_deref())?,
         allow_unencrypted_bind: file.bind.allow_unencrypted_bind.is_on(),

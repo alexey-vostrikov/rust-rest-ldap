@@ -446,6 +446,16 @@ const ENGLISH: &[(&str, &str)] = &[
         "error.sync_lagged",
         "connection {peer} fell {missed} changes behind and its persistent searches were dropped",
     ),
+    ("error.peer", "peer {url}: {detail}; retrying"),
+    (
+        "error.peer_id",
+        "peer {url} says it is server {actual}, but the configuration says {expected}: two nodes \
+         must not share an id, and this peer is replicating under another node's name",
+    ),
+    (
+        "error.peer_conflict",
+        "peer {url} and this node disagree about {dn}: {why}; the local version was kept",
+    ),
     (
         "error.panic",
         "connection {peer} ended in an internal error; the listeners are unaffected",
@@ -549,6 +559,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ("warn.schema", "schema warning: {detail}"),
     // Configuration diagnostics, one per variant an operator can hit
     ("config.server_id", "invalid server id: {detail}"),
+    ("config.peers", "invalid peers: {detail}"),
     ("config.referral", "invalid referrals: {detail}"),
     (
         "config.tls_material",

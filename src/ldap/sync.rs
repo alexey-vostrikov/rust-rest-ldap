@@ -55,6 +55,17 @@ pub enum Mode {
     RefreshAndPersist,
 }
 
+impl Mode {
+    fn as_u8(self) -> u8 {
+        match self {
+            // RFC 4533 §2.5: 1 = refreshOnly, 3 = refreshAndPersist. Two is not skipped by
+            // mistake - the numbering is the protocol's.
+            Mode::RefreshOnly => 1,
+            Mode::RefreshAndPersist => 3,
+        }
+    }
+}
+
 /// The state of one entry in the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -439,6 +450,30 @@ pub fn decode_cookie(value: &[u8]) -> Option<(u64, Option<String>)> {
 /// chronological order - the same property the journal keys rely on.
 pub fn is_newer(csn: &str, since: &str) -> bool {
     csn > since
+}
+
+/// The `syncRequest` control: the mode, and the cookie a client resumes from.
+///
+/// `syncRequestValue ::= SEQUENCE { mode ENUMERATED, cookie OCTET STRING OPTIONAL,
+/// reloadHint BOOLEAN DEFAULT FALSE }`. Critical, because a server that ignored it would answer an
+/// ordinary search and the client would take that for a synchronisation that had happened.
+pub fn request_control(mode: Mode, cookie: Option<&[u8]>) -> Control {
+    let mut body = vec![ENUMERATED_TAG, 0x01, mode.as_u8()];
+    if let Some(cookie) = cookie {
+        body.push(OCTET_STRING_TAG);
+        body.extend(encode_length(cookie.len()));
+        body.extend_from_slice(cookie);
+    }
+
+    let mut value = vec![SEQUENCE_TAG];
+    value.extend(encode_length(body.len()));
+    value.extend_from_slice(&body);
+
+    Control::new(
+        LdapOid::from(SYNC_OID.as_bytes()),
+        true,
+        Some(rasn::types::OctetString::from(value)),
+    )
 }
 
 /// The `syncInfo` message that ends the refresh stage of a `refreshAndPersist` search.

@@ -65,6 +65,7 @@ async fn serve(
         schema_files: Vec::new(),
         indexes: Default::default(),
         server_id: 0,
+        peers: Vec::new(),
         referrals: rust_rest_ldap::referral::Referrals::new(
             referrals
                 .iter()
