@@ -131,6 +131,16 @@ pub fn parse_generalized_time(text: &str) -> Option<SystemTime> {
     Some(UNIX_EPOCH + std::time::Duration::from_micros(micros.max(0) as u64))
 }
 
+/// When a change happened, read from its CSN.
+///
+/// The journal keeps no separate timestamp: the CSN already begins with the time it was stamped,
+/// and a second field recording the same moment is a second field that can disagree with the
+/// ordering the whole replication rests on.
+pub fn csn_time(csn: &str) -> Option<SystemTime> {
+    let (time, _) = csn.split_once('#')?;
+    parse_generalized_time(time)
+}
+
 /// `20261102143012.123456Z#000042#000#000000`.
 /// A CSN for a change that has no entry to stamp - a deletion, which leaves a tombstone.
 ///

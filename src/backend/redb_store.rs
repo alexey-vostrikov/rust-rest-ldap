@@ -601,6 +601,10 @@ impl RedbBackend {
     /// A journal that is never trimmed grows with every write for ever, and a replica that has
     /// been offline longer than the journal is not `error` but a fact: it must be re-initialised
     /// rather than caught up, and `journal_head` is how it finds out.
+    ///
+    /// The count is the wrong only bound on its own, which is why [`Self::journal_prune_before`]
+    /// exists: a directory that is written to rarely keeps a year of records under a generous
+    /// count, and a directory written to heavily keeps a couple of hours under the same one.
     pub fn journal_prune(&self, keep: usize) -> Result<usize, BackendError> {
         let records = self.journal_since(None)?;
         if records.len() <= keep {
@@ -611,6 +615,47 @@ impl RedbBackend {
             .iter()
             .map(|record| record.csn.clone())
             .collect();
+
+        self.remove_changes(&doomed)
+    }
+
+    /// Drops the records stamped before `cutoff`.
+    ///
+    /// A tombstone ("this DN was deleted") is kept for one reason: a peer that has not yet heard
+    /// about the deletion must be able to hear about it. Once every peer is past that moment the
+    /// record is history, and keeping it because a count says so leaves a directory holding
+    /// deletions from a year ago - which is both storage and a disclosure of what used to exist.
+    ///
+    /// A record whose CSN cannot be read is kept: an unreadable timestamp is not evidence that it
+    /// is old, and dropping a record that a peer still needs costs a full resynchronisation of
+    /// that peer, while keeping one costs a few bytes.
+    pub fn journal_prune_before(
+        &self,
+        cutoff: std::time::SystemTime,
+    ) -> Result<usize, BackendError> {
+        let records = self.journal_since(None)?;
+
+        let doomed: Vec<String> = records
+            .iter()
+            .filter(|record| {
+                crate::operational::csn_time(&record.csn)
+                    .map(|stamp| stamp < cutoff)
+                    .unwrap_or(false)
+            })
+            .map(|record| record.csn.clone())
+            .collect();
+
+        self.remove_changes(&doomed)
+    }
+
+    /// Removes change records by CSN, in one transaction.
+    ///
+    /// The head and the floor are derived from what is present, so removing the tail is all a
+    /// prune has to do; nothing else is updated, and nothing can be left half-removed.
+    fn remove_changes(&self, doomed: &[String]) -> Result<usize, BackendError> {
+        if doomed.is_empty() {
+            return Ok(0);
+        }
 
         let mut transaction = self
             .database
@@ -633,7 +678,7 @@ impl RedbBackend {
                         path: "<changes>".to_string(),
                         reason: source.to_string(),
                     })?;
-            for csn in &doomed {
+            for csn in doomed {
                 table
                     .remove(csn.as_str())
                     .map_err(|source| BackendError::Redb {
@@ -738,6 +783,105 @@ mod tests {
             "flags must survive the round trip"
         );
         assert!(entry.is_admin(), "the internal flag must survive too");
+    }
+
+    /// An entry stamped at `at`, so the journal record carries that moment.
+    fn stamped(dn: &str, cn: &str, at: std::time::SystemTime) -> Entry {
+        crate::operational::stamp_write_for(&entry(dn, cn, None, false), "test", at, 1)
+    }
+
+    #[test]
+    fn records_older_than_the_configured_age_are_dropped_and_younger_ones_stay() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempdir().expect("tempdir");
+        let backend = backend(&dir);
+        let now = SystemTime::now();
+
+        backend
+            .apply(&[
+                EntryChange::Upsert {
+                    entry: stamped(
+                        "cn=old,ou=users,dc=example,dc=com",
+                        "old",
+                        now - Duration::from_secs(90 * 86_400),
+                    ),
+                },
+                EntryChange::Upsert {
+                    entry: stamped(
+                        "cn=young,ou=users,dc=example,dc=com",
+                        "young",
+                        now - Duration::from_secs(3600),
+                    ),
+                },
+            ])
+            .expect("write");
+
+        assert_eq!(backend.journal_len().expect("len"), 2);
+
+        let removed = backend
+            .journal_prune_before(now - Duration::from_secs(30 * 86_400))
+            .expect("prune");
+
+        assert_eq!(
+            removed, 1,
+            "only the record from ninety days ago is older than thirty"
+        );
+        assert_eq!(backend.journal_len().expect("len"), 1);
+        assert!(
+            backend
+                .journal_since(None)
+                .expect("records")
+                .iter()
+                .all(|record| record.dn.contains("young")),
+            "the record inside the age is the one that survived"
+        );
+        assert!(
+            backend
+                .journal_since(None)
+                .expect("records")
+                .iter()
+                .all(|record| !record.dn.contains("old")),
+            "and the old DN is gone, not merely hidden from the count"
+        );
+    }
+
+    #[test]
+    fn a_record_with_an_unreadable_stamp_is_kept() {
+        use std::time::{Duration, SystemTime};
+
+        // The rule this pins: an unreadable timestamp is not evidence that a record is old.
+        // Dropping one that a peer still needs costs that peer a full resynchronisation, while
+        // keeping it costs a few bytes - so the doubt resolves towards keeping.
+        let dir = tempdir().expect("tempdir");
+        let backend = backend(&dir);
+
+        let mut broken = entry(
+            "cn=broken,ou=users,dc=example,dc=com",
+            "broken",
+            None,
+            false,
+        );
+        broken = Entry::new(
+            broken.dn(),
+            broken
+                .attributes()
+                .clone()
+                .replace(Attribute::single("entryCSN", "not-a-csn").operational()),
+        );
+        backend
+            .apply(&[EntryChange::Upsert { entry: broken }])
+            .expect("write");
+
+        let removed = backend
+            .journal_prune_before(SystemTime::now() + Duration::from_secs(86_400))
+            .expect("prune");
+
+        assert_eq!(
+            removed, 0,
+            "nothing is dropped on the strength of a bad stamp"
+        );
+        assert_eq!(backend.journal_len().expect("len"), 1);
     }
 
     #[test]

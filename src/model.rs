@@ -19,6 +19,21 @@ use serde::Deserialize;
 pub const ATTR_ENTRY_DN: &str = "entryDN";
 /// Operational attribute pointing at the schema governing this entry (RFC 4512 §3.4).
 pub const ATTR_SUBSCHEMA_SUBENTRY: &str = "subschemaSubentry";
+
+/// Attributes a server computes about an entry rather than stores in it.
+///
+/// They describe the answering server: `entryDN` is the DN spelled again, `subschemaSubentry`
+/// names where *this* server's schema lives. Neither is data, which is why `mutate` refuses to
+/// write them - and the same reason keeps them off a replication stream: a replica that stored
+/// what a peer computed would fail its own schema check, and would do it on every poll.
+pub const DERIVED_ATTRIBUTES: [&str; 2] = [ATTR_ENTRY_DN, ATTR_SUBSCHEMA_SUBENTRY];
+
+/// True when `name` is one of [`DERIVED_ATTRIBUTES`], compared as LDAP compares names.
+pub fn is_derived(name: &str) -> bool {
+    DERIVED_ATTRIBUTES
+        .iter()
+        .any(|derived| derived.eq_ignore_ascii_case(name))
+}
 /// The DN of that subentry, as OpenLDAP spells it.
 pub const SUBSCHEMA_SUBENTRY_DN: &str = "cn=Subschema";
 /// Attribute description returned for every entry when `+` is requested.

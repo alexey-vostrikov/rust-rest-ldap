@@ -102,6 +102,10 @@ impl ConfigError {
                 key = "config.journal_keep";
                 owned.push(("detail".to_string(), detail.clone()));
             }
+            Self::JournalMaxAge(detail) => {
+                key = "config.journal_max_age";
+                owned.push(("detail".to_string(), detail.clone()));
+            }
             Self::AdSchema(detail) => {
                 key = "config.ad_schema";
                 owned.push(("detail".to_string(), detail.clone()));
@@ -321,6 +325,13 @@ pub struct Config {
     pub peers: Vec<crate::peers::Peer>,
     /// How many change records this node keeps; `None` keeps everything.
     pub journal_keep: Option<usize>,
+    /// How long a change record is kept, when the count alone is the wrong bound.
+    ///
+    /// `journal_keep` says how many records to keep and nothing about how old they are: a
+    /// directory written to rarely holds a year of them, one written to heavily holds hours. A
+    /// tombstone only has to outlive the slowest peer, and after that it is history worth not
+    /// keeping - it says what used to exist.
+    pub journal_max_age: Option<Duration>,
     /// Where conflicts with peers are recorded; `None` keeps them only on standard error.
     pub conflict_log: Option<PathBuf>,
     /// The `sasl:` section as written, with its realms already checked against the base.
@@ -372,6 +383,8 @@ pub enum ConfigError {
     AdSchema(String),
     #[error("invalid journal_keep: {0}")]
     JournalKeep(String),
+    #[error("invalid journal_max_age: {0}")]
+    JournalMaxAge(String),
     #[error("invalid referrals: {0}")]
     Referral(String),
     #[error("use_tls is enabled, but server_cert and server_key are not both set")]
@@ -571,6 +584,12 @@ pub struct ReplicationConfig {
     /// everything, which is the honest default for a node whose peers have been down for a long
     /// time - and a slow leak for a node nobody reads.
     pub journal_keep: Option<usize>,
+    /// How long a change record is kept, as text (`30d`, `12h`).
+    ///
+    /// The companion of `journal_keep`, not a replacement: whichever bound cuts first wins, and
+    /// together they answer "enough to outlive the slowest peer, and no longer". A tombstone says
+    /// what used to exist, so keeping it for ever is a disclosure as much as a cost.
+    pub journal_max_age: Option<String>,
     /// Where disagreements with peers are written down, one JSON object per line.
     ///
     /// Without it a conflict is printed to standard error and forgotten: after a restart there is
@@ -924,6 +943,24 @@ pub fn resolve(
             }
             other => other,
         },
+        // Zero is refused for the same reason as `journal_keep: 0`: the record of a deletion is
+        // the only thing that says the deletion happened, and a duration of nothing would drop it
+        // while the peers are still behind. Omitting the key keeps everything.
+        journal_max_age: match file.replication.journal_max_age.as_deref() {
+            None => None,
+            Some(text) => {
+                let parsed = humantime::parse_duration(text)
+                    .map_err(|source| ConfigError::JournalMaxAge(format!("'{text}': {source}")))?;
+                if parsed.is_zero() {
+                    return Err(ConfigError::JournalMaxAge(
+                        "'0' would discard every change record, including the only record that \
+                         a deletion ever happened; omit the key to keep everything"
+                            .to_string(),
+                    ));
+                }
+                Some(parsed)
+            }
+        },
         conflict_log: file.replication.conflict_log.clone(),
         sasl: {
             crate::sasl::Gssapi::validate(&file.sasl, &base_dn)
@@ -1218,6 +1255,50 @@ bootstrap:
     fn without_a_conflict_log_a_conflict_is_only_printed() {
         let cfg = resolve(Args::default(), None, no_env).expect("defaults");
         assert_eq!(cfg.conflict_log, None);
+    }
+
+    #[test]
+    fn a_journal_max_age_is_read_as_a_duration() {
+        let text = "replication:\n  journal_max_age: 30d\n";
+        let cfg = resolve(Args::default(), Some(text), no_env).expect("config");
+        assert_eq!(
+            cfg.journal_max_age,
+            Some(Duration::from_secs(30 * 86_400)),
+            "the bound on age is what the operator wrote"
+        );
+    }
+
+    #[test]
+    fn a_zero_max_age_is_refused() {
+        // Same reason as `journal_keep: 0`: the record of a deletion is the only thing that says
+        // the deletion happened, and a duration of nothing drops it while the peers are behind.
+        let err = resolve(
+            Args::default(),
+            Some("replication:\n  journal_max_age: 0s\n"),
+            no_env,
+        )
+        .expect_err("zero is a mistake, not a policy");
+
+        assert!(
+            err.to_string().contains("journal_max_age"),
+            "the message names the key: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_max_age_is_refused_with_what_was_written() {
+        let err = resolve(
+            Args::default(),
+            Some("replication:\n  journal_max_age: soon\n"),
+            no_env,
+        )
+        .expect_err("'soon' is not a duration");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("soon"),
+            "the message quotes the value: {text}"
+        );
     }
 
     #[test]

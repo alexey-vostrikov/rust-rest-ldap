@@ -414,6 +414,10 @@ const ENGLISH: &[(&str, &str)] = &[
         "journal: dropped {removed} of the oldest change records, as replication.journal_keep says",
     ),
     (
+        "start.journal_pruned_age",
+        "journal: dropped {removed} change record(s) older than the configured age",
+    ),
+    (
         "start.http",
         "http: listening on {addr} (health, metrics, callback)",
     ),
@@ -474,6 +478,11 @@ const ENGLISH: &[(&str, &str)] = &[
         "error.peer_id",
         "peer {url} says it is server {actual}, but the configuration says {expected}: two nodes \
          must not share an id, and this peer is replicating under another node's name",
+    ),
+    (
+        "error.peer_schema",
+        "peer {url} sent {dn} with data this server's schema refuses, so it was not stored: \
+         {detail}",
     ),
     (
         "error.peer_conflict",
@@ -582,6 +591,10 @@ const ENGLISH: &[(&str, &str)] = &[
     ("warn.schema", "schema warning: {detail}"),
     // Configuration diagnostics, one per variant an operator can hit
     ("config.server_id", "invalid server id: {detail}"),
+    (
+        "config.journal_max_age",
+        "invalid journal_max_age: {detail}",
+    ),
     ("config.journal_keep", "invalid journal_keep: {detail}"),
     ("config.sasl", "invalid sasl: {detail}"),
     (

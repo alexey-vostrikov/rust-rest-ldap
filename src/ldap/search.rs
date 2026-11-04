@@ -498,6 +498,13 @@ pub fn handle_search(
 
     let mut messages: Vec<LdapMessage> = Vec::with_capacity(page_end.saturating_sub(page_start));
 
+    // Whether this answer is a replication stream. Only then are the attributes a server derives
+    // about an entry left out: `entryDN` and `subschemaSubentry` describe the server that computed
+    // them, and a replica that stored them would fail its own schema check on every poll. An
+    // ordinary client asking for `+` is owed them - RFC 5020 says `entryDN` comes back for `+`,
+    // and a tool that renders an entry reads it from there.
+    let replication_stream = sync_request.is_some();
+
     for (index, (dn, attributes)) in matched[page_start..page_end].iter().enumerate() {
         let is_unchanged = unchanged[index];
 
@@ -509,6 +516,12 @@ pub fn handle_search(
         let visible: Vec<Attribute> = attributes
             .select(dn, &selection)
             .into_iter()
+            .filter(|attribute| {
+                // A synchronised answer carries the entry as data, so what the server derived
+                // about it is left out; the receiving side strips it too, for peers that predate
+                // this rule.
+                !(replication_stream && crate::model::is_derived(&attribute.name))
+            })
             .filter(|attribute| {
                 security
                     .acl
@@ -745,6 +758,9 @@ impl Subscription {
                     .attributes()
                     .select(entry.dn(), &self.selection)
                     .into_iter()
+                    // Same rule as the refresh above: what a server derived about an entry is
+                    // not part of the entry a replica should store.
+                    .filter(|attribute| !crate::model::is_derived(&attribute.name))
                     .filter(|attribute| {
                         security
                             .acl

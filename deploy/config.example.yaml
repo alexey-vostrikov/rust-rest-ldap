@@ -153,6 +153,11 @@ access:
 #server_id: 1
 #replication:
 #  journal_keep: 100000
+#  # The other bound, and the one a count cannot express: a quiet directory keeps a year of
+#  # records under a generous count, a busy one keeps hours. A tombstone say what used to exist,
+#  # so it should outlive the slowest peer and no longer. Zero is refused: it would drop the only
+#  # record that a deletion ever happened.
+#  journal_max_age: 30d
 #  conflict_log: /var/lib/rust-rest-ldap/conflicts.jsonl
 #peers:
 #  - url: ldaps://node2.example.com:636
