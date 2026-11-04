@@ -121,6 +121,13 @@ pub fn parse_generalized_time(text: &str) -> Option<SystemTime> {
 }
 
 /// `20261102143012.123456Z#000042#000#000000`.
+/// A CSN for a change that has no entry to stamp - a deletion, which leaves a tombstone.
+///
+/// Public because the journal needs an ordering key for a change whose subject no longer exists.
+pub fn next_csn() -> String {
+    change_sequence_number(SystemTime::now())
+}
+
 fn change_sequence_number(at: SystemTime) -> String {
     let counter = CSN_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}#{counter:06}#{:03}#000000", generalized_time(at), 0)

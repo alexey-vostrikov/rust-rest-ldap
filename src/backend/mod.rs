@@ -192,6 +192,38 @@ impl Backend {
     }
 
     /// The name this backend is configured under.
+    /// Journal records after `csn`, oldest first.
+    ///
+    /// Only the entry store keeps a journal: the JSON backends have no place to write one beside
+    /// their data, and REST is somebody else's service. An empty answer from them means "no
+    /// history here", which is true and is what a replica has to be told rather than a full
+    /// resync it did not need.
+    pub fn journal_since(
+        &self,
+        csn: Option<&str>,
+    ) -> Result<Vec<crate::backend::redb_store::ChangeRecord>, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.journal_since(csn),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// The newest journal CSN, if this backend keeps one.
+    pub fn journal_head(&self) -> Result<Option<String>, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.journal_head(),
+            _ => Ok(None),
+        }
+    }
+
+    /// Trims the journal to its newest `keep` records.
+    pub fn journal_prune(&self, keep: usize) -> Result<usize, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.journal_prune(keep),
+            _ => Ok(0),
+        }
+    }
+
     /// Whether this backend can store a whole entry as an upsert.
     ///
     /// Not the same question as `keeps_entries_verbatim`: the REST backend maps an entry onto
