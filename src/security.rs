@@ -207,6 +207,12 @@ pub struct Security {
     pub can_upgrade_password_hashes: bool,
     /// Subtrees this server does not hold, and where the client is sent for them.
     pub referrals: crate::referral::Referrals,
+    /// The server's own size and time limits.
+    ///
+    /// Here rather than in each handler for the same reason as the access rules: a search has to
+    /// answer to it, and a second parameter threaded through every call site for one number is how
+    /// a policy gets forgotten in one place and enforced in another.
+    pub limits: crate::limits::Limits,
     /// The GSSAPI acceptor, when a keytab was configured.
     ///
     /// `None` means SASL is not offered: a `GSSAPI` bind is refused with
@@ -223,6 +229,7 @@ impl Default for Security {
             can_upgrade_password_hashes: true,
             referrals: crate::referral::Referrals::default(),
             gssapi: None,
+            limits: crate::limits::Limits::default(),
             passwords: PasswordPolicy::strict(),
             acl: Acl::default(),
             // Off, like the configuration default: a test or a caller that wants a
@@ -254,6 +261,7 @@ impl PartialEq for Security {
             && self.integrity == other.integrity
             && self.can_upgrade_password_hashes == other.can_upgrade_password_hashes
             && self.referrals == other.referrals
+            && self.limits == other.limits
             // Two acceptors are equal when they accept the same realms: the keytab itself is a
             // secret and has no meaningful identity to compare.
             && self.gssapi.as_ref().map(|one| one.realms().collect::<Vec<_>>())
@@ -285,6 +293,7 @@ impl Security {
             // is also what tests and the protocol layer build from a bare configuration.
             can_upgrade_password_hashes: true,
             referrals: config.referrals.clone(),
+            limits: config.limits,
             // Left empty: the keytab is read by the server that has one, not by every caller that
             // builds a policy from a configuration.
             gssapi: None,

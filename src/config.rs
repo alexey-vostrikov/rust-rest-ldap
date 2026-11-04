@@ -285,6 +285,8 @@ pub struct Config {
     pub dangerous_settings: Vec<&'static str>,
     /// Uniqueness and referential integrity of account attributes.
     pub integrity: IntegrityConfig,
+    /// The server's own size and time limits; unlimited unless the operator said otherwise.
+    pub limits: crate::limits::Limits,
     /// Where the change journal goes, if anywhere.
     pub observability: ObservabilityConfig,
     /// The first administrator of an empty store, if the operator configured one.
@@ -425,6 +427,9 @@ pub enum ConfigError {
 struct FileConfig {
     #[serde(default)]
     integrity: IntegrityConfig,
+    /// What the server refuses to do, whatever the client asked for.
+    #[serde(default)]
+    limits: crate::limits::LimitsConfig,
     /// Subtrees held elsewhere: `- dn: dc=remote,dc=com` with the URL a client should ask.
     #[serde(default)]
     referrals: Vec<ReferralConfig>,
@@ -780,6 +785,7 @@ pub fn resolve(
         server_cert: file.server_cert,
         server_key: file.server_key,
         integrity: file.integrity,
+        limits: crate::limits::Limits::from_config(&file.limits),
         observability: file.observability,
         locale: {
             // The configuration wins over the host: an operator who wrote `locale: ru`

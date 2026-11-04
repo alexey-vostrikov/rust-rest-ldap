@@ -146,6 +146,24 @@ indexes:
 #  - dn: dc=remote,dc=com
 #    url: ldaps://ldap.remote.example.com
 
+# What the server refuses to do, whatever the client asked for.
+#
+# Every client may ask for everything: `ldapsearch -z 0` is the ordinary spelling of it, and against
+# a large directory that is one request that occupies the server and is bounded by nothing an
+# operator wrote down. A policy is the limit the operator wrote, and the smaller of the two wins.
+#
+# `size_limit` bounds what is sent and is applied to the entries that matched - after the filter, so
+# a limit of a thousand never refuses a search that would have returned one entry. `time_limit`
+# bounds the scan, and it is the only limit that bounds a search returning almost nothing: a broad
+# filter with no index costs the scan, not the answer.
+#
+# Absent or zero means no limit, which is what every deployment had before this existed. That is a
+# default, not an oversight: a limit chosen by the software would be one nobody measured, and
+# refusing a legitimate bulk export is its own kind of outage.
+#limits:
+#  size_limit: 5000
+#  time_limit: 30
+
 # Language of the diagnostics an OPERATOR reads: startup lines, configuration errors,
 # the journal. Client-visible protocol text stays English ASCII, because scripts match on
 # it. Fallback order: this key, then RUST_REST_LDAP_LOCALE, then LC_ALL, then LANG.

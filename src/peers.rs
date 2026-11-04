@@ -858,6 +858,7 @@ mod tests {
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),
             integrity: Default::default(),
+            limits: Default::default(),
             observability: Default::default(),
             bootstrap: None,
             locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),

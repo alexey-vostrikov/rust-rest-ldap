@@ -57,6 +57,12 @@ pub fn handle_search(
         return super::schema_entry::search(message_id, request, &schema, &base_object);
     }
 
+    // Started before the scan, because that is where the time goes: a filter that matches nothing
+    // still visits every entry. The limit covers finding the entries, not sending them - a search
+    // that has its answer and is writing it is nearly done, and cutting it off mid-answer leaves a
+    // client with half a result and no way to tell why.
+    let started = std::time::Instant::now();
+
     let mut page = Page::default();
     let mut has_paged_control = false;
     let mut sort_request: Option<sort::SortRequest> = None;
@@ -237,7 +243,26 @@ pub fn handle_search(
     let candidates = directory.candidates(&filter::to_query(&request.filter));
 
     let mut matched: Vec<(String, Attributes)> = Vec::new();
+    let mut visited: usize = 0;
+
     for (position, entry) in directory.entries_with_ids(&base_object, scope) {
+        // Every 256 entries, not every one: the clock read is cheap but not free, and a search that
+        // spends its budget on `Instant::now` is a search that did not need the limit.
+        visited += 1;
+        if visited.is_multiple_of(256)
+            && let Some(budget) = security.limits.time_limit
+            && started.elapsed() > budget
+        {
+            return vec![responses::search_done(
+                message_id,
+                ResultCode::TimeLimitExceeded,
+                &format!(
+                    "the search took longer than this server allows ({}s) after visiting {visited}                      entries: narrow the filter, or ask an operator for a larger limits.time_limit",
+                    budget.as_secs()
+                ),
+            )];
+        }
+
         if candidates
             .as_ref()
             .is_some_and(|candidates| !candidates.contains(position as u32))
@@ -322,8 +347,10 @@ pub fn handle_search(
         });
     }
 
-    // Client size limit: applied to the entries that matched, per RFC 4511.
-    let size_limit = request.size_limit as usize;
+    // Size limit: the smaller of what the client asked for and what this server allows, applied to
+    // the entries that matched - after the filter, as RFC 4511 requires. A limit checked before
+    // the filter refuses a search that would have returned one entry.
+    let size_limit = security.limits.effective_size_limit(request.size_limit);
     let size_limit_exceeded = size_limit > 0 && matched.len() > size_limit;
     if size_limit_exceeded {
         matched.truncate(size_limit);
@@ -576,6 +603,19 @@ pub fn handle_search(
     } else {
         ResultCode::Success
     };
+
+    // The diagnostic says whose limit it was. A client that asked for ten and got ten knows why;
+    // one that asked for everything and got a thousand needs to be told the server has a policy,
+    // or it pages for ever and never understands what stopped it.
+    let diagnostic = if size_limit_exceeded && security.limits.server_bound(request.size_limit) {
+        format!(
+            "this server returns at most {} entries per search (limits.size_limit); the answer was \
+             truncated. Narrow the filter, or ask an operator for a larger limit",
+            security.limits.size_limit
+        )
+    } else {
+        String::new()
+    };
     // A persistent search does not end: RFC 4533 §1.3.2 says the refresh stage is closed by a
     // `syncInfo` message and the connection then carries changes, so a `searchResDone` here would
     // tell the client the answer is over and it should stop listening.
@@ -591,7 +631,7 @@ pub fn handle_search(
         messages.push(search_done_with_controls(
             message_id,
             code,
-            "",
+            &diagnostic,
             controls_out,
         ));
     }
@@ -1595,6 +1635,235 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    /// A policy that limits searches, for the tests below.
+    fn limited(size_limit: usize, time_limit: Option<std::time::Duration>) -> Security {
+        Security {
+            limits: crate::limits::Limits {
+                size_limit,
+                time_limit,
+            },
+            ..Security::default()
+        }
+    }
+
+    /// A directory of `count` generated people, for a scan long enough to notice a clock.
+    fn many_people(count: usize) -> Directory {
+        use crate::model::{Attribute, Attributes, Entry};
+
+        let entries: Vec<Entry> = (0..count)
+            .map(|index| {
+                let cn = format!("user{index:04}");
+                Entry::new(
+                    format!("cn={cn},ou=users,{BASE}"),
+                    Attributes::new()
+                        .push(Attribute::new(
+                            "objectClass",
+                            vec!["top".to_string(), "person".to_string()],
+                        ))
+                        .push(Attribute::single("cn", &cn))
+                        .push(Attribute::single("sn", "Person")),
+                )
+            })
+            .collect();
+
+        Directory::from_entries(BASE, "users", "groups", entries)
+    }
+
+    #[test]
+    fn the_servers_own_size_limit_truncates_and_says_so() {
+        // The hole this closes: `ldapsearch -z 0` against an unconfigured server returns the whole
+        // directory, and nothing an operator wrote has any say in it.
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let messages = handle_search(&session, &directory(), 1, &request, None, &limited(2, None));
+
+        assert_eq!(
+            dns(&messages).len(),
+            2,
+            "at most the server's limit, whatever the client asked for"
+        );
+        assert_eq!(result_code(&messages), ResultCode::SizeLimitExceeded);
+        assert!(
+            diagnostic(&messages).contains("limits.size_limit"),
+            "the client is told the server has a policy: {}",
+            diagnostic(&messages)
+        );
+    }
+
+    #[test]
+    fn a_client_limit_below_the_servers_is_not_the_servers_fault() {
+        // A client that asked for two and got two knows why. Blaming the server would send it
+        // looking for a setting nobody needs to change.
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            2,
+            &[],
+        );
+
+        let messages = handle_search(
+            &session,
+            &directory(),
+            1,
+            &request,
+            None,
+            &limited(100, None),
+        );
+
+        assert_eq!(dns(&messages).len(), 2);
+        assert_eq!(result_code(&messages), ResultCode::SizeLimitExceeded);
+        assert!(
+            diagnostic(&messages).is_empty(),
+            "no server policy was involved: {}",
+            diagnostic(&messages)
+        );
+    }
+
+    #[test]
+    fn the_server_limit_is_applied_after_the_filter() {
+        // The rule from RFC 4511 and from the plan: a limit checked before the filter refuses a
+        // search that would have returned exactly one entry. A directory of five with a limit of
+        // two must still answer a filter that matches one.
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("mail"),
+            0,
+            &[],
+        );
+
+        let messages = handle_search(&session, &directory(), 1, &request, None, &limited(2, None));
+
+        assert_eq!(
+            dns(&messages).len(),
+            2,
+            "the two entries that carry a mail attribute"
+        );
+        assert_eq!(
+            result_code(&messages),
+            ResultCode::Success,
+            "the limit was not reached, so nothing was truncated"
+        );
+    }
+
+    #[test]
+    fn a_truncated_answer_does_not_let_a_replica_prune() {
+        // The interaction that would be dangerous: RFX 4533 `refreshDeletes` FALSE tells a replica
+        // to delete everything the answer did not name. A server limit truncates the answer for a
+        // reason that is not "it was deleted", so the answer must not carry that instruction.
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let cookie = crate::ldap::sync::encode_cookie(1, None);
+        let big = stamped_directory()
+            .with_csn(Some("20260101000000.000009Z#000001#001#000000".to_string()));
+
+        let messages = handle_search(
+            &session,
+            &big,
+            1,
+            &request,
+            Some(&sync_control(1, Some(&cookie), false)),
+            &limited(2, None),
+        );
+
+        // Controls ride on the message, not on the result op inside it.
+        let done = messages
+            .iter()
+            .find(|message| matches!(message.protocol_op, ProtocolOp::SearchResDone(_)))
+            .expect("a done");
+
+        let control = done
+            .controls
+            .as_ref()
+            .and_then(|controls| controls.iter().next())
+            .expect("a sync done control");
+        let value = control.control_value.as_ref().expect("a value").as_ref();
+
+        let (_, refresh_deletes) =
+            crate::ldap::sync::decode_done(value).expect("a decodable sync done");
+        assert!(
+            refresh_deletes,
+            "a truncated answer must tell the client to prune only what was named, or it would \
+             delete every entry the limit left out"
+        );
+    }
+
+    #[test]
+    fn a_search_that_runs_out_of_time_is_stopped_with_the_reason() {
+        // A filter over three hundred entries with a one-nanosecond budget: the deadline is checked
+        // every 256 entries, which is why the directory has more than that. The point is that the
+        // search stops and says why, rather than running to completion because nothing was
+        // watching the clock.
+        let session = admin_session();
+        let directory = many_people(300);
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let messages = handle_search(
+            &session,
+            &directory,
+            1,
+            &request,
+            None,
+            &limited(0, Some(std::time::Duration::from_nanos(1))),
+        );
+
+        assert_eq!(result_code(&messages), ResultCode::TimeLimitExceeded);
+        assert!(
+            diagnostic(&messages).contains("limits.time_limit"),
+            "the diagnostic names the setting an operator would change: {}",
+            diagnostic(&messages)
+        );
+    }
+
+    #[test]
+    fn a_search_within_its_time_budget_is_answered() {
+        // The control case: a generous budget must not turn into a refusal, or the limit would be
+        // a switch that turns the server off.
+        let session = admin_session();
+        let request = request(
+            BASE,
+            SearchRequestScope::WholeSubtree,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let messages = handle_search(
+            &session,
+            &directory(),
+            1,
+            &request,
+            None,
+            &limited(0, Some(std::time::Duration::from_secs(30))),
+        );
+
+        assert_eq!(result_code(&messages), ResultCode::Success);
+        assert!(!dns(&messages).is_empty());
     }
 
     #[test]
