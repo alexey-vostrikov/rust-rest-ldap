@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod acl;
+pub mod ad_schema;
 pub mod backend;
 pub mod bootstrap;
 pub mod cli;

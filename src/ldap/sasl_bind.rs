@@ -54,12 +54,24 @@ pub enum Framing {
 }
 
 /// Where a GSSAPI exchange stands.
+///
+/// The rounds follow libsasl's state machine, which is what every real client speaks - not the
+/// three rounds RFC 4752 describes read literally. The difference cost a live debugging session:
+///
+/// 1. the client's AP-REQ, answered with an AP-REP;
+/// 2. an **empty** token from the client (its GSS context is complete and it has nothing to say),
+///    answered with the server's security-layer mask, wrapped;
+/// 3. the client's own wrapped choice, answered with `success`.
+///
+/// That is four messages and three transitions, and a server that expects the layer token in
+/// round two refuses every cyrus-sasl client with "not a signed or sealed GSS token" - which
+/// reads like a bug in the token and is a bug in the ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// The AP-REQ was accepted; the RFC 4752 security-layer token is expected next.
-    Layered,
-    /// The layer was agreed; the final empty token is expected.
-    Final,
+    /// The AP-REP was sent; the client's empty token is expected, and answered with our mask.
+    OfferSent,
+    /// Our mask was sent; the client's wrapped choice is expected, and ends the exchange.
+    ChoiceExpected,
 }
 
 /// The state a GSSAPI conversation keeps between two binds on one connection.
@@ -76,6 +88,16 @@ pub struct Exchange {
 }
 
 impl Exchange {
+    /// The ticket's session key, for the tokens that follow.
+    pub fn session_key(&self) -> &rskrb5::keytab::EncryptionKey {
+        &self.session_key
+    }
+
+    /// The entry this principal maps to, once the exchange completes.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
     /// Where this exchange stands.
     pub fn stage(&self) -> Stage {
         self.stage
@@ -191,10 +213,16 @@ pub fn handle_gssapi(
         _ => Vec::new(),
     };
 
+    // A fresh SASL bind starts by making the connection anonymous, per RFC 4513 - but only a
+    // fresh one: the rounds of an exchange in progress must not clear what they depend on.
+    if session.sasl_stage().is_none() {
+        session.reset();
+    }
+
     let outcome = match session.sasl_stage() {
         None => begin(session, directory, &gssapi, token, security),
-        Some(Stage::Layered) => layers(session, token),
-        Some(Stage::Final) => finish(session, token),
+        Some(Stage::OfferSent) => offer_layer(session, token),
+        Some(Stage::ChoiceExpected) => accept_choice(session, token),
     };
 
     match outcome {
@@ -256,7 +284,13 @@ fn begin(
     let (ap_req, framing) = unwrap(token)?;
 
     let mut validator = rskrb5::service::ServiceValidator::new(gssapi.keytab())
-        .with_shared_replay_cache(gssapi.replay());
+        .with_shared_replay_cache(gssapi.replay())
+        // No PAC validation: this server takes no authorization decision from the PAC - who may
+        // do what comes from the entry and the access rules, not from a Windows group list. The
+        // ticket's own signature, checked with the service key, is what proves the client.
+        // Left on, a KDC that issues a PAC this library cannot parse refuses every good ticket;
+        // a live run against MIT's KDC showed exactly that.
+        .without_pac_validation();
 
     if let Some(parts) = gssapi.service_principal() {
         let components: Vec<&str> = parts.iter().map(String::as_str).collect();
@@ -267,17 +301,7 @@ fn begin(
         .validate_ap_req(&ap_req)
         .map_err(|err| SaslError::Ticket(err.to_string()))?;
 
-    let mapped = gssapi
-        .identity(&validated.client, directory.base_dn())
-        .ok_or_else(|| SaslError::Realm(validated.client.realm.clone()))?;
-
-    // The entry decides whether this principal is an administrator: the flag lives on the entry,
-    // and a ticket says who the client is, not what it may do.
-    let admin = directory
-        .find(&mapped.dn)
-        .map(|entry| entry.is_admin())
-        .unwrap_or(false);
-    let identity = Identity::new(&mapped.dn, admin);
+    let identity = resolve_identity(gssapi, directory, &validated.client)?;
 
     // The AP-REP is what proves the server holds the service key. Built with an explicit
     // confounder because the library asks for one rather than drawing its own.
@@ -296,12 +320,22 @@ fn begin(
         )
         .map_err(|err| SaslError::Ticket(err.to_string()))?;
 
+    // The key the rest of the exchange is protected with. RFC 4121 §3.3.1: when the initiator puts
+    // a subkey in its authenticator, **that** is the context key and the ticket's session key is
+    // not used again. A server that keeps using the session key produces tokens the client cannot
+    // verify - "a token had an invalid MIC" - which looks like a broken checksum and is a wrong
+    // key.
+    let context_key = validated
+        .subkey
+        .clone()
+        .unwrap_or_else(|| validated.session_key.clone());
+
     session.set_sasl(Exchange {
-        session_key: validated.session_key.clone(),
-        principal: mapped.principal.clone(),
+        session_key: context_key,
+        principal: format!("{}@{}", validated.client.name(), validated.client.realm),
         identity,
         framing,
-        stage: Stage::Layered,
+        stage: Stage::OfferSent,
     });
 
     Ok(Round {
@@ -312,86 +346,188 @@ fn begin(
     })
 }
 
-/// The second round: agree the security layer, and refuse anything but "none".
-fn layers(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslError> {
-    let exchange = session
-        .sasl_exchange()
-        .ok_or_else(|| SaslError::Sequence("no GSSAPI exchange in progress".to_string()))?;
-
-    let allowed = if exchange.session_key.etype == 0 {
-        Vec::new()
-    } else {
-        unwrap_signed(&token, &exchange.session_key)?
-    };
-
-    // RFC 4752 §3.1: four octets of layer mask, three octets of maximum buffer, then the
-    // authorization identity the client would like to act as.
-    if allowed.len() < 4 {
-        return Err(SaslError::Layer(format!(
-            "the security layer token is {} bytes, at least four are needed for the layer mask",
-            allowed.len()
+/// The second round: answer the client's empty token with our security-layer mask.
+///
+/// libsasl's server, and therefore 389 DS, says it exactly: "GSSAPI server is not expecting data
+/// at this stage" and refuses anything but an empty token. The mask is four octets - which layers
+/// this server offers, then a three-octet maximum buffer - and it is **wrapped**, because the
+/// client unwraps it with the session key before reading it.
+fn offer_layer(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslError> {
+    if !token.is_empty() {
+        return Err(SaslError::Sequence(format!(
+            "the token after the ticket must be empty (the client's GSS context is complete), got \
+             {} bytes",
+            token.len()
         )));
     }
 
-    let mask = u32::from_be_bytes([allowed[0], allowed[1], allowed[2], allowed[3]]);
+    let session_key = session
+        .sasl_exchange()
+        .ok_or_else(|| SaslError::Sequence("no GSSAPI exchange in progress".to_string()))?
+        .session_key()
+        .clone();
 
-    // Bit 0 is "no security layer", bit 1 integrity, bit 2 confidentiality. Only 0 is offered.
-    const NO_LAYER: u32 = 1;
-    if mask & NO_LAYER == 0 {
-        return Err(SaslError::Layer(
-            "this server does not implement a SASL security layer: it offers only \"none\", and \
-             TLS is where the encryption belongs. The client's mask did not include it"
-                .to_string(),
-        ));
-    }
+    // RFC 4752 §3.1: the four octets are **one** mask byte followed by a **three**-octet maximum
+    // buffer size - not a 32-bit number. Sending `00 00 00 01` advertises a mask of zero, i.e. no
+    // layers at all, and a client answers "mechanism too weak" because there is nothing it may
+    // select. libsasl builds the same four octets as `sasldata[0] |= LAYER_NONE` plus
+    // `sasldata[1..3] = maxbufsize`.
+    const NO_LAYER: u8 = 1;
+    let mask = vec![NO_LAYER, 0, 0, 0];
 
-    // The requested authorization identity is deliberately not honoured: acting as somebody else
-    // needs an ACL rule for exactly that, and a token field is not one.
-    if allowed.len() > 7 {
-        let authzid = String::from_utf8_lossy(&allowed[7..]).trim().to_string();
-        if !authzid.is_empty() {
-            return Err(SaslError::Layer(
-                "requested proxy authorization is not supported: bind as the principal itself, or \
-                 use the proxy authorization control, which the access rules can refuse"
-                    .to_string(),
-            ));
-        }
-    }
-
-    session.set_sasl_stage(Stage::Final);
-
-    // The server's answer: the selected layer, and a buffer size that means nothing when no
-    // layer was selected - zero, rather than a number a client might act on.
-    let mut reply = Vec::with_capacity(4);
-    reply.extend_from_slice(&NO_LAYER.to_be_bytes());
+    let wrapped = wrap_signed(&mask, &session_key)?;
+    session.set_sasl_stage(Stage::ChoiceExpected);
 
     Ok(Round {
         code: ResultCode::SaslBindInProgress,
-        credentials: Some(reply),
+        credentials: Some(wrapped),
         identity: None,
         diagnostic: String::new(),
     })
 }
 
-/// The third round: the client proves it unwrapped what was sent, and the bind succeeds.
-fn finish(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslError> {
+/// The last round: the client's wrapped choice, and the bind succeeds.
+///
+/// The token is the client's four-octet selection (plus an optional authorization identity),
+/// wrapped with the session key. Verifying the wrap is the point: it proves the client could
+/// process what the server sent, which a client that only knows the ticket could not.
+fn accept_choice(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslError> {
     let exchange = session
         .sasl_exchange()
         .ok_or_else(|| SaslError::Sequence("no GSSAPI exchange in progress".to_string()))?;
+    let session_key = exchange.session_key().clone();
+    let identity = exchange.identity().clone();
 
-    if !token.is_empty() {
-        return Err(SaslError::Sequence(format!(
-            "the last token of a GSSAPI bind must be empty, got {} bytes",
-            token.len()
+    let chosen = unwrap_signed(&token, &session_key)?;
+
+    if chosen.len() < 4 {
+        return Err(SaslError::Layer(format!(
+            "the client's choice is {} bytes, four are needed for the layer mask",
+            chosen.len()
         )));
+    }
+
+    const NO_LAYER: u8 = 1;
+    if chosen[0] & NO_LAYER == 0 {
+        return Err(SaslError::Layer(
+            "the client selected a security layer and this server offers only \"none\": TLS is \
+             where the encryption belongs. A client that insists on a SASL layer needs a server \
+             that implements one"
+                .to_string(),
+        ));
+    }
+
+    // Anything after the four octets is the authorization identity the client would like to act
+    // as. Not honoured: becoming somebody else is a right an access rule grants, not a field in a
+    // token, and the proxy authorization control is where that decision belongs.
+    if chosen.len() > 4 {
+        let authzid = String::from_utf8_lossy(&chosen[4..]).trim().to_string();
+        if !authzid.is_empty() {
+            return Err(SaslError::Layer(format!(
+                "requested proxy authorization as '{authzid}' is not supported: bind as the \
+                 principal itself, or use the proxy authorization control, which the access rules \
+                 can refuse"
+            )));
+        }
     }
 
     Ok(Round {
         code: ResultCode::Success,
         credentials: None,
-        identity: Some(exchange.identity.clone()),
+        identity: Some(identity),
         diagnostic: String::new(),
     })
+}
+
+/// Turns a verified principal into the entry it authenticates as.
+///
+/// Two namings, in this order, and the order matters:
+///
+/// 1. **`userPrincipalName`.** In a directory that publishes AD vocabulary the UPN *is* the
+///    account name, and it need not follow from the DN: `alice@EXAMPLE.COM` can live at
+///    `cn=Alice Smith,ou=staff,...`. A template alone would look for `uid=alice` and find nothing,
+///    then refuse a client whose ticket is perfectly good. More than one entry carrying the same
+///    UPN is a refusal, not a first-match: two accounts with one name is precisely the case where
+///    picking one silently hands over somebody else's record.
+/// 2. **The realm template,** for everything that is not AD-shaped - including this server's own
+///    `uid={user},ou=users,{base}`.
+///
+/// Once the entry is known, `userAccountControl` decides whether it may authenticate. That check
+/// is the reason the attribute is in the schema at all: Kerberos never sends this server a
+/// password, so nothing else would ever notice that the account was disabled.
+fn resolve_identity(
+    gssapi: &crate::sasl::Gssapi,
+    directory: &Directory,
+    principal: &rskrb5::service::Principal,
+) -> Result<Identity, SaslError> {
+    // The realm filter applies to both namings. A realm nobody mapped has no subtree, and a UPN
+    // that happens to match is not permission to ignore the realm it came with.
+    let by_template = gssapi
+        .identity(principal, directory.base_dn())
+        .ok_or_else(|| SaslError::Realm(principal.realm.clone()))?;
+
+    let upn = by_template.principal.clone();
+
+    // One pass over the directory, and the entry itself rather than its DN: the account flags are
+    // on the entry, and asking the index for it afterwards would be a second lookup that can miss
+    // - entries loaded from a backend are not all in the by-DN map, which a test caught here.
+    let mut by_upn: Vec<&crate::model::Entry> = Vec::new();
+    let mut by_dn: Option<&crate::model::Entry> = None;
+
+    for entry in directory.all() {
+        if crate::dn::normalize(entry.dn()) == by_template.dn {
+            by_dn = Some(entry);
+        }
+        if entry
+            .attributes()
+            .get("userPrincipalName")
+            .is_some_and(|attribute| {
+                attribute
+                    .values
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(&upn))
+            })
+        {
+            by_upn.push(entry);
+        }
+    }
+
+    let entry = match by_upn.len() {
+        // AD-shaped: the UPN names the account, and its DN need not follow from the principal.
+        1 => Some(by_upn[0]),
+        // Two accounts with one name is exactly the case where picking one silently hands over
+        // somebody else's record.
+        many if many > 1 => {
+            let dns: Vec<&str> = by_upn.iter().map(|entry| entry.dn()).collect();
+            return Err(SaslError::Ticket(format!(
+                "'{upn}' is the userPrincipalName of {many} entries ({}), so a ticket naming it \
+                 cannot be resolved to one identity",
+                dns.join(", ")
+            )));
+        }
+        // Not AD-shaped: the realm template is the naming, as it was before this existed.
+        _ => by_dn,
+    };
+
+    // The account's own answer about whether it may authenticate. Kerberos never sends this server
+    // a password, so nothing else would notice a disabled account.
+    if let Some(entry) = entry
+        && let Some(flags) = entry
+            .attributes()
+            .get("userAccountControl")
+            .and_then(|attribute| attribute.values.first())
+            .and_then(|text| crate::ad_schema::UserAccountControl::parse(text))
+        && let Some(reason) = flags.refusal()
+    {
+        return Err(SaslError::Ticket(reason.to_string()));
+    }
+
+    let dn = entry
+        .map(|entry| crate::dn::normalize(entry.dn()))
+        .unwrap_or_else(|| by_template.dn.clone());
+    let admin = entry.map(|entry| entry.is_admin()).unwrap_or(false);
+
+    Ok(Identity::new(&dn, admin))
 }
 
 /// Strips the framing and returns the AP-REQ and how it arrived.
@@ -465,10 +601,13 @@ fn wrap_reply(payload: &[u8], framing: Framing, initial: bool) -> Result<Vec<u8>
             out.extend_from_slice(payload);
             Ok(out)
         }
-        Framing::Gss => {
-            let token = rskrb5::spnego::Krb5MechToken::ap_rep(payload.to_vec());
-            Ok(context_token_wrap(&token.encode().map_err(bad)?))
-        }
+        // `Krb5MechToken::encode` already produces the whole `[APPLICATION 0] { OID, TOK_ID,
+        // message }` context token. Wrapping it again - which is what this code did until a live
+        // client said "Invalid token was supplied" - puts a second OID inside the first, and a
+        // double-wrapped token is exactly as unparseable as it sounds.
+        Framing::Gss => rskrb5::spnego::Krb5MechToken::ap_rep(payload.to_vec())
+            .encode()
+            .map_err(bad),
         Framing::Spnego => {
             let krb5 = rskrb5::spnego::Krb5MechToken::ap_rep(payload.to_vec());
             let resp = if initial {
@@ -483,6 +622,10 @@ fn wrap_reply(payload: &[u8], framing: Framing, initial: bool) -> Result<Vec<u8>
 }
 
 /// Wraps bytes in a GSS-API `[APPLICATION 0] { Kerberos OID, inner }` context token.
+///
+/// Used by the tests to build the shapes a client sends, and by nothing else: the server's own
+/// replies come from `Krb5MechToken::encode`, which does this itself.
+#[cfg(test)]
 fn context_token_wrap(inner: &[u8]) -> Vec<u8> {
     // 1.2.840.113554.1.2.2, the Kerberos V5 mechanism, DER-encoded.
     const KRB5_OID: [u8; 11] = [
@@ -500,6 +643,7 @@ fn context_token_wrap(inner: &[u8]) -> Vec<u8> {
 }
 
 /// A DER length, in the short form when it fits.
+#[cfg(test)]
 fn der_length(length: usize) -> Vec<u8> {
     if length < 0x80 {
         return vec![length as u8];
@@ -591,7 +735,7 @@ fn unwrap_signed(token: &[u8], key: &rskrb5::keytab::EncryptionKey) -> Result<Ve
 
         if let Some(payload) = wrap.payload.clone() {
             let intact = wrap
-                .verify(key, rskrb5::spnego::GSSAPI_INITIATOR_SIGN_USAGE)
+                .verify(key, rskrb5::spnego::GSSAPI_INITIATOR_SEAL_USAGE)
                 .map_err(bad)?;
             if !intact {
                 return Err(SaslError::Layer(
@@ -619,6 +763,24 @@ fn unwrap_signed(token: &[u8], key: &rskrb5::keytab::EncryptionKey) -> Result<Ve
     Err(SaslError::Layer(
         "the security layer token is neither a signed nor a sealed GSS token".to_string(),
     ))
+}
+
+/// Signs a payload as the acceptor, the mirror of [`unwrap_signed`].
+fn wrap_signed(payload: &[u8], key: &rskrb5::keytab::EncryptionKey) -> Result<Vec<u8>, SaslError> {
+    let mut token =
+        rskrb5::spnego::WrapToken::new(rskrb5::spnego::GSS_TOKEN_FLAG_SENT_BY_ACCEPTOR, 0);
+    token.payload = Some(payload.to_vec());
+    // RFC 4121 §7.2: a **Wrap** token is protected with 22 (acceptor) / 24 (initiator); 23 and 25
+    // are for **MIC** tokens. Using 23 here produced a token the client could parse and could not
+    // verify - "a token had an invalid MIC" - which is the least helpful way for a key usage to be
+    // wrong. The crate's own test vectors verify WrapTokens with the SEAL usage, which is the same
+    // fact stated in code.
+    token
+        .set_checksum(key, rskrb5::spnego::GSSAPI_ACCEPTOR_SEAL_USAGE)
+        .map_err(|err| SaslError::Layer(err.to_string()))?;
+    token
+        .encode()
+        .map_err(|err| SaslError::Layer(err.to_string()))
 }
 
 /// A bind response that carries server credentials.
@@ -901,13 +1063,452 @@ mod tests {
         );
     }
 
+    /// A token as a client sends it: wrapped and signed by the **initiator**.
+    ///
+    /// Not `wrap_signed`, which produces an acceptor token - that is what the server sends, and its
+    /// flag is what tells a reader which side made it. A test that used the server's wrapper to
+    /// stand in for a client would be testing the wrong direction and would never notice.
+    fn client_choice(payload: &[u8], key: &rskrb5::keytab::EncryptionKey) -> Vec<u8> {
+        rskrb5::spnego::WrapToken::new_initiator(payload, key)
+            .expect("an initiator wrap")
+            .encode()
+            .expect("encoded")
+    }
+
+    /// A session holding an exchange at a given stage with a known key.
+    ///
+    /// Built directly rather than by playing a real ticket through the round: the ticket's
+    /// cryptography is the library's to test and a real client's to prove, while what this module
+    /// decides is the shape of the exchange - which token is expected when, and what goes back.
+    fn exchanging(stage: Stage) -> Session {
+        let key = rskrb5::keytab::EncryptionKey {
+            etype: 18,
+            value: vec![0x11; 32],
+        };
+
+        let mut session = Session::new();
+        session.set_encrypted(true);
+        session.set_sasl(Exchange {
+            session_key: key,
+            principal: "alice@EXAMPLE.COM".to_string(),
+            identity: Identity::new("uid=alice,ou=users,dc=example,dc=com", false),
+            framing: Framing::Bare,
+            stage,
+        });
+        session
+    }
+
+    fn bind_response_body(response: &rasn_ldap::LdapMessage) -> &rasn_ldap::BindResponse {
+        match &response.protocol_op {
+            rasn_ldap::ProtocolOp::BindResponse(body) => body,
+            other => panic!("expected a bind response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_layer_offer_is_one_mask_byte_and_three_of_buffer_size() {
+        // This is the byte order that cost a live debugging session: sent as a 32-bit integer,
+        // `01 00 00 00` becomes `00 00 00 01`, which advertises a mask of zero - no layers at all -
+        // and the client answers "mechanism too weak" because there is nothing it may select.
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::OfferSent);
+        let directory = crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        );
+
+        let response = handle_gssapi(
+            &mut session,
+            &directory,
+            1,
+            &gssapi_request(Some(Vec::new())),
+            &security,
+        );
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::SaslBindInProgress);
+
+        let credentials = body
+            .server_sasl_creds
+            .as_ref()
+            .expect("the offer")
+            .as_ref()
+            .to_vec();
+
+        let key = session
+            .sasl_exchange()
+            .expect("still exchanging")
+            .session_key()
+            .clone();
+        // Decoded as an **acceptor** token, which is what it is: the flag says so, and a client
+        // checks it. Reading it back as an initiator token would be the wrong side of the exchange.
+        let mut token =
+            rskrb5::spnego::WrapToken::decode(&credentials, true).expect("an acceptor wrap");
+        assert!(
+            token
+                .verify(&key, rskrb5::spnego::GSSAPI_ACCEPTOR_SEAL_USAGE)
+                .expect("verifiable"),
+            "the offer is signed with the wrap key usage a client checks, not the MIC one"
+        );
+        let plain = token.payload.take().expect("with a payload");
+
+        assert_eq!(
+            plain,
+            vec![0x01, 0x00, 0x00, 0x00],
+            "one mask byte (\"no layer\") followed by a three-octet buffer size of zero"
+        );
+    }
+
+    #[test]
+    fn the_offer_moves_the_exchange_to_expecting_a_choice() {
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::OfferSent);
+        let directory = crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        );
+
+        handle_gssapi(
+            &mut session,
+            &directory,
+            1,
+            &gssapi_request(Some(Vec::new())),
+            &security,
+        );
+
+        assert_eq!(
+            session.sasl_stage(),
+            Some(Stage::ChoiceExpected),
+            "the next token is the client's choice, not another empty one"
+        );
+    }
+
+    #[test]
+    fn a_token_where_the_client_has_nothing_to_say_is_refused() {
+        // libsasl's server says it plainly: "GSSAPI server is not expecting data at this stage".
+        // A client that sends its layer choice straight after the ticket is following RFC 4752 as
+        // written rather than the state machine everybody implements, and telling it so beats
+        // trying to parse the token as something else.
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::OfferSent);
+        let directory = crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        );
+
+        let response = handle_gssapi(
+            &mut session,
+            &directory,
+            1,
+            &gssapi_request(Some(vec![0x01, 0, 0, 0])),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::InvalidCredentials);
+        assert!(
+            body.diagnostic_message.0.contains("must be empty"),
+            "{}",
+            body.diagnostic_message.0
+        );
+        assert_eq!(session.sasl_stage(), None, "and the exchange is dropped");
+    }
+
+    #[test]
+    fn a_choice_of_no_layer_completes_the_bind_with_the_mapped_identity() {
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::ChoiceExpected);
+        let key = session
+            .sasl_exchange()
+            .expect("exchanging")
+            .session_key()
+            .clone();
+        let choice = client_choice(&[0x01, 0x00, 0x00, 0x00], &key);
+
+        let directory = crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        );
+
+        let response = handle_gssapi(
+            &mut session,
+            &directory,
+            1,
+            &gssapi_request(Some(choice)),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::Success);
+        assert_eq!(
+            session.identity().map(|identity| identity.dn.as_str()),
+            Some("uid=alice,ou=users,dc=example,dc=com"),
+            "the entry the realm table mapped the principal to"
+        );
+        assert_eq!(session.sasl_stage(), None, "the exchange is finished");
+    }
+
+    #[test]
+    fn a_client_that_insists_on_a_security_layer_is_refused() {
+        // Only "no layer" is offered, so only "no layer" may be chosen. Accepting a layer this
+        // server does not implement would mean the client encrypts what the server reads as
+        // plaintext - a connection that fails on the first search rather than at the bind.
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::ChoiceExpected);
+        let key = session
+            .sasl_exchange()
+            .expect("exchanging")
+            .session_key()
+            .clone();
+        // Integrity only: bit 1 set, bit 0 clear.
+        let choice = client_choice(&[0x02, 0x00, 0x00, 0x00], &key);
+
+        let directory = crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        );
+
+        let response = handle_gssapi(
+            &mut session,
+            &directory,
+            1,
+            &gssapi_request(Some(choice)),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::InvalidCredentials);
+        assert!(
+            body.diagnostic_message.0.contains("offers only"),
+            "{}",
+            body.diagnostic_message.0
+        );
+    }
+
+    #[test]
+    fn a_requested_authorization_identity_is_not_honoured() {
+        // The token's trailing field asks to act as somebody else. Becoming another identity is a
+        // right an access rule grants, not a field a client may set.
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::ChoiceExpected);
+        let key = session
+            .sasl_exchange()
+            .expect("exchanging")
+            .session_key()
+            .clone();
+        let mut payload = vec![0x01, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(b"uid=admin,ou=users,dc=example,dc=com");
+        let choice = client_choice(&payload, &key);
+
+        let directory = crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        );
+
+        let response = handle_gssapi(
+            &mut session,
+            &directory,
+            1,
+            &gssapi_request(Some(choice)),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::InvalidCredentials);
+        assert!(
+            body.diagnostic_message.0.contains("proxy authorization"),
+            "{}",
+            body.diagnostic_message.0
+        );
+        assert!(session.identity().is_none(), "and nobody is bound");
+    }
+
+    /// A directory holding the given entries, under the usual naming context.
+    fn directory_with(entries: Vec<crate::model::Entry>) -> crate::directory::Directory {
+        crate::directory::Directory::from_entries("dc=example,dc=com", "users", "groups", entries)
+    }
+
+    fn ad_user(cn: &str, upn: &str, flags: Option<&str>) -> crate::model::Entry {
+        let mut attributes = crate::model::Attributes::new()
+            .push(crate::model::Attribute::new(
+                "objectClass",
+                vec!["top".to_string(), "person".to_string(), "user".to_string()],
+            ))
+            .push(crate::model::Attribute::single("cn", cn))
+            .push(crate::model::Attribute::single("sn", "Kerberos"))
+            .push(crate::model::Attribute::single("userPrincipalName", upn));
+
+        if let Some(flags) = flags {
+            attributes =
+                attributes.push(crate::model::Attribute::single("userAccountControl", flags));
+        }
+
+        crate::model::Entry::new(cn, attributes)
+    }
+
+    fn principal(text: &str) -> rskrb5::service::Principal {
+        let (name, realm) = text.split_once('@').expect("a realm");
+        rskrb5::service::Principal {
+            realm: realm.to_string(),
+            name_type: 1,
+            components: name.split('/').map(str::to_string).collect(),
+        }
+    }
+
+    /// An acceptor for `EXAMPLE.COM`, without needing a keytab on disk.
+    fn acceptor() -> std::sync::Arc<crate::sasl::Gssapi> {
+        let (security, _dir) = security_with_keytab();
+        security
+            .gssapi
+            .clone()
+            .expect("the test policy has an acceptor")
+    }
+
+    #[test]
+    fn an_account_is_found_by_its_user_principal_name_not_only_by_the_template() {
+        // The case a template cannot serve: the UPN says alice@EXAMPLE.COM, the entry lives at
+        // `cn=Alice Smith`, and `uid=alice` does not exist. Without this, a perfectly good ticket
+        // is refused because the directory is shaped like AD rather than like this server.
+        let directory = directory_with(vec![ad_user(
+            "cn=Alice Smith,ou=users,dc=example,dc=com",
+            "alice@EXAMPLE.COM",
+            Some("512"),
+        )]);
+
+        let identity = resolve_identity(&acceptor(), &directory, &principal("alice@EXAMPLE.COM"))
+            .expect("resolved");
+
+        assert_eq!(identity.dn, "cn=alice smith,ou=users,dc=example,dc=com");
+    }
+
+    #[test]
+    fn the_template_is_still_used_when_no_entry_carries_the_upn() {
+        // Not every deployment is AD-shaped, and the default naming must keep working.
+        let directory = directory_with(vec![]);
+
+        let identity = resolve_identity(&acceptor(), &directory, &principal("alice@EXAMPLE.COM"))
+            .expect("resolved");
+
+        assert_eq!(identity.dn, "uid=alice,ou=users,dc=example,dc=com");
+    }
+
+    #[test]
+    fn a_upn_shared_by_two_entries_is_a_refusal_not_a_first_match() {
+        // Two accounts with one name is exactly the case where picking one silently hands over
+        // somebody else's record.
+        let directory = directory_with(vec![
+            ad_user(
+                "cn=Alice One,ou=users,dc=example,dc=com",
+                "alice@EXAMPLE.COM",
+                None,
+            ),
+            ad_user(
+                "cn=Alice Two,ou=users,dc=example,dc=com",
+                "alice@EXAMPLE.COM",
+                None,
+            ),
+        ]);
+
+        let error = resolve_identity(&acceptor(), &directory, &principal("alice@EXAMPLE.COM"))
+            .expect_err("must refuse");
+
+        let text = error.to_string();
+        assert!(text.contains("2 entries"), "{text}");
+        assert!(
+            text.to_lowercase().contains("cn=alice one"),
+            "both entries are named, so an operator can resolve it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_account_cannot_authenticate_by_ticket() {
+        // Kerberos never sends this server a password, so nothing else would ever notice that the
+        // account was disabled. This is the reason `userAccountControl` is in the schema.
+        let directory = directory_with(vec![ad_user(
+            "cn=Alice Smith,ou=users,dc=example,dc=com",
+            "alice@EXAMPLE.COM",
+            Some("514"),
+        )]);
+
+        let error = resolve_identity(&acceptor(), &directory, &principal("alice@EXAMPLE.COM"))
+            .expect_err("must refuse");
+
+        assert!(error.to_string().contains("disabled"), "{error}");
+    }
+
+    #[test]
+    fn a_locked_out_account_cannot_authenticate_by_ticket() {
+        let directory = directory_with(vec![ad_user(
+            "cn=Alice Smith,ou=users,dc=example,dc=com",
+            "alice@EXAMPLE.COM",
+            Some("528"),
+        )]);
+
+        let error = resolve_identity(&acceptor(), &directory, &principal("alice@EXAMPLE.COM"))
+            .expect_err("must refuse");
+
+        assert!(error.to_string().contains("locked"), "{error}");
+    }
+
+    #[test]
+    fn an_enabled_account_with_bits_this_server_does_not_interpret_is_allowed() {
+        // 66048 = NORMAL_ACCOUNT | DONT_EXPIRE_PASSWORD. Interpreting an unknown bit as a refusal
+        // would lock out exactly the accounts the extension exists to serve.
+        let directory = directory_with(vec![ad_user(
+            "cn=Alice Smith,ou=users,dc=example,dc=com",
+            "alice@EXAMPLE.COM",
+            Some("66048"),
+        )]);
+
+        assert!(resolve_identity(&acceptor(), &directory, &principal("alice@EXAMPLE.COM")).is_ok());
+    }
+
+    #[test]
+    fn an_entry_with_no_flag_word_is_not_refused_for_the_lack_of_one() {
+        // An ordinary LDAP entry never claimed to have a flag; it is not broken for not having one.
+        let directory = directory_with(vec![ad_user(
+            "cn=Alice Smith,ou=users,dc=example,dc=com",
+            "alice@EXAMPLE.COM",
+            None,
+        )]);
+
+        assert!(resolve_identity(&acceptor(), &directory, &principal("alice@EXAMPLE.COM")).is_ok());
+    }
+
+    #[test]
+    fn a_realm_nobody_mapped_is_refused_even_when_a_upn_matches() {
+        // The UPN must not become a way around the realm table: a ticket from an unconfigured
+        // realm is refused before any entry is looked for.
+        let directory = directory_with(vec![ad_user(
+            "cn=Alice Smith,ou=users,dc=example,dc=com",
+            "alice@EVIL.ORG",
+            Some("512"),
+        )]);
+
+        let error = resolve_identity(&acceptor(), &directory, &principal("alice@EVIL.ORG"))
+            .expect_err("must refuse");
+
+        assert!(error.to_string().contains("EVIL.ORG"), "{error}");
+    }
+
     #[test]
     fn a_second_round_without_a_first_is_refused() {
         // A client that starts at round two gets a refusal rather than a panic on a missing
         // exchange, and the session does not acquire an identity from nowhere.
         let (security, _dir) = security_with_keytab();
         let mut session = session();
-        session.set_sasl_stage(Stage::Layered);
+        session.set_sasl_stage(Stage::OfferSent);
 
         let response = handle_gssapi(
             &mut session,

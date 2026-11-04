@@ -51,6 +51,7 @@ warn.schema: "предупреждение схемы: {detail}"
 # Диагностика конфигурации
 config.server_id: "некорректный server id: {detail}"
 config.journal_keep: "некорректный journal_keep: {detail}"
+config.ad_schema: "расширение схемы Active Directory непригодно: {detail}"
 config.sasl: "ошибка в разделе sasl: {detail}"
 config.peers: "ошибка в разделе peers: {detail}"
 config.referral: "ошибка в разделе referrals: {detail}"

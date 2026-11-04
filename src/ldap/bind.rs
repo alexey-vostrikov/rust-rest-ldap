@@ -74,6 +74,14 @@ fn authenticate(
     security: &Security,
     upgrade: &mut Option<crate::model::Entry>,
 ) -> rasn_ldap::LdapMessage {
+    // Before the reset: a SASL bind is several requests, and the exchange between them lives on
+    // the session. Clearing it here - which is what a simple bind must do - made every round look
+    // like the first one, and a live client got "the first token must carry the ticket" on its
+    // second message.
+    if super::sasl_bind::is_gssapi(request) {
+        return super::sasl_bind::handle_gssapi(session, directory, message_id, request, security);
+    }
+
     session.reset();
 
     if request.version != 3 {
@@ -82,12 +90,6 @@ fn authenticate(
             ResultCode::ProtocolError,
             &format!("only LDAP version 3 is supported, got {}", request.version),
         );
-    }
-
-    // A SASL bind is a conversation with state on the connection, so it is handled where that
-    // state lives rather than bent into the password path below.
-    if super::sasl_bind::is_gssapi(request) {
-        return super::sasl_bind::handle_gssapi(session, directory, message_id, request, security);
     }
 
     let password = match &request.authentication {
