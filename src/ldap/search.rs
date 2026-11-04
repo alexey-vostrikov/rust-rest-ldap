@@ -225,22 +225,6 @@ pub fn handle_search(
         )];
     }
 
-    // `refreshAndPersist` is a second mode of the connection: the answer stays open and changes
-    // are pushed as they happen. This server does not implement it, and §2.5 of RFC 4533 has the
-    // code for saying so - `syncRefreshRequired` tells the client to start again in a mode this
-    // server can serve, which is a better answer than a refreshOnly stream the client would wait
-    // on forever.
-    if sync_request
-        .as_ref()
-        .is_some_and(|sync| sync.mode == sync::Mode::RefreshAndPersist)
-    {
-        return vec![responses::search_done(
-            message_id,
-            ResultCode::UnwillingToPerform,
-            "refreshAndPersist is not implemented: ask again with refreshOnly",
-        )];
-    }
-
     let scope = scope_of(request);
     let selection: Vec<String> = request
         .attributes
@@ -521,12 +505,25 @@ pub fn handle_search(
     } else {
         ResultCode::Success
     };
-    messages.push(search_done_with_controls(
-        message_id,
-        code,
-        "",
-        controls_out,
-    ));
+    // A persistent search does not end: RFC 4533 §1.3.2 says the refresh stage is closed by a
+    // `syncInfo` message and the connection then carries changes, so a `searchResDone` here would
+    // tell the client the answer is over and it should stop listening.
+    let persistent = sync_request
+        .as_ref()
+        .is_some_and(|request| request.mode == sync::Mode::RefreshAndPersist);
+
+    if persistent && code == ResultCode::Success {
+        let mut info = sync::info_refresh_present(sync_cookie.as_deref());
+        info.message_id = message_id;
+        messages.push(info);
+    } else {
+        messages.push(search_done_with_controls(
+            message_id,
+            code,
+            "",
+            controls_out,
+        ));
+    }
 
     messages
 }
@@ -535,6 +532,100 @@ fn without_values(attribute: crate::model::Attribute) -> crate::model::Attribute
     crate::model::Attribute {
         values: Vec::new().into_boxed_slice(),
         ..attribute
+    }
+}
+
+/// A search that stays open: what it asked for, and who asked.
+///
+/// Built when the answer is sent, then used to decide which of the changes the server announces
+/// belong to this search. It holds the *request*, not its results: a change is evaluated against
+/// the same base, scope and filter the original search used, which is the only way a pushed entry
+/// can be trusted to be one the client would have received from a fresh search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subscription {
+    pub message_id: MessageId,
+    pub base_object: String,
+    pub scope: crate::directory::Scope,
+    pub filter: rasn_ldap::Filter,
+    /// The connection this belongs to, for the access rules.
+    pub requester: crate::acl::Requester,
+    /// The selection the client asked for, so a pushed entry carries the attributes it wants.
+    pub selection: Vec<String>,
+}
+
+impl Subscription {
+    /// The messages a change produces for this search, if it is in the content.
+    ///
+    /// A deletion is reported when the DN is in scope: the entry is gone, so there is no filter to
+    /// evaluate it against, and scope is the most that can honestly be asked.
+    ///
+    /// A change that moves an entry *out* of the content - a DN edit into another subtree, or an
+    /// attribute edit that stops it matching the filter - is not reported as a deletion. Knowing
+    /// that would mean remembering what this subscription has already sent, and a wrong `delete`
+    /// makes a client drop an entry it should keep.
+    pub fn messages_for(
+        &self,
+        notice: &sync::Notice,
+        directory: &crate::directory::Directory,
+        security: &crate::security::Security,
+    ) -> Vec<rasn_ldap::LdapMessage> {
+        let cookie = sync::encode_cookie(directory.snapshot(), directory.csn());
+        let uuid = match sync::uuid_bytes(&notice.uuid) {
+            Some(uuid) => uuid,
+            None => return Vec::new(),
+        };
+
+        let in_scope = crate::directory::in_scope_for(&notice.dn, &self.base_object, self.scope);
+        if !in_scope {
+            return Vec::new();
+        }
+
+        match (&notice.entry, notice.kind) {
+            (None, _) => {
+                // A deletion: an empty entry carrying the state, which is how RFC 4533 §1.3.2
+                // says a removal is sent.
+                let control = sync::state_control(sync::State::Delete, &uuid, Some(&cookie));
+                vec![responses::search_result_entry_with_controls(
+                    self.message_id,
+                    &notice.dn,
+                    &[],
+                    vec![control],
+                )]
+            }
+            (Some(entry), _) => {
+                if !self.matches(entry) {
+                    return Vec::new();
+                }
+                let visible: Vec<crate::model::Attribute> = entry
+                    .attributes()
+                    .select(entry.dn(), &self.selection)
+                    .into_iter()
+                    .filter(|attribute| {
+                        security
+                            .acl
+                            .rights(
+                                &self.requester,
+                                directory,
+                                entry.dn(),
+                                Some(&*attribute.name),
+                            )
+                            .read
+                    })
+                    .collect();
+
+                let control = sync::state_control(sync::State::Add, &uuid, Some(&cookie));
+                vec![responses::search_result_entry_with_controls(
+                    self.message_id,
+                    entry.dn(),
+                    &visible,
+                    vec![control],
+                )]
+            }
+        }
+    }
+
+    fn matches(&self, entry: &crate::model::Entry) -> bool {
+        crate::ldap::filter::matches(entry.attributes(), entry.dn(), &self.filter).unwrap_or(false)
     }
 }
 

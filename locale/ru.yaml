@@ -34,6 +34,7 @@ error.tls_handshake: "клиент {peer}: TLS-рукопожатие не уд�
 error.starttls_handshake: "клиент {peer}: StartTLS-рукопожатие не удалось"
 error.malformed: "клиент {peer} прислал некорректное сообщение, соединение закрыто"
 error.client: "клиент {peer}: {detail}"
+error.sync_lagged: "соединение {peer} отстало на {missed} изменений; постоянные поиски на нём сняты"
 error.panic: "соединение {peer} оборвалось внутренней ошибкой; слушатели не затронуты"
 error.journal: "не удаётся записать журнал изменений: {detail}"
 error.shutdown_timeout: "плавная остановка не уложилась в {grace}, закрываю оставшиеся соединения"

@@ -356,6 +356,64 @@ impl Client {
         self.collect(id, expected).await
     }
 
+    /// Starts a `refreshAndPersist` search and reads until the refresh stage ends.
+    ///
+    /// The answer to a persistent search never carries a `searchResDone`: RFC 4533 §1.3.2 closes
+    /// the refresh with a `syncInfo` message and then keeps the connection open. A client that
+    /// waits for the usual final message waits for ever - which is what happened before this
+    /// existed, and is why it does.
+    ///
+    /// Returns the messages of the refresh stage and the message id, which `next_change` uses to
+    /// tell this search's notifications from another's.
+    pub async fn search_persist(
+        &self,
+        request: rasn_ldap::SearchRequest,
+        controls: Vec<rasn_ldap::Control>,
+    ) -> Result<(Vec<LdapMessage>, MessageId), Error> {
+        let id = self.inner.bookkeeping.lock().await.next_id();
+        let mut message = LdapMessage::new(id, ProtocolOp::SearchRequest(request));
+        if !controls.is_empty() {
+            message.controls = Some(controls);
+        }
+        self.send(&codec::encode(&message)?).await?;
+
+        let mut reader = self.inner.reader.lock().await;
+        let mut answer = Vec::new();
+
+        loop {
+            let half = reader.as_mut().ok_or(Error::Closed)?;
+            let bytes = self.read_frame(half).await?;
+            let message = codec::decode(&bytes)?;
+
+            if message.message_id != id {
+                continue;
+            }
+
+            let finished = matches!(message.protocol_op, ProtocolOp::SearchResDone(_))
+                || matches!(message.protocol_op, ProtocolOp::IntermediateResponse(_));
+            answer.push(message);
+
+            if finished {
+                return Ok((answer, id));
+            }
+        }
+    }
+
+    /// Reads one pushed message for a persistent search.
+    ///
+    /// `None` when the connection closed. The caller matches on the message id it was given by
+    /// `search_persist`, because a connection may carry more than one persistent search.
+    pub async fn next_change(&self) -> Result<Option<LdapMessage>, Error> {
+        let mut reader = self.inner.reader.lock().await;
+        let half = reader.as_mut().ok_or(Error::Closed)?;
+
+        match self.read_frame(half).await {
+            Ok(bytes) => Ok(Some(codec::decode(&bytes)?)),
+            Err(Error::Io(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Writes one framed message.
     async fn send(&self, bytes: &[u8]) -> Result<(), Error> {
         let mut writer = self.inner.writer.lock().await;
