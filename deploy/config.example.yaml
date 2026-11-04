@@ -102,6 +102,40 @@ access:
     attributes: ["*"]
     rights: [read, search]
 
+# Replication, if this node takes part in one. Left out, it stands alone.
+#
+# `server_id` is this node's number, written into the third field of every change sequence
+# number it issues. It must differ from every peer's: two nodes sharing an id produce changes
+# that cannot be told apart, and the order between them cannot be recovered afterwards - so the
+# server refuses at startup, and again at the first exchange if a peer disagrees with what is
+# written here.
+#
+# A peer is an ordinary LDAP server, and the exchange is RFC 4533 `refreshAndPersist`: changes
+# arrive pushed, deletions included, which a poll cannot express. Give the bind a DN that can
+# read the whole naming context - the base being replicated is this node's own.
+#
+# `journal_keep` bounds how far back this node can answer for, because the journal is the only
+# place a deletion is remembered. A peer that falls further behind than this is told to do a
+# full refresh instead of being given a gap it would never notice. Omit the key and nothing is
+# pruned: correct for a node whose peers may be down for a long time, and a slow leak for one
+# nobody reads. Zero is refused.
+#server_id: 1
+#replication:
+#  journal_keep: 100000
+#peers:
+#  - url: ldaps://node2.example.com:636
+#    server_id: 2
+#    bind_dn: cn=replicator,dc=example,dc=com
+#    password: <secret>
+
+# Subtrees this server does not hold, and where a client is sent for them. Referrals are how a
+# naming context points at a part of the tree somebody else keeps: nothing is copied and nothing
+# is cached. A base under no referral and outside this tree is still `noSuchObject`, so a typo in
+# a DN stays a typo.
+#referrals:
+#  - dn: dc=remote,dc=com
+#    url: ldaps://ldap.remote.example.com
+
 # Reload: the file backends are re-read on this interval, on SIGUSR1, and on
 # `HEAD /callback` with the token below. With the redb backend there is nothing to re-read,
 # but the interval still drives the entry cache refresh.
