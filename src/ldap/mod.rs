@@ -11,6 +11,7 @@ pub mod filter_parse;
 pub mod modify;
 pub mod paged;
 pub mod responses;
+pub mod sasl_bind;
 pub mod schema_entry;
 pub mod search;
 pub mod session;

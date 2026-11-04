@@ -34,7 +34,7 @@ redb = "4.4.0"
 # Kerberos for SASL GSSAPI, in pure Rust: the C `libgssapi` binding would break the rule that
 # this server carries no C. Only the message and service half is asked for - the client half
 # (a KDC-facing negotiator, an HTTP layer, a token cache) is not what a server does.
-rskrb5 = { version = "0.2", default-features = false, features = ["messages"] }
+rskrb5 = { version = "0.2", default-features = false, features = ["messages", "spnego"] }
 roaring = "0.12.0"
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2.2.0"

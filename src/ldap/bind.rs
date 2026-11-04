@@ -84,6 +84,12 @@ fn authenticate(
         );
     }
 
+    // A SASL bind is a conversation with state on the connection, so it is handled where that
+    // state lives rather than bent into the password path below.
+    if super::sasl_bind::is_gssapi(request) {
+        return super::sasl_bind::handle_gssapi(session, directory, message_id, request, security);
+    }
+
     let password = match &request.authentication {
         AuthenticationChoice::Simple(password) => {
             String::from_utf8_lossy(password.as_ref()).into_owned()
@@ -429,7 +435,10 @@ mod tests {
     }
 
     #[test]
-    fn sasl_bind_is_not_supported() {
+    fn a_sasl_bind_without_a_keytab_says_why() {
+        // GSSAPI is implemented, but a server with no keytab cannot accept a ticket, and the
+        // answer has to say that rather than the old "method not supported": an operator reading
+        // it needs to know the difference between "never implemented" and "not configured here".
         let directory = directory();
         let mut session = Session::new();
         let sasl = BindRequest::new(
@@ -444,7 +453,30 @@ mod tests {
         let response = handle_bind(&mut session, &directory, 8, &sasl, &security());
 
         assert_eq!(code(&response), ResultCode::AuthMethodNotSupported);
-        assert!(diagnostic(&response).contains("GSSAPI"));
+        assert!(
+            diagnostic(&response).contains("keytab"),
+            "{}",
+            diagnostic(&response)
+        );
+    }
+
+    #[test]
+    fn an_unknown_sasl_mechanism_is_refused_by_name() {
+        let directory = directory();
+        let mut session = Session::new();
+        let sasl = BindRequest::new(
+            3,
+            rasn_ldap::LdapDn::from(ADMIN_DN),
+            AuthenticationChoice::Sasl(rasn_ldap::SaslCredentials::new(
+                rasn_ldap::LdapString::from("EXTERNAL"),
+                None,
+            )),
+        );
+
+        let response = handle_bind(&mut session, &directory, 9, &sasl, &security());
+
+        assert_eq!(code(&response), ResultCode::AuthMethodNotSupported);
+        assert!(diagnostic(&response).contains("EXTERNAL"));
     }
 
     #[test]
