@@ -389,7 +389,15 @@ pub fn handle_search(
     // the same after a restart.
     let sync_cookie = sync_request
         .as_ref()
-        .map(|_| directory.snapshot().to_string().into_bytes());
+        .map(|_| sync::encode_cookie(directory.snapshot(), directory.csn()));
+
+    // What the client already has, if it said. `None` means "send me everything with attributes",
+    // which is what a first refresh is.
+    let client_csn = sync_request
+        .as_ref()
+        .and_then(|request| request.cookie.as_deref())
+        .and_then(sync::decode_cookie)
+        .and_then(|(_, csn)| csn);
 
     let mut messages: Vec<LdapMessage> = matched[page_start..page_end]
         .iter()
@@ -409,6 +417,18 @@ pub fn handle_search(
             } else {
                 visible
             };
+            // RFC 4533 §1.3.1: an entry whose content the client does not have goes as `add`
+            // *with* its attributes; an unchanged entry goes as an **empty** entry (no
+            // attributes) with state `present`, which is what lets a resumed refresh cost the
+            // changes rather than the directory.
+            let unchanged = match (&client_csn, &sync_request) {
+                (Some(since), Some(_)) => attributes
+                    .get(crate::operational::ATTR_ENTRY_CSN)
+                    .and_then(|attribute| attribute.values.first())
+                    .is_some_and(|csn| !sync::is_newer(csn, since)),
+                _ => false,
+            };
+
             let state_controls = match (&sync_request, &sync_cookie) {
                 (Some(_), Some(cookie)) => {
                     let uuid = attributes
@@ -416,19 +436,24 @@ pub fn handle_search(
                         .and_then(|attribute| attribute.values.first().cloned())
                         .unwrap_or_else(|| crate::directory::entry_uuid(dn));
                     match sync::uuid_bytes(&uuid) {
-                        // `present`: this answer describes the directory as it is now, and the
-                        // client reconciles. Without a history of changes there is nothing to
-                        // report as `add` or `modify` - and a wrong state is worse than none.
-                        Some(uuid) => vec![sync::state_control(
-                            sync::State::Present,
-                            &uuid,
-                            Some(cookie),
-                        )],
+                        Some(uuid) => {
+                            let state = if unchanged {
+                                sync::State::Present
+                            } else {
+                                sync::State::Add
+                            };
+                            vec![sync::state_control(state, &uuid, Some(cookie))]
+                        }
                         None => Vec::new(),
                     }
                 }
                 _ => Vec::new(),
             };
+
+            // An unchanged entry is reported as an empty entry: the client already has the
+            // content, and sending it again would make a poll cost the directory rather than the
+            // changes.
+            let selected = if unchanged { Vec::new() } else { selected };
 
             responses::search_result_entry_with_controls(message_id, dn, &selected, state_controls)
         })
@@ -439,8 +464,25 @@ pub fn handle_search(
     // The end of a synchronised answer carries its own control, and only that: RFC 4533 §2.5
     // says a client that does not find it must treat the refresh as failed even if every entry
     // arrived.
+    //
+    // `refreshDeletes` is how a refreshOnly answer reports deletions at all, and it means "delete
+    // anything you did not receive". That is only honest when the client received everything: a
+    // paged answer, a VLV window or a size-limited one leaves entries out for reasons that are not
+    // "it was deleted", and saying TRUE there would make a client delete live entries.
+    //
+    // A client with no cookie is not told to delete either: it is asking for the directory for the
+    // first time, and "you did not receive it" says nothing about what it holds.
+    //
+    // RFC 4533 §1.3.1: `refreshDeletes` FALSE means the client drops every entry this answer did
+    // not identify as present - which is safe only when the answer is the whole content, because
+    // an entry left out of a page was not deleted. TRUE means "drop only what I named", so an
+    // incomplete answer must say TRUE and name nothing: the client then keeps what it has and a
+    // later complete poll reconciles it.
     if let Some(cookie) = &sync_cookie {
-        controls_out.push(sync::done_control(Some(cookie), false));
+        let paging = has_paged_control && page.is_requested();
+        let complete = window.is_none() && !paging && !size_limit_exceeded;
+
+        controls_out.push(sync::done_control(Some(cookie), !complete));
     }
 
     // A sorted search without the sort response leaves the client guessing whether the
