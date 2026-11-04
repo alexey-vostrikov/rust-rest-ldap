@@ -24,6 +24,13 @@ use crate::model::{Attribute, AttributeFlags, Attributes, Entry};
 
 const ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("entries");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// The change journal: one record per accepted write, keyed by `entryCSN`.
+///
+/// In the same database and written in the same transaction as the entry it describes, so a
+/// change and its record cannot half-happen. That is the whole reason it lives here and not in a
+/// file beside the store: the file could be written and the store not, or the other way round,
+/// and a replica reading the journal would then replay a change that never was.
+const CHANGES: TableDefinition<&str, &[u8]> = TableDefinition::new("changes");
 const FORMAT_VERSION: &str = "1";
 const META_FORMAT: &str = "format";
 
@@ -36,14 +43,75 @@ struct StoredAttribute {
     flags: AttributeFlags,
 }
 
+/// The ordering key of a change: the entry's own `entryCSN`.
+///
+/// A change that arrives without one gets a fresh CSN here rather than no record: a journal entry
+/// with no key cannot be ordered, and a change that happened is not made un-happened by the
+/// absence of a stamp.
+fn csn_of(entry: &Entry) -> String {
+    entry
+        .attributes()
+        .get(crate::operational::ATTR_ENTRY_CSN)
+        .and_then(|attribute| attribute.values.first().cloned())
+        .unwrap_or_else(crate::operational::next_csn)
+}
+
+/// The identity a replica knows the entry by.
+fn uuid_of(entry: &Entry) -> String {
+    entry
+        .attributes()
+        .get(crate::model::ATTR_ENTRY_UUID)
+        .and_then(|attribute| attribute.values.first().cloned())
+        .unwrap_or_else(|| crate::directory::entry_uuid(entry.dn()))
+}
+
+/// What kind of change a journal record describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeKind {
+    Add,
+    Modify,
+    Delete,
+}
+
+impl ChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeKind::Add => "add",
+            ChangeKind::Modify => "modify",
+            ChangeKind::Delete => "delete",
+        }
+    }
+}
+
+/// One record in the change journal.
+///
+/// `csn` is both the key and the ordering: `entryCSN` is fixed width, so lexicographic order is
+/// chronological order - which is the property that lets a replica say "everything after this".
+///
+/// A deletion is a record with no entry and a CSN of its own: a tombstone. Without one, a node
+/// that was offline would re-send its copy of an entry somebody else deleted, and the entry would
+/// come back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChangeRecord {
+    pub csn: String,
+    pub kind: ChangeKind,
+    pub dn: String,
+    /// The entry's `entryUUID`, or one derived from the DN when the entry had none.
+    pub uuid: String,
+    /// The entry as it stood after the change. `None` for a deletion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<StoredEntry>,
+}
+
 /// One entry as it is stored: the DN plus every attribute, flags included.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct StoredEntry {
+pub struct StoredEntry {
     attributes: Vec<StoredAttribute>,
 }
 
 impl StoredEntry {
-    fn from_entry(entry: &Entry) -> Self {
+    pub fn from_entry(entry: &Entry) -> Self {
         Self {
             attributes: entry
                 .attributes()
@@ -58,7 +126,7 @@ impl StoredEntry {
         }
     }
 
-    fn into_entry(self, dn: &str) -> Entry {
+    pub fn into_entry(self, dn: &str) -> Entry {
         let mut attributes = Attributes::new();
         for attribute in self.attributes {
             attributes = attributes.push(Attribute {
@@ -250,9 +318,51 @@ impl RedbBackend {
                         reason: source.to_string(),
                     })?;
 
+            let mut journal =
+                transaction
+                    .open_table(CHANGES)
+                    .map_err(|source| BackendError::Redb {
+                        path: "<changes>".to_string(),
+                        reason: source.to_string(),
+                    })?;
+
             for change in changes {
                 match change {
                     EntryChange::Upsert { entry } => {
+                        // `add` or `modify` is decided by the store, in the same transaction:
+                        // asking the directory in memory would be a second source of truth, and
+                        // the two disagree exactly when a reload has not happened yet.
+                        let existed = entries
+                            .get(entry.dn())
+                            .map_err(|source| BackendError::Redb {
+                                path: entry.dn().to_string(),
+                                reason: source.to_string(),
+                            })?
+                            .is_some();
+
+                        let record = ChangeRecord {
+                            csn: csn_of(entry),
+                            kind: if existed {
+                                ChangeKind::Modify
+                            } else {
+                                ChangeKind::Add
+                            },
+                            dn: entry.dn().to_string(),
+                            uuid: uuid_of(entry),
+                            entry: Some(StoredEntry::from_entry(entry)),
+                        };
+                        let bytes =
+                            serde_json::to_vec(&record).map_err(|err| BackendError::Redb {
+                                path: entry.dn().to_string(),
+                                reason: format!("cannot serialize the journal record: {err}"),
+                            })?;
+                        journal
+                            .insert(record.csn.as_str(), bytes.as_slice())
+                            .map_err(|source| BackendError::Redb {
+                                path: "<changes>".to_string(),
+                                reason: source.to_string(),
+                            })?;
+
                         let stored = StoredEntry::from_entry(entry);
                         let bytes =
                             serde_json::to_vec(&stored).map_err(|err| BackendError::Redb {
@@ -267,6 +377,28 @@ impl RedbBackend {
                             })?;
                     }
                     EntryChange::Delete { dn, .. } => {
+                        // The tombstone is written even when the entry was already gone: a
+                        // replica that never learned about the deletion still has to, and a
+                        // record we skip is a record it will never see.
+                        let record = ChangeRecord {
+                            csn: crate::operational::next_csn(),
+                            kind: ChangeKind::Delete,
+                            dn: dn.clone(),
+                            uuid: String::new(),
+                            entry: None,
+                        };
+                        let bytes =
+                            serde_json::to_vec(&record).map_err(|err| BackendError::Redb {
+                                path: dn.clone(),
+                                reason: format!("cannot serialize the journal record: {err}"),
+                            })?;
+                        journal
+                            .insert(record.csn.as_str(), bytes.as_slice())
+                            .map_err(|source| BackendError::Redb {
+                                path: "<changes>".to_string(),
+                                reason: source.to_string(),
+                            })?;
+
                         entries
                             .remove(dn.as_str())
                             .map_err(|source| BackendError::Redb {
@@ -288,6 +420,130 @@ impl RedbBackend {
             path: "<database>".to_string(),
             reason: source.to_string(),
         })
+    }
+
+    /// Journal records strictly after `csn`, oldest first.
+    ///
+    /// `None` means the beginning. The key is `entryCSN`, which is fixed width, so a range scan
+    /// over the text keys is a range scan over time - and no separate index is needed to answer
+    /// "what changed since".
+    pub fn journal_since(&self, csn: Option<&str>) -> Result<Vec<ChangeRecord>, BackendError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+
+        let table = match transaction.open_table(CHANGES) {
+            Ok(table) => table,
+            // A store that has never been written to has no journal table yet, which is not an
+            // error: it has nothing to report.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(BackendError::Redb {
+                    path: "<changes>".to_string(),
+                    reason: source.to_string(),
+                });
+            }
+        };
+
+        let range = match csn {
+            None => table.iter().map_err(|source| BackendError::Redb {
+                path: "<changes>".to_string(),
+                reason: source.to_string(),
+            })?,
+            Some(csn) => table
+                .range::<&str>((std::ops::Bound::Excluded(csn), std::ops::Bound::Unbounded))
+                .map_err(|source| BackendError::Redb {
+                    path: "<changes>".to_string(),
+                    reason: source.to_string(),
+                })?,
+        };
+
+        let mut records = Vec::new();
+        for item in range {
+            let (_, value) = item.map_err(|source| BackendError::Redb {
+                path: "<changes>".to_string(),
+                reason: source.to_string(),
+            })?;
+            records.push(serde_json::from_slice(value.value()).map_err(|source| {
+                BackendError::Parse {
+                    path: "<changes>".to_string(),
+                    source,
+                }
+            })?);
+        }
+
+        Ok(records)
+    }
+
+    /// The newest CSN in the journal, if there is one.
+    pub fn journal_head(&self) -> Result<Option<String>, BackendError> {
+        Ok(self
+            .journal_since(None)?
+            .last()
+            .map(|record| record.csn.clone()))
+    }
+
+    /// How many records the journal holds.
+    pub fn journal_len(&self) -> Result<usize, BackendError> {
+        Ok(self.journal_since(None)?.len())
+    }
+
+    /// Drops the oldest records, keeping the newest `keep`.
+    ///
+    /// A journal that is never trimmed grows with every write for ever, and a replica that has
+    /// been offline longer than the journal is not `error` but a fact: it must be re-initialised
+    /// rather than caught up, and `journal_head` is how it finds out.
+    pub fn journal_prune(&self, keep: usize) -> Result<usize, BackendError> {
+        let records = self.journal_since(None)?;
+        if records.len() <= keep {
+            return Ok(0);
+        }
+
+        let doomed: Vec<String> = records[..records.len() - keep]
+            .iter()
+            .map(|record| record.csn.clone())
+            .collect();
+
+        let mut transaction = self
+            .database
+            .begin_write()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        transaction
+            .set_durability(self.durability)
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        {
+            let mut table =
+                transaction
+                    .open_table(CHANGES)
+                    .map_err(|source| BackendError::Redb {
+                        path: "<changes>".to_string(),
+                        reason: source.to_string(),
+                    })?;
+            for csn in &doomed {
+                table
+                    .remove(csn.as_str())
+                    .map_err(|source| BackendError::Redb {
+                        path: "<changes>".to_string(),
+                        reason: source.to_string(),
+                    })?;
+            }
+        }
+        transaction.commit().map_err(|source| BackendError::Redb {
+            path: "<database>".to_string(),
+            reason: source.to_string(),
+        })?;
+
+        Ok(doomed.len())
     }
 
     /// Number of stored entries; used by tests and logging.
