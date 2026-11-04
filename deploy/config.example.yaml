@@ -119,9 +119,15 @@ access:
 # full refresh instead of being given a gap it would never notice. Omit the key and nothing is
 # pruned: correct for a node whose peers may be down for a long time, and a slow leak for one
 # nobody reads. Zero is refused.
+#
+# `conflict_log` records the one outcome an operator has to act on: two nodes disagreeing about
+# an entry in a way no timestamp settles, so one version was kept and the other exists only on
+# its own node. One JSON object per line - DN, both change numbers, reason - and it survives a
+# restart, unlike standard error. `ldap_replication_conflicts_total` counts them for alerting.
 #server_id: 1
 #replication:
 #  journal_keep: 100000
+#  conflict_log: /var/lib/rust-rest-ldap/conflicts.jsonl
 #peers:
 #  - url: ldaps://node2.example.com:636
 #    server_id: 2

@@ -452,6 +452,10 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("error.peer", "peer {url}: {detail}; retrying"),
     (
+        "error.conflict_log",
+        "conflict about {dn} could not be written to the conflict log: {detail}",
+    ),
+    (
         "error.peer_behind",
         "peer {url}: its cookie points into a part of the journal this node has already pruned, \
          so the changes in between are gone; starting a full refresh instead of a silent gap",

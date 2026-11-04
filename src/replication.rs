@@ -168,7 +168,14 @@ pub enum Local {
 /// What a peer says happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Incoming {
-    pub csn: String,
+    /// The change's sequence number, or `None` when the peer sent none at all.
+    ///
+    /// `None` and "unparseable" are different facts and are treated differently. A peer that says
+    /// nothing about order has told the truth about an entry the directory synthesises - the
+    /// naming context and its units carry no `entryCSN`, because nothing wrote them. A peer that
+    /// sends something this server cannot read has sent a change whose place in history is
+    /// unknown, and that is a conflict.
+    pub csn: Option<String>,
     pub kind: ChangeKind,
     /// The entry's `entryUUID`. Two nodes that independently created the same DN have two, and
     /// that is a conflict no timestamp settles.
@@ -191,14 +198,32 @@ pub enum Decision {
 ///
 /// Entry-level last-writer-wins, with the cases where a timestamp is the wrong tool spelled out.
 pub fn merge(local: &Local, incoming: &Incoming) -> Decision {
-    let incoming_csn = match Csn::parse(&incoming.csn) {
-        Some(csn) => csn,
+    let incoming_csn = match &incoming.csn {
         None => {
-            return Decision::Conflict {
-                why: "the incoming change carries a change sequence number this server cannot \
-                      order, so there is no honest way to place it in history",
+            // Nothing to order by. An entry this directory does not hold is taken: there is
+            // nothing to overwrite and writing it once is idempotent. An entry it does hold is
+            // left alone - applying an unordered change to it would rewrite it on every poll, for
+            // ever, because nothing could ever make it stale.
+            return match local {
+                Local::Absent => Decision::Apply {
+                    why: "the peer sent no change sequence number, but this directory does not \
+                          hold the entry at all, so writing it cannot lose anything",
+                },
+                _ => Decision::Ignore {
+                    why: "the peer sent a change with no change sequence number: there is no \
+                          order to apply it in, so the local version stays",
+                },
             };
         }
+        Some(text) => match Csn::parse(text) {
+            Some(csn) => csn,
+            None => {
+                return Decision::Conflict {
+                    why: "the incoming change carries a change sequence number this server \
+                          cannot order, so there is no honest way to place it in history",
+                };
+            }
+        },
     };
 
     match local {
@@ -327,7 +352,7 @@ mod tests {
 
     fn incoming(csn: &str, kind: ChangeKind) -> Incoming {
         Incoming {
-            csn: csn.to_string(),
+            csn: Some(csn.to_string()),
             kind,
             uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
         }
@@ -636,12 +661,69 @@ mod tests {
     }
 
     #[test]
+    fn a_change_with_no_sequence_number_is_written_only_where_there_is_nothing_to_lose() {
+        // The case a live two-node run found: the naming context and the two units are
+        // synthesised, so they carry no `entryCSN`, and a peer sends them with none. Treating
+        // "no number" as "an unreadable number" made every node start by recording three
+        // conflicts that were not conflicts.
+        let absent = Local::Absent;
+        match merge(
+            &absent,
+            &Incoming {
+                csn: None,
+                kind: ChangeKind::Add,
+                uuid: None,
+            },
+        ) {
+            Decision::Apply { why } => assert!(why.contains("does not hold the entry at all")),
+            other => panic!("a new entry is taken even without a number: {other:?}"),
+        }
+
+        let present = Local::Present {
+            csn: None,
+            uuid: None,
+        };
+        match merge(
+            &present,
+            &Incoming {
+                csn: None,
+                kind: ChangeKind::Modify,
+                uuid: None,
+            },
+        ) {
+            Decision::Ignore { why } => assert!(
+                why.contains("no change sequence number"),
+                "and it is not called a conflict: {why}"
+            ),
+            other => panic!("an unordered change must not be written over an entry: {other:?}"),
+        }
+
+        let tombstone = Local::Tombstone {
+            csn: "20260101000000.000001Z#000001#002#000000".to_string(),
+        };
+        assert!(matches!(
+            merge(
+                &tombstone,
+                &Incoming {
+                    csn: None,
+                    kind: ChangeKind::Add,
+                    uuid: None,
+                },
+            ),
+            Decision::Ignore { .. }
+        ));
+    }
+
+    #[test]
     fn an_unorderable_incoming_change_stops_the_merge() {
         let local = Local::Present {
             csn: Some("20261104005712.352052Z#000002#003#000000".to_string()),
             uuid: None,
         };
-        match merge(&local, &incoming("garbage", ChangeKind::Modify)) {
+        let mut unparseable = incoming("garbage", ChangeKind::Modify);
+        unparseable.csn = Some("garbage".to_string());
+
+        match merge(&local, &unparseable) {
             Decision::Conflict { why } => assert!(why.contains("cannot")),
             other => panic!("expected a conflict, got {other:?}"),
         }

@@ -79,6 +79,7 @@ async fn serve(entries: Vec<Entry>) -> String {
         server_id: 0,
         peers: Vec::new(),
         journal_keep: None,
+        conflict_log: None,
         acl: rust_rest_ldap::acl::from_config(Some(&[rust_rest_ldap::acl::AccessRuleConfig {
             subject: "anonymous".to_string(),
             base: None,
@@ -169,6 +170,23 @@ fn search() -> SearchRequest {
 
 /// The `syncRequest` control with a cookie: a client that already has a copy, asking for what
 /// changed since.
+/// `replace: sn` on one entry, the smallest write that produces a change.
+fn modify_sn(cn: &str, value: &str) -> rasn_ldap::ModifyRequest {
+    use rasn::types::SetOf;
+    use rasn_ldap::{AttributeDescription, AttributeValue, PartialAttribute};
+
+    rasn_ldap::ModifyRequest {
+        object: LdapDn::from(format!("cn={cn},ou=users,{BASE}").as_str()),
+        changes: vec![rasn_ldap::ModifyRequestChanges {
+            operation: rasn_ldap::ChangeOperation::Replace,
+            modification: PartialAttribute::new(
+                AttributeDescription::from("sn"),
+                SetOf::from_vec(vec![AttributeValue::from(value.as_bytes().to_vec())]),
+            ),
+        }],
+    }
+}
+
 fn sync_control_resuming(mode: u8, cookie: &[u8]) -> Control {
     let mut body = vec![0x0a, 0x01, mode, 0x04];
     body.push(cookie.len() as u8);
@@ -477,6 +495,59 @@ async fn a_persistent_search_is_answered_and_then_pushes_what_changes() {
         entries[0].2 > 0,
         "and with its attributes, or the client cannot apply it"
     );
+}
+
+#[tokio::test]
+async fn a_persistent_search_survives_being_idle_past_the_client_timeout() {
+    // Found live, on two nodes: a peer reconnecting every thirty seconds and retransmitting a
+    // refresh, because the ordinary read deadline applied to a connection whose whole purpose is
+    // to sit still until something happens.
+    //
+    // The waiting has to happen *inside* `next_change`, not before it: a change already in the
+    // socket is read at once and would prove nothing about the deadline. So the write is a task
+    // and the read is the caller.
+    let url = serve(vec![person("alice")]).await;
+
+    let client = Client::connect(
+        &url,
+        Options {
+            timeout: Duration::from_millis(100),
+            ..Options::default()
+        },
+    )
+    .await
+    .expect("connect");
+
+    let (_, id) = client
+        .search_persist(search(), vec![sync_control(3)])
+        .await
+        .expect("persistent refresh");
+
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let other = Client::connect(&url, Options::default())
+            .await
+            .expect("connect");
+        other
+            .request(
+                ProtocolOp::ModifyRequest(modify_sn("alice", "Idle")),
+                "modify response",
+            )
+            .await
+            .expect("modify");
+    });
+
+    let pushed = tokio::time::timeout(Duration::from_secs(5), client.next_change())
+        .await
+        .expect("the connection must still be open after an idle wait")
+        .expect("no transport error")
+        .expect("a message");
+
+    writer.await.expect("the writer");
+
+    assert_eq!(pushed.message_id, id);
+    let entries = synchronised(std::slice::from_ref(&pushed));
+    assert_eq!(entries[0].0, "cn=alice,ou=users,dc=example,dc=com");
 }
 
 #[tokio::test]

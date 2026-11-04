@@ -382,7 +382,9 @@ impl Client {
 
         loop {
             let half = reader.as_mut().ok_or(Error::Closed)?;
-            let bytes = self.read_frame(half).await?;
+            // No read deadline: a refresh on a directory of any size takes as long as it takes,
+            // and the caller stops it through its own shutdown, not through a per-frame timer.
+            let bytes = self.read_frame_with(half, None).await?;
             let message = codec::decode(&bytes)?;
 
             if message.message_id != id {
@@ -407,9 +409,9 @@ impl Client {
         let mut reader = self.inner.reader.lock().await;
         let half = reader.as_mut().ok_or(Error::Closed)?;
 
-        match self.read_frame(half).await {
+        match self.read_frame_with(half, None).await {
             Ok(bytes) => Ok(Some(codec::decode(&bytes)?)),
-            Err(Error::Io(_)) => Ok(None),
+            Err(Error::Io(_)) | Err(Error::Closed) => Ok(None),
             Err(err) => Err(err),
         }
     }
@@ -496,6 +498,21 @@ impl Client {
 
     /// Reads one framed message, refusing an oversized one on its header.
     async fn read_frame(&self, reader: &mut ReadHalf<Transport>) -> Result<Vec<u8>, Error> {
+        self.read_frame_with(reader, Some(self.inner.options.timeout))
+            .await
+    }
+
+    /// Reads one frame, waiting at most `patience` for it - or not at all when `None`.
+    ///
+    /// A persistent search is idle by nature: nothing happens on it between changes, and that is
+    /// the point. Applying the ordinary read deadline there makes an idle connection look broken,
+    /// which is exactly what a live run showed - a peer reconnecting every thirty seconds and
+    /// retransmitting a refresh nobody had asked for.
+    async fn read_frame_with(
+        &self,
+        reader: &mut ReadHalf<Transport>,
+        patience: Option<Duration>,
+    ) -> Result<Vec<u8>, Error> {
         let limit = self.inner.options.limits.max_message;
         let mut buffer = Vec::with_capacity(256);
 
@@ -533,19 +550,28 @@ impl Client {
             // One octet at a time for the header: at most ten bytes on a healthy
             // connection, and it means a partial header never consumes the body.
             let mut byte = [0u8; 1];
-            match tokio::time::timeout(self.inner.options.timeout, reader.read_exact(&mut byte))
-                .await
-            {
-                Ok(Ok(_)) => buffer.push(byte[0]),
-                Ok(Err(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Err(Error::Closed);
+
+            let outcome = match patience {
+                Some(limit) => {
+                    match tokio::time::timeout(limit, reader.read_exact(&mut byte)).await {
+                        Ok(result) => result.map(Some),
+                        Err(_) => Ok(None),
+                    }
                 }
-                Ok(Err(err)) => return Err(Error::Io(err.to_string())),
-                Err(_) => {
+                None => reader.read_exact(&mut byte).await.map(Some),
+            };
+
+            match outcome {
+                Ok(Some(_)) => buffer.push(byte[0]),
+                Ok(None) => {
                     return Err(Error::Timeout {
-                        waited: self.inner.options.timeout,
+                        waited: patience.unwrap_or_default(),
                     });
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Err(Error::Closed);
+                }
+                Err(err) => return Err(Error::Io(err.to_string())),
             }
         }
     }

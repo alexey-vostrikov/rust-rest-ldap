@@ -298,6 +298,8 @@ pub struct Config {
     pub peers: Vec<crate::peers::Peer>,
     /// How many change records this node keeps; `None` keeps everything.
     pub journal_keep: Option<usize>,
+    /// Where conflicts with peers are recorded; `None` keeps them only on standard error.
+    pub conflict_log: Option<PathBuf>,
     /// Subtrees held elsewhere, and where a client is sent for them.
     ///
     /// Empty means the server answers `noSuchObject` for anything outside its own tree, which is
@@ -521,6 +523,12 @@ pub struct ReplicationConfig {
     /// everything, which is the honest default for a node whose peers have been down for a long
     /// time - and a slow leak for a node nobody reads.
     pub journal_keep: Option<usize>,
+    /// Where disagreements with peers are written down, one JSON object per line.
+    ///
+    /// Without it a conflict is printed to standard error and forgotten: after a restart there is
+    /// no record that two nodes ever disagreed, and the entry that lost is simply missing. An
+    /// operator resolving a divergence needs the list, not a line in a stream.
+    pub conflict_log: Option<PathBuf>,
 }
 
 /// `observability:` section of the configuration file.
@@ -849,6 +857,7 @@ pub fn resolve(
             }
             other => other,
         },
+        conflict_log: file.replication.conflict_log.clone(),
         referrals,
         acl: crate::acl::from_config(file.access.as_deref())?,
         allow_unencrypted_bind: file.bind.allow_unencrypted_bind.is_on(),
@@ -1072,6 +1081,23 @@ bootstrap:
             matches!(err, ConfigError::BootstrapPasswordMissing),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_conflict_log_is_read_from_the_file() {
+        let text =
+            "base_dn: dc=example,dc=com\nreplication:\n  conflict_log: /var/log/conflicts.jsonl\n";
+        let cfg = resolve(Args::default(), Some(text), no_env).expect("config");
+        assert_eq!(
+            cfg.conflict_log.as_deref(),
+            Some(std::path::Path::new("/var/log/conflicts.jsonl"))
+        );
+    }
+
+    #[test]
+    fn without_a_conflict_log_a_conflict_is_only_printed() {
+        let cfg = resolve(Args::default(), None, no_env).expect("defaults");
+        assert_eq!(cfg.conflict_log, None);
     }
 
     #[test]
