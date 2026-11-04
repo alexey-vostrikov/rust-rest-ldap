@@ -626,6 +626,7 @@ mod tests {
             peers: Vec::new(),
             journal_keep: None,
             conflict_log: None,
+            sasl: Default::default(),
             acl: Default::default(),
             allow_unencrypted_bind: true,
             dangerous_settings: Vec::new(),

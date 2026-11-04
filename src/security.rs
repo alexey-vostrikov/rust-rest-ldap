@@ -207,6 +207,13 @@ pub struct Security {
     pub can_upgrade_password_hashes: bool,
     /// Subtrees this server does not hold, and where the client is sent for them.
     pub referrals: crate::referral::Referrals,
+    /// The GSSAPI acceptor, when a keytab was configured.
+    ///
+    /// `None` means SASL is not offered: a `GSSAPI` bind is refused with
+    /// `authMethodNotSupported`, which is what every deployment without a keytab got before this
+    /// existed. Loaded once, here, because reading a keytab per bind would turn a file-permission
+    /// mistake into a per-request failure.
+    pub gssapi: Option<std::sync::Arc<crate::sasl::Gssapi>>,
 }
 
 impl Default for Security {
@@ -215,6 +222,7 @@ impl Default for Security {
             respect_control_criticality: true,
             can_upgrade_password_hashes: true,
             referrals: crate::referral::Referrals::default(),
+            gssapi: None,
             passwords: PasswordPolicy::strict(),
             acl: Acl::default(),
             // Off, like the configuration default: a test or a caller that wants a
@@ -246,6 +254,10 @@ impl PartialEq for Security {
             && self.integrity == other.integrity
             && self.can_upgrade_password_hashes == other.can_upgrade_password_hashes
             && self.referrals == other.referrals
+            // Two acceptors are equal when they accept the same realms: the keytab itself is a
+            // secret and has no meaningful identity to compare.
+            && self.gssapi.as_ref().map(|one| one.realms().collect::<Vec<_>>())
+                == other.gssapi.as_ref().map(|one| one.realms().collect::<Vec<_>>())
             && current_schema(&self.schema) == current_schema(&other.schema)
             && self.schema_mode == other.schema_mode
     }
@@ -273,7 +285,16 @@ impl Security {
             // is also what tests and the protocol layer build from a bare configuration.
             can_upgrade_password_hashes: true,
             referrals: config.referrals.clone(),
+            // Left empty: the keytab is read by the server that has one, not by every caller that
+            // builds a policy from a configuration.
+            gssapi: None,
         }
+    }
+
+    /// The same policy, able to accept Kerberos tickets.
+    pub fn with_gssapi(mut self, gssapi: Option<std::sync::Arc<crate::sasl::Gssapi>>) -> Self {
+        self.gssapi = gssapi;
+        self
     }
 
     /// The same policy, publishing `schema` instead of its own copy.

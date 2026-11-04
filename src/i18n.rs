@@ -401,6 +401,10 @@ const ENGLISH: &[(&str, &str)] = &[
     ("start.shutting_down", "shutting down"),
     ("start.export_done", "exported {entries} entries to {path}"),
     (
+        "start.gssapi",
+        "sasl: accepting Kerberos tickets for realm(s) {realms}",
+    ),
+    (
         "start.journal_pruned",
         "journal: dropped {removed} of the oldest change records, as replication.journal_keep says",
     ),
@@ -450,6 +454,7 @@ const ENGLISH: &[(&str, &str)] = &[
         "error.sync_lagged",
         "connection {peer} fell {missed} changes behind and its persistent searches were dropped",
     ),
+    ("error.sasl", "sasl: {detail}"),
     ("error.peer", "peer {url}: {detail}; retrying"),
     (
         "error.conflict_log",
@@ -573,6 +578,7 @@ const ENGLISH: &[(&str, &str)] = &[
     // Configuration diagnostics, one per variant an operator can hit
     ("config.server_id", "invalid server id: {detail}"),
     ("config.journal_keep", "invalid journal_keep: {detail}"),
+    ("config.sasl", "invalid sasl: {detail}"),
     ("config.peers", "invalid peers: {detail}"),
     ("config.referral", "invalid referrals: {detail}"),
     (
