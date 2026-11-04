@@ -555,20 +555,24 @@ impl Directory {
     /// on every search, which is what a load test of a million entries measured: 39 ms for a
     /// lookup that matches one entry, because the index skipped the filter but not the walk.
     pub fn entries_at(&self, ids: &roaring::RoaringBitmap) -> Vec<(usize, &Entry)> {
+        // A bitmap from the index names **ids**, and an id is not a position once an entry has
+        // been added or removed before it. Indexing the vector with an id read the wrong entry -
+        // or none - and the symptom was a search that did not find an entry a write had just
+        // reported as stored. The translation is the whole reason `by_id` exists.
         ids.iter()
             .filter_map(|id| {
-                self.entries
-                    .get(id as usize)
-                    .map(|entry| (id as usize, entry))
+                let position = *self.by_id.get(&id)?;
+                Some((position, &self.entries[position]))
             })
             .collect()
     }
 
-    /// Positions of the entries under `base_object` for this scope, as a bitmap.
+    /// Ids of the entries under `base_object` for this scope, as a bitmap.
     ///
-    /// The bitmap knows positions, not subtrees, so a search that walks candidates must still check
-    /// the scope of each one. Building the bitmap here rather than letting a caller subtract the two
-    /// keeps that rule in one place.
+    /// Ids rather than positions, so this can be intersected with what the index answered: the
+    /// index speaks ids, and two bitmaps in different numberings intersect into nonsense. A
+    /// bitmap also knows numbers, not subtrees, so a search that walks candidates still has to
+    /// check the scope of each one - building the set here keeps that rule in one place.
     pub fn scope_ids(&self, base_object: &str, scope: Scope) -> roaring::RoaringBitmap {
         let base_object = dn::normalize(base_object);
 
@@ -576,7 +580,10 @@ impl Directory {
             .iter()
             .enumerate()
             .filter(|(_, entry)| in_scope(entry.dn(), &base_object, scope))
-            .map(|(position, _)| position as u32)
+            // Ids, not positions: a caller intersects this with what the index answered, and a
+            // bitmap of positions intersected with a bitmap of ids silently keeps the wrong
+            // entries.
+            .map(|(position, _)| self.ids[position])
             .collect()
     }
 

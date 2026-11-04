@@ -182,13 +182,15 @@ fn answered_dns(directory: &rust_rest_ldap::directory::Directory, query: &Query)
         return Vec::new();
     };
 
-    let mut dns: Vec<String> = candidates
-        .iter()
-        .filter_map(|id| {
-            directory
-                .entry_by_id(id)
-                .map(|entry| entry.dn().to_string())
-        })
+    // Through `entries_at`, because that is the accessor the search path uses. Reading the
+    // answers through `entry_by_id` - the other translation of the same bitmap - compares the
+    // right thing by a path the server does not take, and that is exactly how a defect where the
+    // index names ids and the vector is indexed by position slipped past the first version of
+    // this helper.
+    let mut dns: Vec<String> = directory
+        .entries_at(&candidates)
+        .into_iter()
+        .map(|(_, entry)| entry.dn().to_string())
         .collect();
     dns.sort();
     dns
