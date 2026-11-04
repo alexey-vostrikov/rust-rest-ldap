@@ -98,6 +98,10 @@ impl ConfigError {
         let mut owned: Vec<(String, String)> = Vec::new();
 
         match self {
+            Self::ServerId(detail) => {
+                key = "config.server_id";
+                owned.push(("detail".to_string(), detail.clone()));
+            }
             Self::Referral(detail) => {
                 key = "config.referral";
                 owned.push(("detail".to_string(), detail.clone()));
@@ -273,6 +277,12 @@ pub struct Config {
     pub locale: (crate::i18n::Locale, crate::i18n::Source),
     /// Translation file, when one is configured.
     pub locale_file: Option<PathBuf>,
+    /// This node's id, written into the change sequence number of every change it makes.
+    ///
+    /// Zero means "this node does not replicate": two nodes with the same id produce changes that
+    /// cannot be told apart, and the order between them cannot be recovered afterwards. So zero is
+    /// allowed only while the server has no peers.
+    pub server_id: u16,
     /// Subtrees held elsewhere, and where a client is sent for them.
     ///
     /// Empty means the server answers `noSuchObject` for anything outside its own tree, which is
@@ -306,6 +316,8 @@ pub enum ConfigError {
         #[source]
         source: humantime::DurationError,
     },
+    #[error("invalid server id: {0}")]
+    ServerId(String),
     #[error("invalid referrals: {0}")]
     Referral(String),
     #[error("use_tls is enabled, but server_cert and server_key are not both set")]
@@ -377,6 +389,8 @@ struct FileConfig {
     /// Subtrees held elsewhere: `- dn: dc=remote,dc=com` with the URL a client should ask.
     #[serde(default)]
     referrals: Vec<ReferralConfig>,
+    /// See [`Config::server_id`].
+    server_id: Option<u16>,
     #[serde(default)]
     observability: ObservabilityConfig,
     /// Language for operator-facing diagnostics: `ru`, `en`. Empty means "ask the
@@ -769,6 +783,16 @@ pub fn resolve(
             file.indexes.resolve()?;
             file.indexes
         },
+        // A peer and this node must be distinguishable, or the history cannot be untangled: two
+        // changes from the same id at the same microsecond look like the same change, and the
+        // merge that follows is a coin toss dressed as an order. Checked at startup because the
+        // damage is permanent.
+        server_id: match file.server_id.unwrap_or(0) {
+            0 => 0,
+            value => crate::replication::ServerId::new(value)
+                .map(|id| id.value())
+                .map_err(|err| ConfigError::ServerId(err.to_string()))?,
+        },
         referrals,
         acl: crate::acl::from_config(file.access.as_deref())?,
         allow_unencrypted_bind: file.bind.allow_unencrypted_bind.is_on(),
@@ -992,6 +1016,30 @@ bootstrap:
             matches!(err, ConfigError::BootstrapPasswordMissing),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_server_id_is_read_from_the_file() {
+        let text = "base_dn: dc=example,dc=com\nserver_id: 4\n";
+        let cfg = resolve(Args::default(), Some(text), no_env).expect("config");
+        assert_eq!(cfg.server_id, 4);
+    }
+
+    #[test]
+    fn an_unconfigured_server_has_no_id() {
+        // Zero is not a missing value to be defaulted to one: it says "this node does not
+        // replicate", and a node that invented an id would collide with a peer's.
+        let cfg = resolve(Args::default(), None, no_env).expect("defaults");
+        assert_eq!(cfg.server_id, 0);
+    }
+
+    #[test]
+    fn a_server_id_out_of_range_fails_at_startup() {
+        // The CSN carries it in three digits. A value that cannot be written is refused here
+        // rather than truncated into somebody else's id later.
+        let text = "base_dn: dc=example,dc=com\nserver_id: 1000\n";
+        let err = resolve(Args::default(), Some(text), no_env).expect_err("must reject");
+        assert!(matches!(err, ConfigError::ServerId(_)), "{err}");
     }
 
     #[test]

@@ -64,6 +64,7 @@ async fn serve(
         schema_mode: rust_rest_ldap::schema::Mode::Off,
         schema_files: Vec::new(),
         indexes: Default::default(),
+        server_id: 0,
         referrals: rust_rest_ldap::referral::Referrals::new(
             referrals
                 .iter()

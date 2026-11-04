@@ -37,6 +37,7 @@ pub mod operational;
 pub mod password;
 pub mod referral;
 pub mod reload;
+pub mod replication;
 pub mod schema;
 pub mod security;
 pub mod server;

@@ -548,6 +548,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("warn.schema", "schema warning: {detail}"),
     // Configuration diagnostics, one per variant an operator can hit
+    ("config.server_id", "invalid server id: {detail}"),
     ("config.referral", "invalid referrals: {detail}"),
     (
         "config.tls_material",

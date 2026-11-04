@@ -76,6 +76,7 @@ async fn serve(entries: Vec<Entry>) -> String {
         schema_files: Vec::new(),
         indexes: Default::default(),
         referrals: Default::default(),
+        server_id: 0,
         acl: rust_rest_ldap::acl::from_config(Some(&[rust_rest_ldap::acl::AccessRuleConfig {
             subject: "anonymous".to_string(),
             base: None,
