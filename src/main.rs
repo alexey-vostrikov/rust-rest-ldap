@@ -6,8 +6,13 @@ use clap::Parser;
 use rust_rest_ldap::backend::Backend;
 use rust_rest_ldap::{cli, config, i18n, security::Security};
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Built here rather than through `#[tokio::main]`: the attribute cannot name the threads, and a
+    // thread called `tokio-rt-worker` in `ps -L` says nothing about which program it belongs to.
+    rust_rest_ldap::runtime::multi_thread().block_on(serve());
+}
+
+async fn serve() {
     let args: config::Args = cli::Cli::parse().into();
     let export = args.export_ldif.clone();
     let export_yaml = args.export_yaml.clone();
