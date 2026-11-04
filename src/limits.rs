@@ -27,8 +27,13 @@ use std::time::Duration;
 /// Absent means no limit, which is what every deployment had before this existed and is a
 /// deliberate default rather than an oversight: a limit chosen by a library would be a limit
 /// nobody measured, and refusing a legitimate bulk export is its own kind of outage.
+/// `deny_unknown_fields` is the point of this attribute, not decoration: the key this section
+/// documents is `time_limit`, and the field was called `time_limit_seconds`. An unknown key was
+/// silently ignored, so an operator who wrote the documented limit got no limit at all - and a
+/// search that should have been cut at one second ran for four minutes. A setting that is written
+/// and does nothing is worse than one that is rejected, because nothing tells the operator.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
     /// The most entries one search may return.
     ///
@@ -40,7 +45,13 @@ pub struct LimitsConfig {
     ///
     /// Zero means no limit. The clock covers the scan, not the writing: a search that has found
     /// its entries and is sending them is nearly done, and cutting it off mid-answer helps nobody.
-    pub time_limit_seconds: Option<u64>,
+    ///
+    /// The name is the documented one. `time_limit_seconds` is accepted as an alias because that
+    /// was the field's name in the code, and a configuration written against the source instead
+    /// of the example should keep working - but the example is what an operator reads, and it
+    /// says `time_limit`.
+    #[serde(alias = "time_limit_seconds")]
+    pub time_limit: Option<u64>,
 }
 
 /// The resolved policy.
@@ -56,7 +67,7 @@ impl Limits {
     pub fn from_config(config: &LimitsConfig) -> Self {
         Self {
             size_limit: config.size_limit,
-            time_limit: match config.time_limit_seconds {
+            time_limit: match config.time_limit {
                 // Zero is how a file says "no limit"; anything else is a real budget. A duration of
                 // zero would otherwise expire before the first entry and answer every search with
                 // a timeout, which is not what a forgotten key should mean.
@@ -101,7 +112,7 @@ mod tests {
     fn limits(size_limit: usize, time_limit_seconds: Option<u64>) -> Limits {
         Limits::from_config(&LimitsConfig {
             size_limit,
-            time_limit_seconds,
+            time_limit: time_limit_seconds,
         })
     }
 
