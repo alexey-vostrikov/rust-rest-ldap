@@ -394,20 +394,26 @@ impl Source {
             return Ok(None);
         }
 
-        // Only a replace keeps the ids of the other entries. An add or a delete shifts every id
-        // after it, and every posting list would have to move with them.
-        let mut replacements = Vec::with_capacity(changes.len());
+        // Every kind of change is applied here now, because an entry's id no longer depends on
+        // its position: an add takes a fresh id, a delete gives its own back to nobody, and the
+        // postings of the entries between them stay where they are. Positions still move, and
+        // the two maps that translate are rebuilt - that is bookkeeping in memory, against
+        // re-reading a store that is gigabytes on disk.
+        let mut upserts: Vec<&Entry> = Vec::new();
+        let mut deletes: Vec<&str> = Vec::new();
         for change in changes {
-            let EntryChange::Upsert { entry } = change else {
-                return Ok(None);
-            };
-            replacements.push(entry);
+            match change {
+                EntryChange::Upsert { entry } => upserts.push(entry),
+                EntryChange::Delete { dn, .. } => deletes.push(dn.as_str()),
+                // A backend may describe a change this path has never heard of; it reloads.
+                _ => return Ok(None),
+            }
         }
 
         // The check a reload would make, over the entries that changed. Every other entry was
         // checked when it was read; checking them again would make a write cost the directory
         // again, which is the whole cost this path exists to remove.
-        let changed: Vec<Entry> = replacements.iter().map(|entry| (*entry).clone()).collect();
+        let changed: Vec<Entry> = upserts.iter().map(|entry| (*entry).clone()).collect();
         for problem in check_entries_collect(&changed, &self.schema(), self.schema_mode)? {
             eprintln!("{}", crate::i18n::t("warn.schema", &[("detail", &problem)]));
         }
@@ -422,14 +428,10 @@ impl Source {
 
         let mut current = self.current.write().await;
 
-        // Every DN must already be there before anything is touched: an upsert of a new entry is
-        // an add, and an add moves the ids after it. Checking first is what lets the loop below
-        // be unconditional, so a refusal cannot leave the snapshot half written.
-        for entry in &replacements {
-            if current.position(entry.dn()).is_none() {
-                return Ok(None);
-            }
-        }
+        // A delete of something this snapshot still holds is a change to it; a delete of
+        // something it does not hold is a replica applying a change it has already applied, and
+        // there is nothing to do.
+        deletes.retain(|dn| current.position(dn).is_some());
 
         // Unique means no reader holds this snapshot, so patching it is invisible to everyone
         // else - there is nobody else. Shared means a search is running against it, and the copy
@@ -440,8 +442,19 @@ impl Source {
         }
         let directory: &mut Directory = Arc::get_mut(&mut current).expect("made unique above");
 
-        for entry in replacements {
-            directory.replace_entry_in_place(entry.clone(), &self.indexes)?;
+        // Deletions first: a change set that removes one entry and adds another under the same
+        // DN - an import replacing an entry - would otherwise add first and then delete what it
+        // had just written.
+        for dn in &deletes {
+            directory.remove_entry_in_place(dn, &self.indexes)?;
+        }
+
+        for entry in upserts {
+            // Replaced when the DN is here, added when it is not. The distinction is the
+            // directory's: it holds the map that answers it.
+            if !directory.replace_entry_in_place(entry.clone(), &self.indexes)? {
+                directory.insert_entry_in_place(entry.clone(), &self.indexes)?;
+            }
         }
 
         directory.set_snapshot(snapshot);
