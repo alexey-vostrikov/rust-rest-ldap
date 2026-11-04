@@ -31,6 +31,14 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// file beside the store: the file could be written and the store not, or the other way round,
 /// and a replica reading the journal would then replay a change that never was.
 const CHANGES: TableDefinition<&str, &[u8]> = TableDefinition::new("changes");
+
+/// The search index as it stood when the data did, so a start can read it instead of building it.
+///
+/// A separate table rather than a row in `meta`: the value is large, and it is derived data that
+/// may be dropped at any moment. Keeping it apart means `clear_index` cannot touch the format
+/// version or anything else the store needs to open.
+const INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("index");
+const INDEX_KEY: &str = "snapshot";
 const FORMAT_VERSION: &str = "1";
 const META_FORMAT: &str = "format";
 
@@ -693,6 +701,108 @@ impl RedbBackend {
         })?;
 
         Ok(doomed.len())
+    }
+
+    /// Stores the index snapshot, replacing any previous one.
+    ///
+    /// Written in its own transaction, after the data it describes: the snapshot names a
+    /// fingerprint of that data, so a start that reads it and finds the fingerprint unchanged
+    /// knows the two agree. Writing it in the same transaction as a change would be wrong for the
+    /// opposite reason - the snapshot is the state of an index over the whole directory, and a
+    /// single change does not update it in place.
+    pub fn save_index(&self, bytes: &[u8]) -> Result<(), BackendError> {
+        let mut transaction = self
+            .database
+            .begin_write()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        transaction
+            .set_durability(self.durability)
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        {
+            let mut table = transaction
+                .open_table(INDEX)
+                .map_err(|source| BackendError::Redb {
+                    path: "<index>".to_string(),
+                    reason: source.to_string(),
+                })?;
+            table
+                .insert(INDEX_KEY, bytes)
+                .map_err(|source| BackendError::Redb {
+                    path: "<index>".to_string(),
+                    reason: source.to_string(),
+                })?;
+        }
+        transaction.commit().map_err(|source| BackendError::Redb {
+            path: "<database>".to_string(),
+            reason: source.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// The stored snapshot, if there is one.
+    ///
+    /// `None` is ordinary and means "build the index": an empty store, a store written by an
+    /// older build, or one whose snapshot was cleared.
+    pub fn load_index(&self) -> Result<Option<Vec<u8>>, BackendError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+
+        let table = match transaction.open_table(INDEX) {
+            Ok(table) => table,
+            // The table does not exist until something is written into it.
+            Err(_) => return Ok(None),
+        };
+
+        let value = table.get(INDEX_KEY).map_err(|source| BackendError::Redb {
+            path: "<index>".to_string(),
+            reason: source.to_string(),
+        })?;
+
+        Ok(value.map(|value| value.value().to_vec()))
+    }
+
+    /// Forgets the snapshot.
+    ///
+    /// Called when the data changed in a way the snapshot cannot describe - an import, a bulk
+    /// write - so the next start does not trust a fingerprint that was never updated.
+    pub fn clear_index(&self) -> Result<(), BackendError> {
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        {
+            let mut table = transaction
+                .open_table(INDEX)
+                .map_err(|source| BackendError::Redb {
+                    path: "<index>".to_string(),
+                    reason: source.to_string(),
+                })?;
+            table
+                .remove(INDEX_KEY)
+                .map_err(|source| BackendError::Redb {
+                    path: "<index>".to_string(),
+                    reason: source.to_string(),
+                })?;
+        }
+        transaction.commit().map_err(|source| BackendError::Redb {
+            path: "<database>".to_string(),
+            reason: source.to_string(),
+        })?;
+        Ok(())
     }
 
     /// Number of stored entries; used by tests and logging.

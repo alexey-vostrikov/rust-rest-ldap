@@ -66,13 +66,57 @@ impl Source {
         backend: Backend,
     ) -> Result<(Arc<Self>, Arc<Directory>), BackendError> {
         let data = backend.load().await?;
-        let directory = data
-            .into_directory(
-                &config.base_dn,
-                &config.users_ou_name,
-                &config.groups_ou_name,
-            )
-            .with_indexes(&config.indexes)?;
+        let directory = data.into_directory(
+            &config.base_dn,
+            &config.users_ou_name,
+            &config.groups_ou_name,
+        );
+
+        // The index first: a start that can read it skips the work that, on three million
+        // entries, takes six minutes - and an operator who waits six minutes turns the index off,
+        // so this is what makes the index usable at all.
+        //
+        // Trust is placed in the fingerprint, not in the file being there. The snapshot names the
+        // data and the plan it was built from; anything else - a change since, a different
+        // `indexes:` section, a blob from another build - is a rebuild. A snapshot trusted by
+        // presence alone would narrow to a value that is no longer in the directory, which reads
+        // as a missing entry and cannot be diagnosed from the outside.
+        let fingerprint =
+            crate::index::data_fingerprint(directory.entries_in_order(), &config.indexes);
+        let reused = backend
+            .load_index()?
+            .and_then(|bytes| crate::index::Index::decode(&bytes, fingerprint));
+
+        let directory = match reused {
+            Some(index) => {
+                println!("{}", crate::i18n::t("start.index_reused", &[]));
+                directory.with_index(index)
+            }
+            None => {
+                let started = std::time::Instant::now();
+                let directory = directory.with_indexes(&config.indexes)?;
+                println!(
+                    "{}",
+                    crate::i18n::t(
+                        "start.index_built",
+                        &[("seconds", &started.elapsed().as_secs().to_string())]
+                    )
+                );
+
+                // Kept for the next start. A failure to write is reported and not fatal: the
+                // index works either way, and refusing to serve because a cache could not be
+                // saved would be the wrong trade.
+                let bytes = directory.index().encode(fingerprint);
+                if let Err(err) = backend.save_index(&bytes) {
+                    eprintln!(
+                        "{}",
+                        crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])
+                    );
+                }
+
+                directory
+            }
+        };
         // The journal head travels with the first snapshot for the same reason it does on every
         // reload: a synchronised search hands it to the client, and a missing head would make a
         // resumed refresh send the whole directory again.

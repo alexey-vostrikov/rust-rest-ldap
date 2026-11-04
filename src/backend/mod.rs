@@ -231,6 +231,36 @@ impl Backend {
         }
     }
 
+    /// The stored search index, if this backend keeps one.
+    ///
+    /// `None` for every backend that does not, and for a store that has never written one: the
+    /// caller builds the index, which is always correct.
+    pub fn load_index(&self) -> Result<Option<Vec<u8>>, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.load_index(),
+            _ => Ok(None),
+        }
+    }
+
+    /// Stores the search index, for a backend that can keep it.
+    ///
+    /// A backend that cannot is not an error: the index is derived, and building it is what every
+    /// backend did before this existed.
+    pub fn save_index(&self, bytes: &[u8]) -> Result<(), BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.save_index(bytes),
+            _ => Ok(()),
+        }
+    }
+
+    /// Forgets the stored index after a change it cannot describe.
+    pub fn clear_index(&self) -> Result<(), BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.clear_index(),
+            _ => Ok(()),
+        }
+    }
+
     /// The oldest journal CSN still remembered; a resume older than this has lost changes.
     pub fn journal_floor(&self) -> Result<Option<String>, BackendError> {
         match self {
