@@ -300,6 +300,69 @@ pub fn request(
 /// anything. A storm is bounded by the number of peers, which is small.
 pub const RETRY: Duration = Duration::from_secs(5);
 
+/// Where a conflict goes: a counter for alerting, and a file for resolving.
+///
+/// Both, because they answer different questions. The counter says "this node has disagreed with
+/// a peer, go and look"; the file says which entry, against which change, and keeps saying it
+/// after a restart. A conflict that only reached standard error is a conflict nobody can act on a
+/// week later.
+#[derive(Clone)]
+pub struct Reporter {
+    metrics: std::sync::Arc<crate::metrics::Metrics>,
+    journal: std::sync::Arc<crate::metrics::Journal>,
+}
+
+impl Reporter {
+    pub fn new(
+        metrics: std::sync::Arc<crate::metrics::Metrics>,
+        journal: std::sync::Arc<crate::metrics::Journal>,
+    ) -> Self {
+        Self { metrics, journal }
+    }
+
+    /// A reporter that counts and records nowhere: for a node with no peers, and for tests.
+    pub fn silent() -> Self {
+        Self {
+            metrics: crate::metrics::Metrics::new(),
+            journal: std::sync::Arc::new(crate::metrics::Journal::off()),
+        }
+    }
+
+    fn conflict(
+        &self,
+        peer: &Peer,
+        dn: &str,
+        local: Option<&str>,
+        incoming: Option<&str>,
+        why: &str,
+    ) {
+        let line = serde_json::json!({
+            "time": crate::operational::generalized_time(std::time::SystemTime::now()),
+            "peer": peer.url,
+            "dn": dn,
+            "local_csn": local,
+            "incoming_csn": incoming,
+            "reason": why,
+        })
+        .to_string();
+
+        self.metrics.record_conflict();
+
+        // A journal that cannot be written must not stop replication: a full disk would then take
+        // the replica down for a reason that has nothing to do with the replica. The counter has
+        // moved either way, and standard error says why.
+        if let Err(err) = self.journal.record_line(&line) {
+            eprintln!(
+                "{}",
+                crate::i18n::t(
+                    "error.conflict_log",
+                    &[("detail", &err.to_string()), ("dn", dn)]
+                )
+            );
+        }
+    }
+}
+
 /// Follows one peer for as long as this server runs.
 ///
 /// Reconnects after any failure, resuming from the last cookie seen, so a peer that restarts or a
@@ -314,6 +377,7 @@ pub async fn follow(
     source: std::sync::Arc<crate::reload::Source>,
     base_dn: String,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    reporter: Reporter,
 ) {
     let mut cookie: Option<Vec<u8>> = None;
 
@@ -322,7 +386,16 @@ pub async fn follow(
             return;
         }
 
-        match exchange(&peer, &source, &base_dn, &mut cookie, &mut shutdown).await {
+        match exchange(
+            &peer,
+            &source,
+            &base_dn,
+            &mut cookie,
+            &mut shutdown,
+            &reporter,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(err) => {
                 eprintln!(
@@ -370,6 +443,7 @@ async fn exchange(
     base_dn: &str,
     cookie: &mut Option<Vec<u8>>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    reporter: &Reporter,
 ) -> Result<(), String> {
     let client = crate::client::Client::connect(&peer.url, crate::client::Options::default())
         .await
@@ -406,7 +480,7 @@ async fn exchange(
     // The refresh itself is merged like any other change: a node that has been away needs what
     // happened while it was away, and the cookie only orders it - it does not replace it.
     for message in &refresh {
-        absorb(peer, source, message).await?;
+        absorb(peer, source, message, reporter).await?;
 
         // The connection's cookie moves forward with the answer, so a reconnect after a failure
         // in the middle of a refresh does not start from the beginning.
@@ -428,7 +502,7 @@ async fn exchange(
 
         match message {
             Some(message) => {
-                absorb(peer, source, &message).await?;
+                absorb(peer, source, &message, reporter).await?;
                 if let Some(next) = cookie_of(&message) {
                     *cookie = Some(next);
                 }
@@ -443,14 +517,26 @@ async fn absorb(
     peer: &Peer,
     source: &std::sync::Arc<crate::reload::Source>,
     message: &LdapMessage,
+    reporter: &Reporter,
 ) -> Result<(), String> {
-    let change = match pushed(message) {
-        Some(change) => change,
+    match pushed(message) {
+        Some(change) => apply(peer, source, &change, reporter).await.map(|_| ()),
         // Not an entry: `syncInfo`, the end of a refresh, or something this server has no
         // business turning into a write.
-        None => return Ok(()),
-    };
+        None => Ok(()),
+    }
+}
 
+/// Decides about one change and carries the decision out.
+///
+/// Separated from [`absorb`] so a conflict can be tested without a socket: the decision is what
+/// is worth pinning down, and it does not need a peer to be wrong at the other end.
+pub async fn apply(
+    peer: &Peer,
+    source: &std::sync::Arc<crate::reload::Source>,
+    change: &Pushed,
+    reporter: &Reporter,
+) -> Result<crate::replication::Decision, String> {
     // A peer that says which node it is, when the operator expected another id, is a node
     // replicating under somebody else's name - and every change it sends would be misordered.
     if let (Some(expected), Some(csn)) = (peer.server_id, change.csn.as_deref())
@@ -468,41 +554,52 @@ async fn absorb(
     }
 
     let directory = source.directory().await;
-    let local = match directory.find(&change.dn) {
-        Some(entry) => crate::replication::Local::Present {
-            csn: entry
+    let (local, local_csn) = match directory.find(&change.dn) {
+        Some(entry) => {
+            let csn = entry
                 .attributes()
                 .get(crate::operational::ATTR_ENTRY_CSN)
                 .and_then(|attribute| attribute.values.first())
-                .cloned(),
-            uuid: entry
-                .attributes()
-                .get(crate::model::ATTR_ENTRY_UUID)
-                .and_then(|attribute| attribute.values.first())
-                .cloned(),
-        },
+                .cloned();
+            (
+                crate::replication::Local::Present {
+                    csn: csn.clone(),
+                    uuid: entry
+                        .attributes()
+                        .get(crate::model::ATTR_ENTRY_UUID)
+                        .and_then(|attribute| attribute.values.first())
+                        .cloned(),
+                },
+                csn,
+            )
+        }
         None => match source
             .tombstone(&change.dn)
             .map_err(|err| err.to_string())?
         {
-            Some(csn) => crate::replication::Local::Tombstone { csn },
-            None => crate::replication::Local::Absent,
+            Some(csn) => (
+                crate::replication::Local::Tombstone { csn: csn.clone() },
+                Some(csn),
+            ),
+            None => (crate::replication::Local::Absent, None),
         },
     };
 
     let incoming = crate::replication::Incoming {
-        csn: change.csn.clone().unwrap_or_default(),
+        csn: change.csn.clone(),
         kind: change.kind,
         uuid: change.uuid.clone(),
     };
 
     let decision = crate::replication::merge(&local, &incoming);
 
-    match decision {
+    match &decision {
         crate::replication::Decision::Apply { .. } => {
-            let entry_change = match change.entry {
-                Some(entry) => crate::backend::EntryChange::Upsert { entry },
-                None => crate::backend::EntryChange::delete(change.dn, None),
+            let entry_change = match &change.entry {
+                Some(entry) => crate::backend::EntryChange::Upsert {
+                    entry: entry.clone(),
+                },
+                None => crate::backend::EntryChange::delete(change.dn.clone(), None),
             };
 
             source
@@ -512,8 +609,9 @@ async fn absorb(
         }
         crate::replication::Decision::Ignore { .. } => {}
         crate::replication::Decision::Conflict { why } => {
-            // Named, not swallowed: a conflict is the one outcome an operator has to see, because
-            // a directory that diverges quietly is discovered by its effects.
+            // Named, counted and written down. This is the one outcome that says a record may
+            // exist on one node and not the other, so it is not allowed to be a line in a stream
+            // that a restart erases.
             eprintln!(
                 "{}",
                 crate::i18n::t(
@@ -521,10 +619,17 @@ async fn absorb(
                     &[("url", &peer.url), ("dn", &change.dn), ("why", why)]
                 )
             );
+            reporter.conflict(
+                peer,
+                &change.dn,
+                local_csn.as_deref(),
+                change.csn.as_deref(),
+                why,
+            );
         }
     }
 
-    Ok(())
+    Ok(decision)
 }
 
 /// The cookie a message carries, if it carries one.
@@ -701,6 +806,172 @@ mod tests {
             change.csn.is_some(),
             "a deletion has nothing but its CSN to be ordered by"
         );
+    }
+
+    /// A source over a temporary redb store, seeded with one entry.
+    async fn source_with(
+        entry: Entry,
+    ) -> (std::sync::Arc<crate::reload::Source>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dir.redb");
+        let backend = crate::backend::Backend::from_config(
+            "redb",
+            Some(&serde_json::json!({"path": path.display().to_string()})),
+        )
+        .expect("backend");
+
+        backend
+            .apply(&[crate::backend::EntryChange::Upsert { entry }])
+            .await
+            .expect("seed");
+
+        let config = crate::config::Config {
+            backend: "redb".to_string(),
+            base_dn: "dc=example,dc=com".to_string(),
+            listen_addr: "127.0.0.1:0".to_string(),
+            update_interval: std::time::Duration::from_secs(3600),
+            log_path: None,
+            debug: false,
+            log_timestamp: false,
+            log_caller: false,
+            backends: Default::default(),
+            respect_control_criticality: true,
+            users_ou_name: "users".to_string(),
+            groups_ou_name: "groups".to_string(),
+            use_tls: false,
+            server_cert: None,
+            server_key: None,
+            http_listen_addr: None,
+            callback_auth_token: None,
+            passwords: Default::default(),
+            schema: crate::schema::Schema::core(),
+            schema_mode: crate::schema::Mode::Off,
+            schema_files: Vec::new(),
+            indexes: Default::default(),
+            referrals: Default::default(),
+            server_id: 2,
+            peers: Vec::new(),
+            journal_keep: None,
+            conflict_log: None,
+            acl: Default::default(),
+            allow_unencrypted_bind: true,
+            dangerous_settings: Vec::new(),
+            integrity: Default::default(),
+            observability: Default::default(),
+            bootstrap: None,
+            locale: (crate::i18n::Locale::english(), crate::i18n::Source::Default),
+            locale_file: None,
+            document: None,
+        };
+
+        let (source, _) = crate::reload::Source::load(&config, backend)
+            .await
+            .expect("source");
+        (source, dir)
+    }
+
+    #[tokio::test]
+    async fn a_disagreement_about_identity_is_recorded_where_an_operator_can_find_it() {
+        // Two nodes created this DN independently, so they hold different records that happen to
+        // share a name. The newer timestamp is not the answer, and the local version is kept -
+        // which means the peer's record exists nowhere. That is why the conflict has to outlive
+        // the connection: a line on standard error is gone after a restart, and the operator
+        // learns about the missing record from its absence instead.
+        let local = crate::model::Entry::new(
+            "cn=clash,ou=users,dc=example,dc=com",
+            crate::model::Attributes::new()
+                .push(crate::model::Attribute::new(
+                    "objectClass",
+                    vec!["top".to_string(), "person".to_string()],
+                ))
+                .push(crate::model::Attribute::single("cn", "clash"))
+                .push(
+                    crate::model::Attribute::single(
+                        "entryUUID",
+                        "11111111-1111-1111-1111-111111111111",
+                    )
+                    .operational(),
+                )
+                .push(
+                    crate::model::Attribute::single(
+                        "entryCSN",
+                        "20260101000000.000001Z#000001#002#000000",
+                    )
+                    .operational(),
+                ),
+        );
+
+        let (source, dir) = source_with(local).await;
+        let log_path = dir.path().join("conflicts.jsonl");
+        let journal = crate::metrics::Journal::file(&log_path).expect("journal");
+        let metrics = crate::metrics::Metrics::new();
+        let reporter = Reporter::new(
+            std::sync::Arc::clone(&metrics),
+            std::sync::Arc::new(journal),
+        );
+
+        let incoming = Pushed {
+            dn: "cn=clash,ou=users,dc=example,dc=com".to_string(),
+            kind: ChangeKind::Add,
+            csn: Some("20260101000000.000009Z#000001#001#000000".to_string()),
+            uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
+            entry: None,
+        };
+
+        let decision = apply(&peer_of("ldap://node1:389"), &source, &incoming, &reporter)
+            .await
+            .expect("apply");
+
+        assert!(
+            matches!(decision, crate::replication::Decision::Conflict { .. }),
+            "expected a conflict, got {decision:?}"
+        );
+        assert_eq!(metrics.conflicts(), 1, "the counter an operator alerts on");
+
+        let written = std::fs::read_to_string(&log_path).expect("conflict log");
+        let line: serde_json::Value =
+            serde_json::from_str(written.trim()).expect("one json object per line");
+
+        assert_eq!(line["dn"], "cn=clash,ou=users,dc=example,dc=com");
+        assert_eq!(line["peer"], "ldap://node1:389");
+        assert_eq!(
+            line["local_csn"], "20260101000000.000001Z#000001#002#000000",
+            "both sides, so the operator can tell which record was kept"
+        );
+        assert_eq!(
+            line["incoming_csn"],
+            "20260101000000.000009Z#000001#001#000000"
+        );
+        assert!(
+            line["reason"]
+                .as_str()
+                .is_some_and(|why| why.contains("independently")),
+            "and why the timestamp was not the answer"
+        );
+
+        // The local version survived: a conflict keeps what is here, it does not delete it.
+        let directory = source.directory().await;
+        let entry = directory
+            .find("cn=clash,ou=users,dc=example,dc=com")
+            .expect("still here");
+        assert_eq!(
+            entry
+                .attributes()
+                .get("entryUUID")
+                .and_then(|attribute| attribute.values.first())
+                .map(String::as_str),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+    }
+
+    /// A peer, as the configuration would produce one.
+    fn peer_of(url: &str) -> Peer {
+        Peer {
+            url: url.to_string(),
+            server_id: Some(1),
+            bind_dn: None,
+            password: None,
+        }
     }
 
     fn set_state(message: &mut LdapMessage, state: crate::ldap::sync::State) {

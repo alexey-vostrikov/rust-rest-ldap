@@ -85,9 +85,16 @@ indexes:
 # deletion is remembered. Omit it and nothing is pruned - the honest default for a node whose
 # peers may be down for a long time, and a slow leak for one nobody reads. Zero is refused:
 # it would discard the only record that a deletion ever happened.
+#
+# `conflict_log` is where a disagreement with a peer is written down, one JSON object per line:
+# the DN, both change numbers and the reason the timestamp was not the answer. Without it a
+# conflict is printed to standard error and forgotten, and after a restart there is no record
+# that an entry was ever kept at the expense of another. The metric
+# `ldap_replication_conflicts_total` counts them either way, so it can be alerted on.
 #server_id: 1
 #replication:
 #  journal_keep: 100000
+#  conflict_log: /var/log/rust-rest-ldap/conflicts.jsonl
 #peers:
 #  - url: ldap://node2.example.com:389
 #    server_id: 2                     # checked at the first exchange: two nodes must not share one

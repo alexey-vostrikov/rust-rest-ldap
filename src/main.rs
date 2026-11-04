@@ -603,6 +603,23 @@ async fn main() {
     // One task per peer, each holding its own persistent connection. Spawned before the listener
     // accepts anything, so a change made here in the first moment of serving is not missed by a
     // peer that was already listening.
+    let reporter = rust_rest_ldap::peers::Reporter::new(
+        Arc::clone(&metrics),
+        match &config.conflict_log {
+            Some(path) => match rust_rest_ldap::metrics::Journal::file(path) {
+                Ok(journal) => Arc::new(journal),
+                Err(err) => fatal(&i18n::t(
+                    "error.conflict_log",
+                    &[
+                        ("dn", &path.display().to_string()),
+                        ("detail", &err.to_string()),
+                    ],
+                )),
+            },
+            None => Arc::new(rust_rest_ldap::metrics::Journal::off()),
+        },
+    );
+
     let peer_tasks: Vec<tokio::task::JoinHandle<()>> = config
         .peers
         .iter()
@@ -612,6 +629,7 @@ async fn main() {
                 Arc::clone(&source),
                 config.base_dn.clone(),
                 shutdown_tx.subscribe(),
+                reporter.clone(),
             ))
         })
         .collect();

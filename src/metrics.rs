@@ -90,6 +90,12 @@ pub struct Metrics {
     reload_failures: AtomicU64,
     binds_failed: AtomicU64,
     writes_total: AtomicU64,
+    /// Entries a peer and this node disagreed about in a way a timestamp cannot settle.
+    ///
+    /// A conflict is not an error and not a dropped change: one version was kept. It is also
+    /// the only event in the whole server that says a record may be missing on one node, so it
+    /// is counted rather than only logged - an operator needs to be able to alert on "non-zero".
+    conflicts_total: AtomicU64,
     /// Sum of entries returned by searches, for an average page size.
     entries_returned: AtomicU64,
     /// Sum of microseconds spent serving searches.
@@ -112,6 +118,16 @@ impl Metrics {
     /// The result code decides success rather than the caller: a search that returned
     /// `sizeLimitExceeded` is a request that happened, and a bind that failed is the one
     /// operators actually watch.
+    /// Records one unresolved disagreement with a peer.
+    pub fn record_conflict(&self) {
+        self.conflicts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many conflicts have been seen.
+    pub fn conflicts(&self) -> u64 {
+        self.conflicts_total.load(Ordering::Relaxed)
+    }
+
     pub fn record(&self, operation: Operation, succeeded: bool) {
         self.requests[operation.index()].fetch_add(1, Ordering::Relaxed);
         if !succeeded {
@@ -282,6 +298,16 @@ impl Metrics {
             "ldap_writes_total {}\n",
             self.writes_total.load(Ordering::Relaxed)
         );
+
+        out.push_str(
+            "# HELP ldap_replication_conflicts_total Entries a peer and this node disagreed about \
+             in a way a timestamp cannot settle.\n",
+        );
+        out.push_str("# TYPE ldap_replication_conflicts_total counter\n");
+        out.push_str(&format!(
+            "ldap_replication_conflicts_total {}\n",
+            self.conflicts_total.load(Ordering::Relaxed)
+        ));
 
         out.push_str("# HELP ldap_reloads_total Successful directory reloads.\n");
         out.push_str("# TYPE ldap_reloads_total counter\n");
@@ -594,8 +620,14 @@ impl Journal {
     /// full disk must not make the directory refuse writes, because then the directory is
     /// down for a reason that has nothing to do with the directory.
     pub fn record(&self, change: &Change) -> std::io::Result<()> {
-        let line = change.to_json();
+        self.record_line(&change.to_json())
+    }
 
+    /// Appends one already-serialised line.
+    ///
+    /// Here so a second journal - the replication conflicts - writes through the same sink,
+    /// the same rotation and the same rule that a full disk must not fail the operation.
+    pub fn record_line(&self, line: &str) -> std::io::Result<()> {
         match &self.sink {
             Sink::Off => Ok(()),
             Sink::Stdout => {
@@ -606,7 +638,7 @@ impl Journal {
                 Ok(())
             }
             Sink::File(file) => {
-                file.write(&line)?;
+                file.write(line)?;
                 self.written.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -631,6 +663,29 @@ impl std::fmt::Debug for Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conflict_is_counted_and_rendered() {
+        // The counter exists so "has this node ever disagreed with a peer" is answerable without
+        // reading a log file on every host. A counter that is not rendered answers nothing.
+        let metrics = Metrics::new();
+        assert!(
+            metrics
+                .render()
+                .contains("ldap_replication_conflicts_total 0"),
+            "the series is present before anything happens, so a graph does not start at nothing"
+        );
+
+        metrics.record_conflict();
+        metrics.record_conflict();
+
+        assert_eq!(metrics.conflicts(), 2);
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("ldap_replication_conflicts_total 2"),
+            "{rendered}"
+        );
+    }
 
     #[test]
     fn a_request_and_its_failure_are_counted() {
