@@ -93,6 +93,38 @@ pub fn unescape(value: &str) -> String {
 }
 
 /// Value of the first RDN, e.g. `dc=example,dc=com` gives `example`.
+/// Escapes a value that is about to become one RDN's value, per RFC 4514 §2.4.
+///
+/// Needed wherever a value comes from outside the server - a Kerberos principal, a name from a
+/// REST service - and is composed into a DN. Without it, a principal whose name contains a comma
+/// produces a DN that means something else, and the entry it points at is somebody else's.
+pub fn escape_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+
+    for (index, character) in value.chars().enumerate() {
+        let last = index + 1 == value.chars().count();
+
+        match character {
+            // RFC 4514 §2.4: the ones that end or split an RDN, plus the escape character.
+            // '=' is not among them - a reader splits at the *first* one, so it is safe inside a
+            // value, and escaping it only makes the DN harder to read in a log.
+            ',' | '+' | '"' | '\\' | '<' | '>' | ';' => {
+                out.push('\\');
+                out.push(character);
+            }
+            // A NUL cannot appear in a DN at all and is hex-escaped, per the same section.
+            '\0' => out.push_str("\\00"),
+            // A leading '#' would read as a hex-encoded value, and leading or trailing spaces are
+            // not part of the value unless escaped.
+            '#' if index == 0 => out.push_str("\\#"),
+            ' ' if index == 0 || last => out.push_str("\\ "),
+            _ => out.push(character),
+        }
+    }
+
+    out
+}
+
 pub fn first_value(entry: &str) -> Option<String> {
     let (_, value, _) = split_first_rdn(entry);
     if value.is_empty() { None } else { Some(value) }
@@ -153,6 +185,27 @@ pub fn is_valid(entry: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_value_that_would_split_the_rdn_is_escaped() {
+        assert_eq!(escape_value("alice"), "alice");
+        assert_eq!(escape_value("a,b"), "a\\,b");
+        assert_eq!(escape_value("a+b"), "a\\+b");
+        assert_eq!(escape_value("a\\b"), "a\\\\b");
+        assert_eq!(escape_value("#hex"), "\\#hex");
+        assert_eq!(escape_value(" lead"), "\\ lead");
+        assert_eq!(escape_value("trail "), "trail\\ ");
+        // A '#' anywhere else is an ordinary character.
+        assert_eq!(escape_value("a#b"), "a#b");
+
+        // What matters is that a DN built from the escaped value parses back to one RDN with the
+        // value it started as: `split_first_rdn` splits and keeps the escapes, `unescape` takes
+        // them off.
+        let (name, value, parent) = split_first_rdn("cn=a\\,b,ou=users");
+        assert_eq!(name, "cn");
+        assert_eq!(unescape(&value), "a,b");
+        assert_eq!(parent, "ou=users");
+    }
 
     #[test]
     fn an_escaped_comma_does_not_end_the_rdn() {

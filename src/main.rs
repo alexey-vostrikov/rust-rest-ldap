@@ -421,7 +421,24 @@ async fn main() {
     };
     // The same schema handle the source holds: a reload through the source has to reach
     // the write path, and a copy would make the two disagree after the first reload.
+    // Read once, here: a keytab is a secret that belongs to root and to the service account, and
+    // a failure to load it is a startup failure rather than a bind that mysteriously refuses.
+    let gssapi = match rust_rest_ldap::sasl::Gssapi::load(&config.sasl, &config.base_dn) {
+        Ok(gssapi) => gssapi.map(Arc::new),
+        Err(err) => fatal(&i18n::t("error.sasl", &[("detail", &err.to_string())])),
+    };
+    if let Some(gssapi) = &gssapi {
+        println!(
+            "{}",
+            i18n::t(
+                "start.gssapi",
+                &[("realms", &gssapi.realms().collect::<Vec<_>>().join(", "))]
+            )
+        );
+    }
+
     let security = Security::from_config(&config)
+        .with_gssapi(gssapi)
         .with_schema(source.shared_schema())
         // The file backend stores a fixed user/group document and refuses a whole entry, so an
         // upgrade it cannot keep was attempted on every bind. Decided once, here.

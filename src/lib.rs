@@ -39,6 +39,7 @@ pub mod peers;
 pub mod referral;
 pub mod reload;
 pub mod replication;
+pub mod sasl;
 pub mod schema;
 pub mod security;
 pub mod server;

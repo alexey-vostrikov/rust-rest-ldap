@@ -102,6 +102,10 @@ impl ConfigError {
                 key = "config.journal_keep";
                 owned.push(("detail".to_string(), detail.clone()));
             }
+            Self::Sasl(detail) => {
+                key = "config.sasl";
+                owned.push(("detail".to_string(), detail.clone()));
+            }
             Self::Peers(detail) => {
                 key = "config.peers";
                 owned.push(("detail".to_string(), detail.clone()));
@@ -300,6 +304,12 @@ pub struct Config {
     pub journal_keep: Option<usize>,
     /// Where conflicts with peers are recorded; `None` keeps them only on standard error.
     pub conflict_log: Option<PathBuf>,
+    /// The `sasl:` section as written, with its realms already checked against the base.
+    ///
+    /// The keytab is not read here: a configuration is a value that can be compared, printed and
+    /// copied, and key material is none of those things. `main` loads it once through
+    /// [`crate::sasl::Gssapi::load`] and hands the acceptor to `Security`.
+    pub sasl: crate::sasl::SaslConfig,
     /// Subtrees held elsewhere, and where a client is sent for them.
     ///
     /// Empty means the server answers `noSuchObject` for anything outside its own tree, which is
@@ -337,6 +347,8 @@ pub enum ConfigError {
     ServerId(String),
     #[error("invalid peers: {0}")]
     Peers(String),
+    #[error("invalid sasl: {0}")]
+    Sasl(String),
     #[error("invalid journal_keep: {0}")]
     JournalKeep(String),
     #[error("invalid referrals: {0}")]
@@ -418,6 +430,9 @@ struct FileConfig {
     /// How far behind a peer may fall.
     #[serde(default)]
     replication: ReplicationConfig,
+    /// SASL, when this server proves identity by ticket rather than by password.
+    #[serde(default)]
+    sasl: crate::sasl::SaslConfig,
     #[serde(default)]
     observability: ObservabilityConfig,
     /// Language for operator-facing diagnostics: `ru`, `en`. Empty means "ask the
@@ -733,12 +748,17 @@ pub fn resolve(
     )
     .map_err(|err| ConfigError::Referral(err.to_string()))?;
 
+    // Resolved once, because the SASL realm table is checked against it: a template that points
+    // outside the naming context has to be caught at startup, and it needs the same base the
+    // server will serve.
+    let base_dn = super::dn::normalize(
+        &pick(args.base_dn, env(ENV_BASE_DN), file.base_dn)
+            .unwrap_or_else(|| DEFAULT_BASE_DN.to_string()),
+    );
+
     let config = Config {
         backend,
-        base_dn: super::dn::normalize(
-            &pick(args.base_dn, env(ENV_BASE_DN), file.base_dn)
-                .unwrap_or_else(|| DEFAULT_BASE_DN.to_string()),
-        ),
+        base_dn: base_dn.clone(),
         listen_addr: pick(args.listen_addr, env(ENV_LISTEN_ADDR), file.listen_addr)
             .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_string()),
         update_interval,
@@ -858,6 +878,11 @@ pub fn resolve(
             other => other,
         },
         conflict_log: file.replication.conflict_log.clone(),
+        sasl: {
+            crate::sasl::Gssapi::validate(&file.sasl, &base_dn)
+                .map_err(|err| ConfigError::Sasl(err.to_string()))?;
+            file.sasl
+        },
         referrals,
         acl: crate::acl::from_config(file.access.as_deref())?,
         allow_unencrypted_bind: file.bind.allow_unencrypted_bind.is_on(),
