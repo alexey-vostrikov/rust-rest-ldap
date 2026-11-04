@@ -451,7 +451,14 @@ pub enum ConfigError {
 }
 
 /// Subset of the configuration that lives in the YAML file.
+///
+/// `deny_unknown_fields` here is the same rule as in the sections: a key the server does not know
+/// is a typo or a setting from a future version, and accepting it silently means an operator
+/// writes a policy nobody applies. The version this was found in ignored a whole section whose
+/// only key was misspelled, and the search that should have been cut at one second ran for four
+/// minutes.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
     integrity: IntegrityConfig,
@@ -545,7 +552,7 @@ struct FileConfig {
 
 /// `schema:` section of the configuration file.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SchemaConfig {
     /// `strict` (default), `warn` or `off`.
     pub mode: Option<String>,
@@ -574,7 +581,7 @@ pub struct ReferralConfig {
 /// Nothing here is needed to serve a directory: it bounds how far behind a peer may fall before it
 /// is refused, which is a decision about storage, not about the protocol.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ReplicationConfig {
     /// How many change records to keep.
     ///
