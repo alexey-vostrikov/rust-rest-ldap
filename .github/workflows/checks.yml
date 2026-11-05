@@ -9,9 +9,20 @@ name: checks
 #   miri   - nightly only. Fourteen minutes on ten modules; too slow for a pull request and
 #            pointless to skip entirely.
 #
-# What is NOT here yet: fuzzing (make fuzz-all needs the tree-sitter grammars, which cannot be
-# downloaded on a runner without network) and mutation (six hours over the tree, and per-file
-# selection does not work - D16 in docs/plan.md).
+#   fuzz   - nightly only, six targets at a minute each.
+#
+# Fuzzing was recorded here as impossible: "make fuzz-all needs the tree-sitter grammars, which
+# cannot be downloaded on a runner without network". Both halves of that were wrong. The targets
+# link this crate and libfuzzer; what they need is clang and cargo-fuzz, and no grammar at all -
+# the grammars belong to the measurement tools (crapper, dryer, mutator), which parse Python-side.
+# And the reason nothing built was fuzz/Cargo.lock: written before the vendored kerberos crate, it
+# resolved rskrb5 from crates.io, whose pin on a pre-release pbkdf2 cannot coexist with the
+# released one this server hashes passwords with. The error named pbkdf2 and said nothing about
+# kerberos, which is how a wrong cause got written down for weeks.
+#
+# What is NOT here yet: mutation (six hours over the tree, and per-file selection does not work -
+# D16 in docs/plan.md). One of its blockers is gone: the tree-sitter grammars are now baked into
+# the metrics image, so it no longer needs a cache warmed by hand on one laptop.
 
 on:
   push:
@@ -110,3 +121,57 @@ jobs:
       # drifts. Modules with system calls are absent on purpose: Miri cannot run sockets or files.
       - name: miri
         run: make miri CARGO=cargo
+
+  fuzz:
+    # On the schedule only: six targets at a minute each plus a build is a quarter of an hour a
+    # pull request should not pay for, and a corpus that grew by a minute a week is enough to keep
+    # these parsers honest.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+          # The fuzz crate has its own lockfile and its own target directory; without listing it,
+          # the cache covers only the main workspace and every run rebuilds six sanitized targets.
+          workspaces: ". -> target, fuzz -> target"
+
+      # clang brings libFuzzer's sanitizer runtime, which cargo-fuzz drives. No tree-sitter, no
+      # grammar download: the target binaries are linked against this crate alone.
+      - name: fuzzer
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang
+          cargo install cargo-fuzz --locked
+
+      # The corpus is generated and not committed; what is committed is fuzz/seeds/<target>/*.bin,
+      # a handful of inputs that put the fuzzer inside the grammar instead of making it rediscover
+      # a parenthesis from random bytes. One minute per target, and a failure stops the job: a
+      # finding is more valuable than the remaining four targets' coverage.
+      - name: targets
+        run: |
+          set -eu
+          for target in codec filter ldif schema dn endpoint; do
+            echo "== $target"
+            mkdir -p "fuzz/corpus/$target" fuzz/artifacts
+            if [ -d "fuzz/seeds/$target" ] && [ -z "$(ls -A "fuzz/corpus/$target")" ]; then
+              cp "fuzz/seeds/$target"/*.bin "fuzz/corpus/$target/" 2>/dev/null || true
+            fi
+            cargo +nightly fuzz run "$target" "fuzz/corpus/$target" -- \
+              -max_total_time=60 -artifact_prefix="$PWD/fuzz/artifacts/"
+          done
+
+      # A crash without its input is a report nobody can reproduce: the corpus is gitignored, so
+      # the one file worth keeping has to leave the runner another way.
+      - name: crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

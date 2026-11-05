@@ -28,25 +28,22 @@ cargo_cache="${RR_LDAP_CARGO_CACHE:-$HOME/.cache/rrl/cargo}"
 rustup_cache="${RR_LDAP_RUSTUP_CACHE:-$HOME/.cache/rrl/rustup}"
 target_cache="${RR_LDAP_TARGET_CACHE:-$HOME/.cache/rrl/target}"
 
-# The tree-sitter grammars cannot be downloaded from here: behind this network the fetch times
-# out, which is what a six-hour "hang" turned out to be. crapper warms the cache on the host once;
-# without it crapper and mutator would sit on a socket, so their absence is a loud failure.
+# The tree-sitter grammars are baked into the metrics image, so a host cache is no longer required
+# - the image works with no network and no home directory. `TS_CACHE` stays as an override for the
+# case it was originally for: a host that warmed a newer language pack than the image pins.
 grammars="${TS_CACHE:-$HOME/.cache/tree-sitter-language-pack}"
-case "$tool" in
-  crapper|dryer|mutator)
-    [ -d "$grammars" ] || {
-      echo "нет кэша грамматик tree-sitter в '$grammars':" >&2
-      echo "запустите crapper на хосте один раз, он скачает их, и повторите" >&2
-      exit 1
-    }
-    ;;
-esac
+# A plain string, not an array: this script runs under `sh`, which is dash on Debian, and dash
+# has no arrays. The path is a cache directory under $HOME, so it has no spaces to split on.
+grammar_flag=
+if [ -d "$grammars" ]; then
+  grammar_flag="-v $grammars:/opt/cache/tree-sitter-language-pack:ro"
+fi
 
 mkdir -p "$cargo_cache" "$rustup_cache" "$target_cache" "$repo/.metrics"
 
 exec docker run --rm \
   -v "$repo:/w" \
-  -v "$grammars:/opt/cache/tree-sitter-language-pack:ro" \
+  $grammar_flag \
   -v "$cargo_cache:/cargo" \
   -v "$rustup_cache:/rustup" \
   -v "$target_cache:/target" \

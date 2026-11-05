@@ -33,11 +33,14 @@ cargo_cache="${RR_LDAP_CARGO_CACHE:-$HOME/.cache/rrl/cargo}"
 rustup_cache="${RR_LDAP_RUSTUP_CACHE:-$HOME/.cache/rrl/rustup}"
 target_cache="${RR_LDAP_TARGET_CACHE:-$HOME/.cache/rrl/target}"
 
+# The grammars are baked into the image; `TS_CACHE` overrides only for a host that warmed a newer
+# language pack than the image pins.
 grammars="${TS_CACHE:-$HOME/.cache/tree-sitter-language-pack}"
-[ -d "$grammars" ] || {
-  echo "нет кэша грамматик tree-sitter в '$grammars': запустите crapper на хосте один раз" >&2
-  exit 1
-}
+# A plain string, not an array: dash has no arrays, and the path has no spaces to split on.
+grammar_flag=
+if [ -d "$grammars" ]; then
+  grammar_flag="-v $grammars:/opt/cache/tree-sitter-language-pack:ro"
+fi
 
 if [ ! -f "$repo/target/coverage/lcov.info" ]; then
   echo "нет покрытия: соберите его (make metrics) — без него mutator запускает ноль мутантов" >&2
@@ -67,7 +70,7 @@ for name in "$@"; do
   # shellcheck disable=SC2086
   docker run --rm \
     -v "$repo:/w" \
-    -v "$grammars:/opt/cache/tree-sitter-language-pack:ro" \
+    $grammar_flag \
     -v "$cargo_cache:/cargo" \
     -v "$rustup_cache:/rustup" \
     -v "$target_cache:/target" \

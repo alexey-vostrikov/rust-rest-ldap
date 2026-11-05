@@ -21,4 +21,3 @@ ldappasswd
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/target
-/fuzz/Cargo.lock

@@ -59,8 +59,13 @@ test = false
 doc = false
 bench = false
 
-# The same patch the crate itself applies. Without it the fuzz build resolves `rasn-ldap` from
+# The same patches the crate itself applies, and they have to be repeated here because a patch
+# applies to one workspace only. Without the first, the fuzz build resolves `rasn-ldap` from
 # crates.io, which does not have the assertion-failed result code this project added to its
-# vendored copy - and the fuzzer fails to compile against a library the server never uses.
+# vendored copy. Without the second it resolves `rskrb5` from crates.io, whose pin on the
+# *release candidate* of `pbkdf2` cannot coexist with the released 0.13.0 the server hashes
+# passwords with - which is why the fuzzer would not build at all after the SASL work, with an
+# error about picking a version for `pbkdf2` rather than anything naming kerberos.
 [patch.crates-io]
 rasn-ldap = { path = "../vendor/rasn-ldap" }
+rskrb5 = { path = "../vendor/rskrb5" }
