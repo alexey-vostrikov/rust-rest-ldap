@@ -22,6 +22,25 @@ use crate::index::IndexConfig;
 use crate::model::Entry;
 use crate::schema::{Mode as SchemaMode, Schema};
 
+/// A sink that counts what passes through it, so a streamed snapshot still reports its size.
+struct CountingWriter<'a> {
+    inner: &'a mut dyn std::io::Write,
+    written: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl std::io::Write for CountingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.written
+            .fetch_add(written, std::sync::atomic::Ordering::Relaxed);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// What the stored index snapshot is, as the process knows it: its counter and its size.
 ///
 /// Both are written on the same three occasions - a snapshot read, built, or rewritten - and read
@@ -187,19 +206,31 @@ impl Source {
                 // Kept for the next start. A failure to write is reported and not fatal: the
                 // index works either way, and refusing to serve because a cache could not be
                 // saved would be the wrong trade.
-                let bytes = directory.index().encode(
-                    fingerprint,
-                    &directory.numbering(),
-                    directory.next_id(),
-                );
-                match backend.save_index(&bytes, sequence) {
-                    Ok(()) => known.remember(sequence, bytes.len()),
+                //
+                // Streamed, not encoded into a `Vec`: the postings are already in memory, and a
+                // second copy of them is what made a three-million-entry start swap - 7.1 GB of
+                // swap, 82 GB read off the disk, the port closed for sixteen minutes.
+                let numbering = directory.numbering();
+                let next_id = directory.next_id();
+                let index = directory.index();
+                let produced = std::sync::atomic::AtomicUsize::new(0);
+                let mut produce = |out: &mut dyn std::io::Write| {
+                    let mut counted = CountingWriter {
+                        inner: out,
+                        written: &produced,
+                    };
+                    index.encode_into(&mut counted, fingerprint, &numbering, next_id)
+                };
+                match backend.save_index_streaming(sequence, &mut produce) {
+                    Ok(()) => known.remember(
+                        sequence,
+                        produced.load(std::sync::atomic::Ordering::Relaxed),
+                    ),
                     Err(err) => eprintln!(
                         "{}",
                         crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])
                     ),
                 }
-
                 directory
             }
         };
@@ -676,13 +707,25 @@ impl Source {
 
                     let fingerprint =
                         crate::index::data_fingerprint(directory.entries_in_order(), &indexes);
-                    let bytes = directory.index().encode(
-                        fingerprint,
-                        &directory.numbering(),
-                        directory.next_id(),
-                    );
-                    let written = bytes.len();
-                    backend.save_index(&bytes, sequence)?;
+                    // The same streaming as at start, for the same reason: this runs while the
+                    // server is serving, and a 2.16 GB allocation here would be felt by every
+                    // search in flight.
+                    let numbering = directory.numbering();
+                    let next_id = directory.next_id();
+                    let index = directory.index();
+                    let produced = std::sync::atomic::AtomicUsize::new(0);
+                    {
+                        let produced = &produced;
+                        let mut produce = |out: &mut dyn std::io::Write| {
+                            let mut counted = CountingWriter {
+                                inner: out,
+                                written: produced,
+                            };
+                            index.encode_into(&mut counted, fingerprint, &numbering, next_id)
+                        };
+                        backend.save_index_streaming(sequence, &mut produce)?;
+                    }
+                    let written = produced.load(std::sync::atomic::Ordering::Relaxed);
                     known.remember(sequence, written);
 
                     Ok((written, recorded))

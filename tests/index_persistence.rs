@@ -333,3 +333,124 @@ async fn wait_for_snapshot_change(path: &std::path::Path, built: &[u8]) -> bool 
     }
     false
 }
+
+/// The snapshot is a file beside the store, not a row in it.
+///
+/// It was a row once, and writing 2.16 GB of postings as one redb value is what made a
+/// three-million-entry start sit in `D` for a quarter of an hour. The file is the fix, so the file
+/// is what this checks - and the store must still name it, or a start would trust bytes whose
+/// extent is a guess.
+#[tokio::test]
+async fn the_snapshot_is_a_file_beside_the_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+
+    drop(load(&path).await);
+
+    let snapshot = dir.path().join("d.redb.index");
+    assert!(
+        snapshot.exists(),
+        "the snapshot is written next to the store, under the store's own name"
+    );
+    assert!(
+        std::fs::metadata(&snapshot).expect("metadata").len() > 0,
+        "and it holds the postings, not an empty file"
+    );
+
+    // No temporary left behind: a crash may leave one, but a clean run must not.
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("read_dir")
+        .filter_map(|item| item.ok())
+        .map(|item| item.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+}
+
+/// A snapshot file with no counter in the store is ignored, not trusted.
+///
+/// The two are written in that order - file, then counter - so a crash between them leaves exactly
+/// this state. Trusting the file would mean replaying deltas onto a snapshot whose extent nobody
+/// recorded, which is an index that answers about entries it never had.
+#[tokio::test]
+async fn a_snapshot_file_without_a_counter_is_not_trusted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+    let backend = open(&path);
+    backend
+        .save_index(b"not a snapshot anyone recorded", 1)
+        .expect("save");
+    backend.clear_index().expect("clear");
+    drop(backend);
+
+    // A file that looks like a snapshot, with nothing in the store to say what it covers.
+    std::fs::write(dir.path().join("d.redb.index"), b"stray bytes").expect("stray");
+
+    let backend = open(&path);
+    assert!(
+        backend.load_index().expect("load").is_none(),
+        "a file whose counter is absent is not a snapshot this start may use"
+    );
+    drop(backend);
+
+    let source = load(&path).await;
+    assert_eq!(
+        matches_from_index(&source, "alice").await,
+        Some(1),
+        "and the index is built from the store instead, which answers"
+    );
+}
+
+/// Clearing forgets both halves: a file left behind would be adopted by the next start if ever a
+/// counter were written again.
+#[tokio::test]
+async fn clearing_removes_the_file_and_the_counter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+    drop(load(&path).await);
+    assert!(
+        dir.path().join("d.redb.index").exists(),
+        "a snapshot exists"
+    );
+
+    let backend = open(&path);
+    backend.clear_index().expect("clear");
+    assert!(
+        backend.load_index().expect("load").is_none(),
+        "after clearing, nothing is offered"
+    );
+    assert!(
+        !dir.path().join("d.redb.index").exists(),
+        "and the file is gone with the counter"
+    );
+}

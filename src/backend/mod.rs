@@ -296,6 +296,22 @@ impl Backend {
     ///
     /// A backend that cannot is not an error: the index is derived, and building it is what every
     /// backend did before this existed.
+    /// Writes the snapshot by handing the store a sink to fill, instead of a buffer to copy.
+    ///
+    /// The difference is memory, and at three million entries it decides whether a start finishes:
+    /// the index is already resident, and a second copy of its postings is what pushed the process
+    /// into swap. Backends that keep no index ignore it.
+    pub fn save_index_streaming(
+        &self,
+        sequence: u64,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> Result<(), BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.save_index_streaming(sequence, produce),
+            _ => Ok(()),
+        }
+    }
+
     pub fn save_index(&self, bytes: &[u8], sequence: u64) -> Result<(), BackendError> {
         match self {
             Backend::Redb(backend) => backend.save_index(bytes, sequence),
