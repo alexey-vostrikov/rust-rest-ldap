@@ -186,6 +186,15 @@ pub struct Index {
     built: BTreeMap<Arc<str>, BTreeSet<Kind>>,
 }
 
+/// What a stored snapshot holds besides the postings: the numbering that gives them meaning, and
+/// the next id to issue.
+///
+/// `Snapshot` is the index, `Numbering` is the pairing between an entry's DN and the number its
+/// postings use. They travel together - an index taken without its numbering answers about
+/// whichever entries happen to sit at those ids now.
+pub type Numbering = Vec<(String, u32)>;
+pub type Snapshot = (Index, Numbering, u32);
+
 /// The per-attribute plan, without the pseudo-attribute that carries the default.
 fn plan_of(config: &IndexConfig) -> Result<BTreeMap<String, BTreeSet<Kind>>, IndexError> {
     let plan = config.resolve()?;
@@ -195,13 +204,51 @@ fn plan_of(config: &IndexConfig) -> Result<BTreeMap<String, BTreeSet<Kind>>, Ind
         .collect())
 }
 
-/// Marks a snapshot written by this format, so a foreign or older blob is refused rather than
+/// One entry's contribution to a change, as the stored index needs to hear it.
+///
+/// Entry-shaped rather than posting-shaped on purpose. A posting-level delta would say "remove
+/// id 41 from `cn`/`ann`"; an entry-level one says "this entry changed", and the index derives the
+/// postings itself through the one function that already does that for a rebuild. Two
+/// implementations of the same derivation is how a persisted index starts disagreeing with a
+/// built one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexChange {
+    /// A new entry, under the id the directory issued.
+    Add { id: u32, entry: Entry },
+    /// A changed entry: the postings of `before` go, those of `after` arrive, under one id.
+    Replace {
+        id: u32,
+        before: Entry,
+        after: Entry,
+    },
+    /// An entry that is gone, named so its postings can be taken away.
+    Remove { id: u32, entry: Entry },
+}
+
+impl IndexChange {
+    /// The id this change is about, whichever shape it has.
+    pub fn id(&self) -> u32 {
+        match self {
+            IndexChange::Add { id, .. }
+            | IndexChange::Replace { id, .. }
+            | IndexChange::Remove { id, .. } => *id,
+        }
+    }
+}
+
+/// Marks a delta written by this format., so a foreign or older blob is refused rather than
 /// misread as postings.
 const MAGIC: &[u8; 4] = b"RRIX";
 
 /// Bumped whenever the layout below changes. An older blob is not upgraded: the index is derived
 /// data and rebuilding it is always correct, while guessing at a layout that changed is not.
 const SNAPSHOT_VERSION: u32 = 1;
+
+/// Marks a delta written by this format.
+const DELTA_MAGIC: &[u8; 4] = b"RRDL";
+
+/// The stored shape of an entry, borrowed from the journal so a delta has no format of its own.
+type StoredShape = crate::backend::redb_store::StoredEntry;
 
 /// A fingerprint of everything the index is derived from.
 ///
@@ -398,6 +445,14 @@ impl<'a> Reader<'a> {
         Some(Arc::from(std::str::from_utf8(bytes).ok()?))
     }
 
+    /// One entry: its DN, then the stored shape of everything else.
+    fn entry(&mut self) -> Option<Entry> {
+        let dn = self.text()?;
+        let length = self.u32()? as usize;
+        let shape: StoredShape = serde_json::from_slice(self.take(length)?).ok()?;
+        Some(shape.into_entry(&dn))
+    }
+
     fn names(&mut self) -> Option<BTreeSet<Arc<str>>> {
         let count = self.u32()? as usize;
         let mut names = BTreeSet::new();
@@ -532,12 +587,24 @@ impl Index {
     ///
     /// `fingerprint` is not a checksum of the bytes: it names the data and the configuration the
     /// snapshot was built from, and the reader recomputes it before trusting anything here.
-    pub fn encode(&self, fingerprint: u64) -> Vec<u8> {
+    pub fn encode(&self, fingerprint: u64, ids: &[(String, u32)], next_id: u32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
         out.extend_from_slice(&fingerprint.to_le_bytes());
         out.extend_from_slice(&kinds_bits(&self.default_kinds).to_le_bytes());
+
+        // The numbering travels with the postings, by DN. A posting is a number and nothing else
+        // says which entry that number names: after an insert the ids are no longer the canonical
+        // positions, and a start that assumed positions would answer about other entries - the
+        // defect this whole numbering exists to prevent. Positions cannot carry this, because the
+        // canonical order itself changes when entries arrive or go.
+        write_u32(&mut out, next_id);
+        write_u32(&mut out, ids.len() as u32);
+        for (dn, id) in ids {
+            write_text(&mut out, dn);
+            write_u32(&mut out, *id);
+        }
 
         write_names(&mut out, &self.case_sensitive);
         write_names(&mut out, &self.ordered_numeric);
@@ -585,6 +652,24 @@ impl Index {
     /// data, or a truncated blob. Rebuilding costs a minute; answering from a snapshot that does
     /// not match the data costs a missing search result that nobody can explain.
     pub fn decode(bytes: &[u8], fingerprint: u64) -> Option<Self> {
+        Self::decode_with_ids(bytes, fingerprint).map(|(index, _, _)| index)
+    }
+
+    /// The snapshot with the numbering it was built under: `(index, (dn, id) pairs, next_id)`.
+    pub fn decode_with_ids(bytes: &[u8], fingerprint: u64) -> Option<Snapshot> {
+        Self::decode_inner(bytes, Some(fingerprint))
+    }
+
+    /// The snapshot without the fingerprint check, for the caller that replays deltas over it.
+    ///
+    /// The data has moved by definition in that case, so the stored fingerprint can never match;
+    /// what vouches for the result is the chain of deltas, each written with the change it
+    /// describes.
+    pub fn decode_unchecked(bytes: &[u8]) -> Option<Snapshot> {
+        Self::decode_inner(bytes, None)
+    }
+
+    fn decode_inner(bytes: &[u8], fingerprint: Option<u64>) -> Option<Snapshot> {
         let mut reader = Reader::new(bytes);
 
         if reader.take(MAGIC.len())? != MAGIC {
@@ -593,11 +678,20 @@ impl Index {
         if reader.u32()? != SNAPSHOT_VERSION {
             return None;
         }
-        if reader.u64()? != fingerprint {
+        let stored = reader.u64()?;
+        if fingerprint.is_some_and(|expected| expected != stored) {
             return None;
         }
 
         let default_kinds = bits_kinds(reader.u32()?)?;
+
+        let next_id = reader.u32()?;
+        let count = reader.u32()? as usize;
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            let dn = reader.text()?;
+            ids.push((dn.to_string(), reader.u32()?));
+        }
 
         let case_sensitive = reader.names()?;
         let ordered_numeric = reader.names()?;
@@ -649,7 +743,7 @@ impl Index {
             built,
         };
         index.fill_built();
-        Some(index)
+        Some((index, ids, next_id))
     }
 
     /// Recomputes which kinds each attribute was built for, from the maps that hold it.
@@ -848,6 +942,113 @@ impl Index {
     /// when the id is the same before and after, which is true for a replace: the position in
     /// canonical order depends on the DN, and a modify does not change the DN. Adding or
     /// deleting an entry moves every id after it, and that still rebuilds the whole index.
+    /// A change set as bytes, for the store to keep until the snapshot is rewritten.
+    ///
+    /// The entries travel whole, through the same `StoredEntry` the journal uses: a format that is
+    /// already written and read on every write is not a second format to get wrong. The DN rides
+    /// alongside because `StoredEntry` deliberately does not carry it - the journal keys by CSN.
+    pub fn encode_delta(changes: &[IndexChange]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(DELTA_MAGIC);
+        out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        write_u32(&mut out, changes.len() as u32);
+
+        let push_entry = |out: &mut Vec<u8>, entry: &Entry| {
+            write_text(out, entry.dn());
+            let json = serde_json::to_vec(&StoredShape::from_entry(entry)).unwrap_or_default();
+            write_u32(out, json.len() as u32);
+            out.extend_from_slice(&json);
+        };
+
+        for change in changes {
+            match change {
+                IndexChange::Add { id, entry } => {
+                    out.push(0);
+                    write_u32(&mut out, *id);
+                    push_entry(&mut out, entry);
+                }
+                IndexChange::Replace { id, before, after } => {
+                    out.push(1);
+                    write_u32(&mut out, *id);
+                    push_entry(&mut out, before);
+                    push_entry(&mut out, after);
+                }
+                IndexChange::Remove { id, entry } => {
+                    out.push(2);
+                    write_u32(&mut out, *id);
+                    push_entry(&mut out, entry);
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Reads a delta, or reports that it cannot be trusted.
+    pub fn decode_delta(bytes: &[u8]) -> Option<Vec<IndexChange>> {
+        let mut reader = Reader::new(bytes);
+
+        if reader.take(DELTA_MAGIC.len())? != DELTA_MAGIC {
+            return None;
+        }
+        if reader.u32()? != SNAPSHOT_VERSION {
+            return None;
+        }
+
+        let count = reader.u32()? as usize;
+        let mut changes = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let kind = reader.u8()?;
+            let id = reader.u32()?;
+            let first = reader.entry()?;
+
+            let change = match kind {
+                0 => IndexChange::Add { id, entry: first },
+                1 => IndexChange::Replace {
+                    id,
+                    before: first,
+                    after: reader.entry()?,
+                },
+                2 => IndexChange::Remove { id, entry: first },
+                _ => return None,
+            };
+
+            changes.push(change);
+        }
+
+        if !reader.finished() {
+            return None;
+        }
+        Some(changes)
+    }
+
+    /// Applies a stored delta, in the order the changes happened.
+    pub fn apply_delta(
+        &mut self,
+        changes: &[IndexChange],
+        config: &IndexConfig,
+    ) -> Result<(), IndexError> {
+        let per_attribute = plan_of(config)?;
+        for change in changes {
+            match change {
+                IndexChange::Add { id, entry } => {
+                    self.touch(*id, entry, &per_attribute, Touch::Add);
+                }
+                IndexChange::Replace { id, before, after } => {
+                    self.touch(*id, before, &per_attribute, Touch::Remove);
+                    self.touch(*id, after, &per_attribute, Touch::Add);
+                    self.prune_attributes(before);
+                }
+                IndexChange::Remove { id, entry } => {
+                    self.touch(*id, entry, &per_attribute, Touch::Remove);
+                    self.prune_attributes(entry);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Adds one entry's postings under `id`, without touching any other entry.
     ///
     /// The half of [`Self::replace`] an insertion needs, and the reason a write no longer costs
@@ -1195,6 +1396,15 @@ mod tests {
         Entry::new(dn, attributes)
     }
 
+    /// The numbering a directory built from these entries would issue: canonical order, from zero.
+    fn numbering_of(entries: &[Entry]) -> Vec<(String, u32)> {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (entry.dn().to_string(), position as u32))
+            .collect()
+    }
+
     /// `count` users, each with a distinct cn and uid and a stamped `entryCSN`, which is what a
     /// write through the protocol produces and what the fingerprint tracks.
     fn people(count: usize) -> Vec<Entry> {
@@ -1392,8 +1602,11 @@ mod tests {
         let index = Index::build(&entries, &config).expect("build");
         let fingerprint = data_fingerprint(&entries, &config);
 
-        let decoded = Index::decode(&index.encode(fingerprint), fingerprint)
-            .expect("a snapshot of this data is readable");
+        let decoded = Index::decode(
+            &index.encode(fingerprint, &numbering_of(&entries), entries.len() as u32),
+            fingerprint,
+        )
+        .expect("a snapshot of this data is readable");
 
         for query in [
             Query::Presence("cn".into()),
@@ -1434,7 +1647,7 @@ mod tests {
         let index = Index::build(&entries, &config).expect("build");
 
         let built_for = data_fingerprint(&entries, &config);
-        let bytes = index.encode(built_for);
+        let bytes = index.encode(built_for, &numbering_of(&entries), entries.len() as u32);
 
         let mut changed = entries.clone();
         let mut attributes = changed[3].attributes().clone();
@@ -1461,7 +1674,11 @@ mod tests {
         let after = config(&[("cn", &["eq", "sub"])], &[]);
         let index = Index::build(&entries, &before).expect("build");
 
-        let bytes = index.encode(data_fingerprint(&entries, &before));
+        let bytes = index.encode(
+            data_fingerprint(&entries, &before),
+            &numbering_of(&entries),
+            entries.len() as u32,
+        );
 
         assert!(
             Index::decode(&bytes, data_fingerprint(&entries, &after)).is_none(),
@@ -1475,7 +1692,7 @@ mod tests {
         let config = config(&[("cn", &["eq"])], &[]);
         let index = Index::build(&entries, &config).expect("build");
         let fingerprint = data_fingerprint(&entries, &config);
-        let bytes = index.encode(fingerprint);
+        let bytes = index.encode(fingerprint, &numbering_of(&entries), entries.len() as u32);
 
         assert!(Index::decode(&bytes[..bytes.len() / 2], fingerprint).is_none());
 

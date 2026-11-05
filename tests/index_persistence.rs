@@ -82,7 +82,11 @@ async fn matches_from_index(source: &Arc<Source>, uid: &str) -> Option<u64> {
 /// Redb holds the file lock while a store is open, and a source owns one - so reading the stored
 /// snapshot means letting the source go, which is what a restart does anyway.
 fn stored_snapshot(path: &std::path::Path) -> Vec<u8> {
-    open(path).load_index().expect("read").expect("a snapshot")
+    open(path)
+        .load_index()
+        .expect("read")
+        .expect("a snapshot")
+        .0
 }
 
 #[tokio::test]
@@ -138,10 +142,15 @@ async fn a_restart_over_unchanged_data_reuses_the_stored_index() {
 }
 
 #[tokio::test]
-async fn a_change_between_starts_makes_the_snapshot_unusable() {
-    // The failure this guards against is silent: an index built before a change narrows to the
-    // value that is no longer there, and the client sees a missing entry with nothing to explain
-    // it. The fingerprint is the only thing standing between the two.
+async fn a_change_between_starts_is_replayed_rather_than_rebuilt() {
+    // Before the deltas existed this test asserted the opposite: a write invalidated the
+    // snapshot, and the next start rebuilt the index - a minute of work for every restart on a
+    // node that is written to. Now the store records what each change set did to the index, and
+    // the next start replays it.
+    //
+    // What has to hold is not "the bytes changed" but "the index in force answers about the data
+    // in force": an index that missed the write would not find the new entry, and an index that
+    // kept the deleted one would answer about an entry that is gone.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("d.redb");
 
@@ -164,9 +173,7 @@ async fn a_change_between_starts_makes_the_snapshot_unusable() {
         .expect("apply");
     drop(source);
 
-    // The snapshot on disk still describes the directory as it was before the write: this is the
-    // one a naive reader would reuse.
-    let stale = stored_snapshot(&path);
+    let before_restart = stored_snapshot(&path);
 
     let after = load(&path).await;
     assert_eq!(
@@ -181,9 +188,54 @@ async fn a_change_between_starts_makes_the_snapshot_unusable() {
     );
     drop(after);
 
-    let rebuilt = stored_snapshot(&path);
-    assert_ne!(
-        stale, rebuilt,
-        "the start rebuilt rather than reusing an index that predates the change"
+    assert_eq!(
+        before_restart,
+        stored_snapshot(&path),
+        "the start replayed the stored deltas instead of rebuilding, so the snapshot is untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_deletion_between_starts_is_replayed_too() {
+    // The case a delta gets wrong most easily: a removal has no entry to add, only postings to
+    // take away. Left unreplayed, the index would answer about an entry that is gone.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[
+                EntryChange::Upsert {
+                    entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+                },
+                EntryChange::Upsert {
+                    entry: person("bob", "20260101000000.000000Z#000002#001#000000"),
+                },
+            ])
+            .await
+            .expect("seed");
+    }
+
+    let source = load(&path).await;
+    source
+        .apply(&[EntryChange::Delete {
+            dn: format!("cn=bob,ou=users,{BASE}"),
+            kind: None,
+        }])
+        .await
+        .expect("delete");
+    drop(source);
+
+    let after = load(&path).await;
+    assert_eq!(
+        matches_from_index(&after, "bob").await,
+        Some(0),
+        "the replayed index does not answer about an entry that was deleted"
+    );
+    assert_eq!(
+        matches_from_index(&after, "alice").await,
+        Some(1),
+        "and keeps the one that stayed"
     );
 }

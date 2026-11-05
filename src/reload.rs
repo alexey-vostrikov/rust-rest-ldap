@@ -76,21 +76,56 @@ impl Source {
         // entries, takes six minutes - and an operator who waits six minutes turns the index off,
         // so this is what makes the index usable at all.
         //
-        // Trust is placed in the fingerprint, not in the file being there. The snapshot names the
-        // data and the plan it was built from; anything else - a change since, a different
-        // `indexes:` section, a blob from another build - is a rebuild. A snapshot trusted by
-        // presence alone would narrow to a value that is no longer in the directory, which reads
-        // as a missing entry and cannot be diagnosed from the outside.
+        // Two ways to trust what is stored, and the fingerprint is the stricter one: the data has
+        // not moved since the snapshot, or the store recorded every change since. Anything else
+        // is a rebuild - a snapshot trusted by presence alone would narrow to a value that is no
+        // longer in the directory, which reads as a missing entry and cannot be diagnosed from
+        // outside.
         let fingerprint =
             crate::index::data_fingerprint(directory.entries_in_order(), &config.indexes);
-        let reused = backend
-            .load_index()?
-            .and_then(|bytes| crate::index::Index::decode(&bytes, fingerprint));
+        let sequence = backend.sequence()?;
+
+        let stored = backend.load_index()?;
+        let reused = match stored {
+            Some((bytes, snapshot_sequence)) => {
+                match crate::index::Index::decode_with_ids(&bytes, fingerprint) {
+                    // Unchanged data: the numbering is exactly the one the postings were built
+                    // under.
+                    Some((index, numbering, next_id)) => {
+                        let map: std::collections::HashMap<String, u32> =
+                            numbering.into_iter().collect();
+                        directory
+                            .clone()
+                            .with_numbered_index(index, &map, next_id)
+                            .map(|directory| (directory, false))
+                    }
+                    None if snapshot_sequence < sequence => {
+                        // The data moved. Replay what the store wrote down, in the order it
+                        // happened; a hole in that chain means a crash wrote the data and not its
+                        // delta, and the only honest answer is to build again.
+                        match backend.index_deltas(snapshot_sequence, sequence)? {
+                            Some(deltas) => replay(&directory, &bytes, &deltas, &config.indexes)
+                                .map(|directory| (directory, true)),
+                            None => None,
+                        }
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
 
         let directory = match reused {
-            Some(index) => {
-                println!("{}", crate::i18n::t("start.index_reused", &[]));
-                directory.with_index(index)
+            Some((directory, replayed)) => {
+                // Two different facts, and an operator reading the log deserves the right one:
+                // nothing happened since the snapshot, or some change sets did and were replayed.
+                let key = if replayed {
+                    "start.index_replayed"
+                } else {
+                    "start.index_reused"
+                };
+                println!("{}", crate::i18n::t(key, &[]));
+                directory
             }
             None => {
                 let started = std::time::Instant::now();
@@ -106,8 +141,12 @@ impl Source {
                 // Kept for the next start. A failure to write is reported and not fatal: the
                 // index works either way, and refusing to serve because a cache could not be
                 // saved would be the wrong trade.
-                let bytes = directory.index().encode(fingerprint);
-                if let Err(err) = backend.save_index(&bytes) {
+                let bytes = directory.index().encode(
+                    fingerprint,
+                    &directory.numbering(),
+                    directory.next_id(),
+                );
+                if let Err(err) = backend.save_index(&bytes, sequence) {
                     eprintln!(
                         "{}",
                         crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])
@@ -117,6 +156,7 @@ impl Source {
                 directory
             }
         };
+
         // The journal head travels with the first snapshot for the same reason it does on every
         // reload: a synchronised search hands it to the client, and a missing head would make a
         // resumed refresh send the whole directory again.
@@ -442,18 +482,56 @@ impl Source {
         }
         let directory: &mut Directory = Arc::get_mut(&mut current).expect("made unique above");
 
+        // What the index has to be told, for the store to replay the same thing on a later
+        // start. Collected as it happens rather than recomputed afterwards, because "which
+        // entries changed" is exactly what this loop knows and nothing else does.
+        let mut applied: Vec<crate::index::IndexChange> =
+            Vec::with_capacity(deletes.len() + upserts.len());
+
         // Deletions first: a change set that removes one entry and adds another under the same
         // DN - an import replacing an entry - would otherwise add first and then delete what it
         // had just written.
         for dn in &deletes {
-            directory.remove_entry_in_place(dn, &self.indexes)?;
+            let id = directory.id_of(dn);
+            let removed = directory.remove_entry_in_place(dn, &self.indexes)?;
+            if let (Some(id), Some(entry)) = (id, removed) {
+                applied.push(crate::index::IndexChange::Remove { id, entry });
+            }
         }
 
         for entry in upserts {
             // Replaced when the DN is here, added when it is not. The distinction is the
             // directory's: it holds the map that answers it.
-            if !directory.replace_entry_in_place(entry.clone(), &self.indexes)? {
-                directory.insert_entry_in_place(entry.clone(), &self.indexes)?;
+            let before = directory.find(entry.dn()).cloned();
+            if directory.replace_entry_in_place(entry.clone(), &self.indexes)? {
+                if let (Some(id), Some(before)) = (directory.id_of(entry.dn()), before) {
+                    applied.push(crate::index::IndexChange::Replace {
+                        id,
+                        before,
+                        after: entry.clone(),
+                    });
+                }
+            } else if directory.insert_entry_in_place(entry.clone(), &self.indexes)?
+                && let Some(id) = directory.id_of(entry.dn())
+            {
+                applied.push(crate::index::IndexChange::Add {
+                    id,
+                    entry: entry.clone(),
+                });
+            }
+        }
+
+        // Recorded for the next start, so it does not have to rebuild what this just built. A
+        // failure is reported and not fatal: the index in memory is right either way, and the
+        // next start simply builds it again.
+        if !applied.is_empty() {
+            let bytes = crate::index::Index::encode_delta(&applied);
+            let sequence = self.backend.sequence()?;
+            if let Err(err) = self.backend.append_index_delta(sequence, &bytes) {
+                eprintln!(
+                    "{}",
+                    crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])
+                );
             }
         }
 
@@ -683,6 +761,46 @@ pub async fn reload_on_interval_with(
             }
         }
     }
+}
+
+/// Rebuilds the index from a snapshot and the changes recorded since it.
+///
+/// `None` when the snapshot cannot be read against the deltas: the numbering has to cover every
+/// entry, and an entry the snapshot never saw and no delta added means the chain is not the whole
+/// story. Rebuilding is correct and costs a minute; guessing is not.
+fn replay(
+    directory: &Directory,
+    snapshot: &[u8],
+    deltas: &[Vec<u8>],
+    config: &crate::index::IndexConfig,
+) -> Option<Directory> {
+    // The snapshot's fingerprint cannot match: the data moved, which is why a delta exists. The
+    // stored value is read past rather than checked, and the deltas are what vouch for the
+    // result - each one was written in the same breath as the change it describes.
+    let (mut index, numbering, mut next_id) = crate::index::Index::decode_unchecked(snapshot)?;
+    let mut numbering: std::collections::HashMap<String, u32> = numbering.into_iter().collect();
+
+    for delta in deltas {
+        let changes = crate::index::Index::decode_delta(delta)?;
+        index.apply_delta(&changes, config).ok()?;
+
+        for change in &changes {
+            match change {
+                crate::index::IndexChange::Add { id, entry } => {
+                    numbering.insert(entry.dn().to_string(), *id);
+                    next_id = next_id.max(*id + 1);
+                }
+                crate::index::IndexChange::Remove { entry, .. } => {
+                    numbering.remove(entry.dn());
+                }
+                crate::index::IndexChange::Replace { .. } => {}
+            }
+        }
+    }
+
+    directory
+        .clone()
+        .with_numbered_index(index, &numbering, next_id)
 }
 
 /// Where the schema is built from: files on disk and definitions the protocol added.
