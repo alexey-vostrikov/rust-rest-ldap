@@ -265,6 +265,22 @@ impl Backend {
     }
 
     /// Records one change set's posting changes for the next start.
+    /// The stored snapshot's size and the counter it covers, without reading the bytes.
+    pub fn index_snapshot_size(&self) -> Result<Option<(u64, usize)>, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.index_snapshot_size(),
+            _ => Ok(None),
+        }
+    }
+
+    /// Bytes of recorded index changes after `after`. Zero where the backend keeps none.
+    pub fn index_delta_bytes(&self, after: u64) -> Result<u64, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.index_delta_bytes(after),
+            _ => Ok(0),
+        }
+    }
+
     pub fn append_index_delta(&self, sequence: u64, bytes: &[u8]) -> Result<(), BackendError> {
         match self {
             Backend::Redb(backend) => backend.append_index_delta(sequence, bytes),
@@ -419,7 +435,7 @@ impl Backend {
         match self {
             Backend::File(backend) => backend.update(change),
             Backend::Null(backend) => backend.update(change),
-            Backend::Redb(backend) => backend.apply(std::slice::from_ref(change)),
+            Backend::Redb(backend) => backend.apply(std::slice::from_ref(change)).map(|_| ()),
             Backend::Rest(backend) => backend.update(change).await,
         }
     }
@@ -428,23 +444,26 @@ impl Backend {
     ///
     /// The entry store commits all changes or none; the JSON backends apply them one
     /// by one, which is why they are not the right choice for data that matters.
-    pub async fn apply(&self, changes: &[EntryChange]) -> Result<(), BackendError> {
+    /// `Some(sequence)` when the backend numbered the change set, `None` when it keeps no
+    /// counter. The number is the one this change set was given, not the counter's current value:
+    /// a caller that files something under it has to file it under its own change.
+    pub async fn apply(&self, changes: &[EntryChange]) -> Result<Option<u64>, BackendError> {
         match self {
             Backend::File(backend) => {
                 for change in changes {
                     backend.update(change)?;
                 }
-                Ok(())
+                Ok(None)
             }
-            Backend::Null(backend) => backend.update(&changes[0]),
-            Backend::Redb(backend) => backend.apply(changes),
+            Backend::Null(backend) => backend.update(&changes[0]).map(|()| None),
+            Backend::Redb(backend) => backend.apply(changes).map(Some),
             Backend::Rest(backend) => {
                 // One request per object: HTTP has no change set, and the service's own
                 // transaction boundaries are the service's.
                 for change in changes {
                     backend.update(change).await?;
                 }
-                Ok(())
+                Ok(None)
             }
         }
     }

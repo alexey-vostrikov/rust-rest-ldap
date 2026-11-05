@@ -18,6 +18,7 @@ start.limit_size: "лимиты: не более {size} записей на по
 start.limit_time: "лимиты: не более {seconds} с на поиск"
 start.gssapi: "sasl: принимаю билеты Kerberos для realm(ов) {realms}"
 start.index_reused: "индекс: прочитан из стора, данные с момента построения не менялись"
+start.index_rewritten: "индекс: снимок переписан — изменений накопилось больше порога ({recorded} байт изменений вместо {bytes} байт снимка)"
 start.index_replayed: "индекс: прочитан из стора и догнан по записанным изменениям"
 start.index_built: "индекс: построен по данным за {seconds} с"
 error.index_snapshot: "индекс не удалось сохранить для следующего запуска, он построит его заново: {detail}"

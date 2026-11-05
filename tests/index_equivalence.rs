@@ -110,6 +110,7 @@ fn directory(indexed: bool) -> Directory {
             )
         })
         .collect(),
+        ..Default::default()
     };
 
     directory.with_indexes(&config).expect("indexes")
@@ -364,6 +365,7 @@ fn substrings_agree_when_the_data_has_capitals() {
                 )
             })
             .collect(),
+        ..Default::default()
     };
 
     let plain = Directory::from_entries(BASE, "users", "groups", entries.clone());

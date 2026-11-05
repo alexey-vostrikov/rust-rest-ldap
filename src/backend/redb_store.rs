@@ -448,9 +448,9 @@ impl RedbBackend {
     ///
     /// All or nothing: on any error nothing is committed, so a caller that writes a
     /// user and a group together can never leave one of them behind.
-    pub fn apply(&self, changes: &[EntryChange]) -> Result<(), BackendError> {
+    pub fn apply(&self, changes: &[EntryChange]) -> Result<u64, BackendError> {
         if changes.is_empty() {
-            return Ok(());
+            return self.sequence();
         }
 
         let mut transaction = self
@@ -467,6 +467,11 @@ impl RedbBackend {
                 reason: source.to_string(),
             })?;
 
+        // The counter this change set gets, returned rather than left to be re-read: between the
+        // commit and a later `sequence()` another writer may have moved it, and an index delta
+        // filed under somebody else's number is a delta that replays the wrong change - or
+        // overwrites the one already there.
+        let assigned;
         {
             let mut entries =
                 transaction
@@ -591,6 +596,7 @@ impl RedbBackend {
             // what the index chain covers, and a counter that could lag the data would let a
             // stale index look current.
             let next = sequence_of(&meta)? + 1;
+            assigned = next;
             meta.insert(META_SEQ, next.to_le_bytes().as_slice())
                 .map_err(|source| BackendError::Redb {
                     path: "<meta>".to_string(),
@@ -601,7 +607,9 @@ impl RedbBackend {
         transaction.commit().map_err(|source| BackendError::Redb {
             path: "<database>".to_string(),
             reason: source.to_string(),
-        })
+        })?;
+
+        Ok(assigned)
     }
 
     /// Journal records strictly after `csn`, oldest first.
@@ -975,6 +983,78 @@ impl RedbBackend {
         })?;
 
         Ok(value.map(|value| (value.value().to_vec(), sequence)))
+    }
+
+    /// The size of the stored snapshot and the counter it covers, without reading it.
+    ///
+    /// `load_index` returns the bytes, which on three million entries is 2.16 GB copied out of the
+    /// store just to ask how big it is. Deciding whether the snapshot is worth rewriting needs the
+    /// number, not the content.
+    pub fn index_snapshot_size(&self) -> Result<Option<(u64, usize)>, BackendError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+
+        let meta = match transaction.open_table(META) {
+            Ok(meta) => meta,
+            Err(_) => return Ok(None),
+        };
+        let Some(sequence) = snapshot_sequence(&meta)? else {
+            return Ok(None);
+        };
+
+        let table = match transaction.open_table(INDEX) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        let value = table.get(INDEX_KEY).map_err(|source| BackendError::Redb {
+            path: "<index>".to_string(),
+            reason: source.to_string(),
+        })?;
+
+        Ok(value.map(|value| (sequence, value.value().len())))
+    }
+
+    /// How many bytes of recorded changes sit after `after`, snapshot excluded.
+    ///
+    /// This is what the rewrite threshold is measured against: the deltas exist to be replayed at
+    /// the next start, and paying more for them than for the snapshot they save is the point at
+    /// which rewriting the snapshot is cheaper than keeping them.
+    pub fn index_delta_bytes(&self, after: u64) -> Result<u64, BackendError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        let table = match transaction.open_table(INDEX_DELTA) {
+            Ok(table) => table,
+            Err(_) => return Ok(0),
+        };
+
+        let mut total = 0u64;
+        let from = std::ops::Bound::Excluded(after);
+        let to = std::ops::Bound::Unbounded;
+        for item in table
+            .range((from, to))
+            .map_err(|source| BackendError::Redb {
+                path: "<index_delta>".to_string(),
+                reason: source.to_string(),
+            })?
+        {
+            let (_, value) = item.map_err(|source| BackendError::Redb {
+                path: "<index_delta>".to_string(),
+                reason: source.to_string(),
+            })?;
+            total += value.value().len() as u64;
+        }
+
+        Ok(total)
     }
 
     /// Records the posting changes of one change set, under its counter value.

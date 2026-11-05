@@ -121,12 +121,20 @@ pub enum IndexError {
 
 /// `indexes:` section of the configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IndexConfig {
     /// Kinds applied to every attribute, including ones not listed below.
     pub default: Vec<String>,
     /// Per-attribute kinds, replacing the default for that attribute.
     pub attributes: BTreeMap<String, Vec<String>>,
+    /// Bytes of recorded changes kept before the stored snapshot is rewritten.
+    ///
+    /// The snapshot exists so a restart does not rebuild the index, and the recorded changes exist
+    /// so a restart does not rebuild it either - but only up to the point where replaying them
+    /// costs more than the snapshot they save. Unset means a quarter of the snapshot, never less
+    /// than a megabyte: below that a small directory would rewrite on every few writes, which is
+    /// dearer than the changes removed.
+    pub snapshot_delta_bytes: Option<u64>,
 }
 
 impl IndexConfig {
@@ -1477,6 +1485,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 

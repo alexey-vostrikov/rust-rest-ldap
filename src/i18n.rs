@@ -414,6 +414,10 @@ const ENGLISH: &[(&str, &str)] = &[
         "index: read from the store, the data has not changed since it was built",
     ),
     (
+        "start.index_rewritten",
+        "index: snapshot rewritten after the recorded changes grew past the threshold ({recorded} bytes of changes replaced {bytes} bytes of snapshot)",
+    ),
+    (
         "start.index_replayed",
         "index: read from the store and brought up to date from the recorded changes",
     ),
