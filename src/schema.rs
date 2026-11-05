@@ -1621,7 +1621,10 @@ mod source_tests {
         );
     }
 
+    // Miri runs in isolation: it refuses to open files at all, so this is the one test in the
+    // module it cannot answer, and it is the only one that touches the filesystem.
     #[test]
+    #[cfg_attr(miri, ignore = "reads the filesystem, and Miri runs isolated")]
     fn an_unreadable_file_names_the_path() {
         let err = Schema::from_sources(&[std::path::PathBuf::from("/nonexistent/x.schema")], &[])
             .expect_err("the file is not there");
