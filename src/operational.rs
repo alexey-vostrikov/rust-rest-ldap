@@ -57,12 +57,21 @@ pub fn stamp_write_for(entry: &Entry, actor: &str, now: SystemTime, server: u16)
     }
 
     // `replace`, not `push`: a second write must move the value, not add a second one.
+    let csn = change_sequence_number(now, server);
     attributes = attributes
         .replace(Attribute::single(ATTR_MODIFY_TIMESTAMP, &timestamp).operational())
         .replace(Attribute::single(ATTR_MODIFIERS_NAME, actor).operational())
-        .replace(
-            Attribute::single(ATTR_ENTRY_CSN, &change_sequence_number(now, server)).operational(),
-        );
+        .replace(Attribute::single(ATTR_ENTRY_CSN, &csn).operational());
+
+    // Every value this write touched gets the write's change beside it, and a value it did not
+    // touch keeps the change that put it there. That is the whole rule, and it is what makes
+    // level-2 merging possible: two nodes editing different attributes of one entry hold stamps
+    // that say which value each of them wrote, so neither has to be thrown away.
+    //
+    // A value that is already stamped keeps its stamp, because stamping it again would claim this
+    // write changed something it did not - and then an older edit, applied later, would look newer
+    // than it is and win.
+    attributes = attributes.stamped(&csn);
 
     Entry::new(entry.dn(), attributes)
 }

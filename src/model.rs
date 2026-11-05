@@ -89,6 +89,23 @@ pub struct Attribute {
     pub name: Arc<str>,
     pub values: Box<[String]>,
     pub flags: AttributeFlags,
+    /// The change that wrote each value, positionally: `value_csns[i]` is the CSN of
+    /// `values[i]`.
+    ///
+    /// `None` when nothing recorded one, which is the ordinary case for a single node and for
+    /// every entry an import wrote. It exists for level-2 replication: an entry-level timestamp
+    /// settles a whole entry from one number, so two nodes editing different attributes of the same
+    /// entry at the same moment lose one edit. A timestamp beside each value is what makes the two
+    /// edits mergeable instead of one of them lost.
+    ///
+    /// Positional rather than a map: the values are already here in an order, a map would be a
+    /// second copy of every value as a key, and the only question asked is "which change wrote the
+    /// value at this position".
+    ///
+    /// Empty string means "this value has no recorded change" - a value from an import, or one
+    /// written before this existed. It is not the same as a missing entry: an unknown stamp loses
+    /// to any known one, which is what keeps an old entry from beating a new change.
+    pub value_csns: Option<Box<[Arc<str>]>>,
 }
 
 impl Attribute {
@@ -98,12 +115,58 @@ impl Attribute {
             name: attribute_name(name.as_ref()),
             values: values.into_boxed_slice(),
             flags: AttributeFlags::default(),
+            value_csns: None,
         }
     }
 
     /// Single-valued attribute with a borrowed value.
     pub fn single(name: impl AsRef<str>, value: &str) -> Self {
         Self::new(name, vec![value.to_string()])
+    }
+
+    /// The change that wrote `value`, if one was recorded.
+    ///
+    /// Exact comparison on purpose: the stored form is what both nodes hold, and a matching rule
+    /// applied here would have to be the attribute's own - a place this has no business reaching.
+    /// An unknown value answers `None`, and callers treat that as "older than anything stamped",
+    /// which is what keeps an unstamped import from beating a fresh change.
+    pub fn csn_of(&self, value: &str) -> Option<&str> {
+        let stamps = self.value_csns.as_ref()?;
+        let at = self.values.iter().position(|held| held == value)?;
+        stamps
+            .get(at)
+            .map(|csn| csn.as_ref())
+            .filter(|csn| !csn.is_empty())
+    }
+
+    /// The stamps, one per value, filling in the empty one for values nobody stamped.
+    ///
+    /// Returned owned and complete rather than optional: a caller merging two versions has to be
+    /// able to ask the same question of both, and a missing stamp is an answer - "no change wrote
+    /// this" - not an absence of one.
+    pub fn stamps(&self) -> Vec<&str> {
+        match &self.value_csns {
+            Some(stamps) => (0..self.values.len())
+                .map(|at| stamps.get(at).map(|csn| csn.as_ref()).unwrap_or(""))
+                .collect(),
+            None => vec![""; self.values.len()],
+        }
+    }
+
+    /// The same attribute with a change recorded for every value.
+    ///
+    /// The caller supplies one stamp per value, in the same order, and it is applied whole: an
+    /// attribute half-stamped would answer "which change wrote this" differently for two values of
+    /// the same modification.
+    #[must_use]
+    pub fn with_stamps(mut self, stamps: Vec<Arc<str>>) -> Self {
+        debug_assert_eq!(
+            stamps.len(),
+            self.values.len(),
+            "one stamp per value, in the same order"
+        );
+        self.value_csns = Some(stamps.into_boxed_slice());
+        self
     }
 
     #[must_use]
@@ -147,6 +210,40 @@ pub struct Attributes {
 impl Attributes {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Every value that has no change recorded gets `csn`; a value that has one keeps it.
+    ///
+    /// This is how a write is stamped onto the values it touched, and the reason it is written
+    /// here rather than at each call site: every path that stores an entry - add, modify, an
+    /// import, a change from a peer - has to apply the same rule, and a rule applied in four
+    /// places is a rule that will disagree with itself in one of them.
+    ///
+    /// Operational attributes are skipped: their stamps are the entry's own `entryCSN`, and
+    /// stamping `modifyTimestamp` with the change that set it would be a stamp on a stamp.
+    #[must_use]
+    pub fn stamped(mut self, csn: &str) -> Self {
+        let stamp: Arc<str> = Arc::from(csn);
+
+        for attribute in self.inner.iter_mut() {
+            if attribute.flags.operational || attribute.flags.internal {
+                continue;
+            }
+            let known = attribute.stamps();
+            let stamps: Vec<Arc<str>> = known
+                .iter()
+                .map(|held| {
+                    if held.is_empty() {
+                        Arc::clone(&stamp)
+                    } else {
+                        Arc::from(*held)
+                    }
+                })
+                .collect();
+            attribute.value_csns = Some(stamps.into_boxed_slice());
+        }
+
+        self
     }
 
     /// Appends an attribute; empty value lists are dropped, so an attribute that

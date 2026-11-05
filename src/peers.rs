@@ -594,8 +594,12 @@ pub async fn apply(
     }
 
     let directory = source.directory().await;
+    // The local version itself, not only its stamp: level 2 merges values, and a stamp says
+    // nothing about which values this node already holds.
+    let mut local_entry: Option<crate::model::Entry> = None;
     let (local, local_csn) = match directory.find(&change.dn) {
         Some(entry) => {
+            local_entry = Some(entry.clone());
             let csn = entry
                 .attributes()
                 .get(crate::operational::ATTR_ENTRY_CSN)
@@ -638,6 +642,38 @@ pub async fn apply(
 
     let decision = crate::replication::merge(&local, &incoming);
 
+    // Level 2, and the reason it is here rather than in `merge`: an entry-level stamp decides which
+    // *version* is newer, and that is the wrong question when the two versions edited different
+    // values. An older change can still carry a value this node never had - a member added on the
+    // other node while this one was adding a different member - so the content written is the merge
+    // of both, not the winner of one.
+    //
+    // Dropped when the decision is to keep the local version *and* the merge has nothing to add:
+    // then the peer really is behind, and writing would rewrite the entry on every poll for ever.
+    let merged: Option<crate::model::Entry> = match (&local_entry, &change.entry) {
+        (Some(here), Some(there)) => {
+            let (merged, report) = crate::replication::merge_entries(here, there);
+            // `None` when the merge produced nothing the local version lacks: writing it then
+            // would rewrite the entry on every poll for ever, which is the defect the entry-level
+            // rule already avoids.
+            report.changed().then_some(merged)
+        }
+        _ => None,
+    };
+
+    // An older change that carries a value this node never had is not a change to drop. This is
+    // the whole point of level 2: the entry-level stamp answers "which version is newer", and the
+    // answer is not "which values to keep".
+    let decision = match (&decision, &merged) {
+        (crate::replication::Decision::Ignore { .. }, Some(_)) => {
+            crate::replication::Decision::Apply {
+                why: "the peer's version is older, but it holds values this node does not: they \
+                      are merged rather than dropped",
+            }
+        }
+        _ => decision,
+    };
+
     // Counted before it is carried out: an entry that fails to write is still a change the peer
     // sent and this node tried to apply, and hiding it would make a failing write look like a
     // peer that had nothing to say.
@@ -655,7 +691,13 @@ pub async fn apply(
             // a policy they turned off.
             let entry_change = match &change.entry {
                 Some(entry) => {
-                    let entry = without_derived(entry);
+                    // The merge when there was one, the peer's entry otherwise. `merged` already
+                    // carries this node's operational attributes, which is why it is not passed
+                    // through `without_derived`: those attributes are this node's own.
+                    let entry = match &merged {
+                        Some(merged) => merged.clone(),
+                        None => without_derived(entry),
+                    };
 
                     if source.schema_mode() != crate::schema::Mode::Warn
                         && let Err(violations) = source.schema().check(&entry)
