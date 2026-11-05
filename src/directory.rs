@@ -60,6 +60,17 @@ pub struct Directory {
     /// The next id to hand out. Never goes back: a reused id would make an old posting, or a
     /// record in a peer's journal, point at a different entry.
     next_id: u32,
+    /// How many entries this server serves: the naming context and everything under it.
+    ///
+    /// Maintained rather than counted, because it is asked for on paths that move whole change
+    /// sets - every write and every reload reports it - and counting it is a pass over every entry
+    /// with a suffix comparison on each. On three million entries that is millions of string
+    /// comparisons per write, for a number that moved by one.
+    ///
+    /// Not `entries.len()`: `other` also holds entries from outside the naming context, which a
+    /// store may carry (an import that was not checked) and which a search under the base does not
+    /// return.
+    in_scope: usize,
     /// Search indexes over the same id numbering. Empty unless `with_indexes` ran.
     index: Arc<Index>,
     /// Which snapshot of the directory this is.
@@ -272,6 +283,10 @@ impl Directory {
             .map(|(position, id)| (*id, position))
             .collect();
         let next_id = entries.len() as u32;
+        let in_scope = entries
+            .iter()
+            .filter(|entry| in_scope(entry.dn(), &base_dn, Scope::Subtree))
+            .count();
 
         Self {
             base_dn,
@@ -284,6 +299,7 @@ impl Directory {
             ids,
             by_id,
             next_id,
+            in_scope,
             // Zero until the source that built it says which snapshot this is: a directory
             // built by hand in a test has no history to be inconsistent with.
             snapshot: 0,
@@ -399,6 +415,12 @@ impl Directory {
         let id = self.next_id;
         let position = self.place_of(&entry_dn);
 
+        // Before the move, and by the entry's own DN: whether it is served does not depend on
+        // where it lands.
+        if in_scope(&entry_dn, &self.base_dn, Scope::Subtree) {
+            self.in_scope += 1;
+        }
+
         self.entries.insert(position, entry);
         self.ids.insert(position, id);
         self.next_id += 1;
@@ -440,6 +462,10 @@ impl Directory {
         let id = self.ids[position];
         let removed = self.entries.remove(position);
         self.ids.remove(position);
+
+        if in_scope(removed.dn(), &self.base_dn, Scope::Subtree) {
+            self.in_scope -= 1;
+        }
 
         if position < self.users.end {
             self.users = self.users.start..(self.users.end - 1);
@@ -644,6 +670,14 @@ impl Directory {
         self.index.candidates(query)
     }
 
+    /// How many entries this server serves, without counting them.
+    ///
+    /// The naming context and everything under it. What a write and a reload report, and what the
+    /// metrics show; see the field for why it is kept rather than computed.
+    pub fn entry_count(&self) -> usize {
+        self.in_scope
+    }
+
     /// Entries matching `base_object` and `scope`, in canonical order.
     pub fn entries(&self, base_object: &str, scope: Scope) -> Vec<&Entry> {
         let base_object = dn::normalize(base_object);
@@ -842,6 +876,16 @@ mod tests {
         }
     }
 
+    fn person(name: &str) -> Entry {
+        Entry::new(
+            format!("uid={name},ou=users,{BASE}"),
+            Attributes::new()
+                .push(Attribute::new("objectClass", vec!["top".to_string()]))
+                .push(Attribute::single("uid", name))
+                .push(Attribute::single("cn", name)),
+        )
+    }
+
     fn directory() -> Directory {
         Directory::new(
             BASE,
@@ -1004,6 +1048,88 @@ mod tests {
         assert_eq!(
             dns(&directory.entries("ou=users,dc=example,dc=com", Scope::OneLevel)),
             vec![ADMIN_DN, ALICE_DN]
+        );
+    }
+
+    // The count is maintained, so the test that matters is the one that compares it with the
+    // walk: a counter that drifts is worse than a walk, because nothing about the answer says it
+    // is wrong.
+    #[test]
+    fn the_served_count_follows_inserts_and_deletes() {
+        let mut directory = directory();
+        let walked = |directory: &Directory| directory.entries(BASE, Scope::Subtree).len();
+        assert_eq!(directory.entry_count(), walked(&directory));
+
+        let config = IndexConfig::default();
+        assert!(
+            directory
+                .insert_entry_in_place(person("bob"), &config)
+                .expect("insert"),
+            "a new DN is added"
+        );
+        assert_eq!(directory.entry_count(), walked(&directory));
+
+        directory
+            .remove_entry_in_place(&format!("uid=bob,ou=users,{BASE}"), &config)
+            .expect("remove")
+            .expect("there was one to remove");
+        assert_eq!(directory.entry_count(), walked(&directory));
+    }
+
+    // A build has to make the same distinction as an insert: a directory assembled from a store
+    // that carries an entry outside the naming context serves one fewer than it holds.
+    #[test]
+    fn a_build_counts_what_a_walk_would_return() {
+        let outside = Entry::new(
+            "ou=elsewhere,dc=other,dc=org",
+            Attributes::new()
+                .push(Attribute::new("objectClass", vec!["top".to_string()]))
+                .push(Attribute::single("ou", "elsewhere")),
+        );
+
+        let directory = Directory::from_entries(BASE, "users", "groups", vec![outside]);
+
+        assert_eq!(
+            directory.entry_count(),
+            directory.entries(BASE, Scope::Subtree).len(),
+            "the count a build starts with is the one a walk would give"
+        );
+        assert_eq!(
+            directory.entry_count(),
+            3,
+            "the naming context and its two organizational units"
+        );
+    }
+
+    // The count is of what is served, and an entry outside the naming context is not served: a
+    // store may carry one (an import nobody checked), and a walk under the base does not return it.
+    #[test]
+    fn an_entry_outside_the_naming_context_is_stored_but_not_counted() {
+        let mut directory = directory();
+        let before = directory.entry_count();
+
+        let outside = Entry::new(
+            "ou=elsewhere,dc=other,dc=org",
+            Attributes::new()
+                .push(Attribute::new("objectClass", vec!["top".to_string()]))
+                .push(Attribute::single("ou", "elsewhere")),
+        );
+        assert!(
+            directory
+                .insert_entry_in_place(outside, &IndexConfig::default())
+                .expect("insert"),
+            "the entry is stored"
+        );
+
+        assert_eq!(
+            directory.entry_count(),
+            before,
+            "and does not change what the server says it serves"
+        );
+        assert_eq!(
+            directory.entry_count(),
+            directory.entries(BASE, Scope::Subtree).len(),
+            "which is what the walk says too"
         );
     }
 

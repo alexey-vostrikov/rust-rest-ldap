@@ -607,7 +607,12 @@ async fn serve() {
     // One metrics registry and one journal for the process. The metrics are lock-free, so
     // the accept loop and every connection task can share this without contention.
     let metrics = rust_rest_ldap::metrics::Metrics::new();
-    metrics.set_entries(directory.len());
+    metrics.set_entries(directory.entry_count());
+    // Let go of the snapshot the load handed back. It is the same `Arc` the source keeps, and
+    // holding one here is enough to make `Arc::get_mut` fail on every write - so every write
+    // copied the whole directory instead of patching it in place. Measured on a million entries:
+    // 2.8 s per modify, which is the price of a copy and not of a change.
+    drop(directory);
 
     let journal = match (
         config.observability.journal_stdout,

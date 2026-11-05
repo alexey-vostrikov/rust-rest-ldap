@@ -123,8 +123,40 @@ pub fn check_unique(
 }
 
 /// The DN of an entry that already has `value`, ignoring `exclude`.
+///
+/// The index answers this when the operator gave the attribute an equality index, and that is not
+/// an optimisation for its own sake: the scan below is a pass over the whole directory for every
+/// unique value of every write. Measured on a million entries, a single `modify` spent 800 ms
+/// here - before the store was touched, which is why it looked like a slow store and was not.
+///
+/// The index only narrows, as everywhere else: each candidate is still read and compared, so an
+/// index with a wrong posting costs a slower answer and never a false one. When the attribute has
+/// no equality index, `candidates` answers `None` and the scan runs - the answer stays right, the
+/// cost stays the operator's choice.
 fn find_value(directory: &Directory, name: &str, value: &str, exclude: &str) -> Option<String> {
     let wanted = value.to_lowercase();
+    let users_ou = directory.ou_dn(directory.users_ou_name());
+
+    if let Some(candidates) = directory.candidates(&crate::index::Query::Equality {
+        attribute: std::sync::Arc::from(name),
+        value: wanted.clone(),
+    }) {
+        return directory
+            .entries_at(&candidates)
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .find(|entry| {
+                dn::normalize(entry.dn()) != dn::normalize(exclude)
+                    && entry.dn().ends_with(&format!(",{users_ou}"))
+                    && entry.attributes().get(name).is_some_and(|attribute| {
+                        attribute
+                            .values
+                            .iter()
+                            .any(|candidate| candidate.to_lowercase() == wanted)
+                    })
+            })
+            .map(|entry| entry.dn().to_string());
+    }
 
     directory
         .all()
@@ -499,6 +531,98 @@ mod tests {
 
     fn unique() -> Vec<String> {
         IntegrityConfig::default().unique_attributes()
+    }
+
+    /// An equality index on the unique attributes: the configuration the fast path serves.
+    fn index_config() -> crate::index::IndexConfig {
+        crate::index::IndexConfig {
+            default: Vec::new(),
+            attributes: [
+                ("cn", vec!["eq"]),
+                ("uid", vec!["eq"]),
+                ("objectclass", vec!["eq"]),
+            ]
+            .into_iter()
+            .map(|(name, kinds)| {
+                (
+                    name.to_string(),
+                    kinds.into_iter().map(str::to_string).collect(),
+                )
+            })
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The same directory, indexed.
+    fn indexed() -> Directory {
+        directory().with_indexes(&index_config()).expect("index")
+    }
+
+    // The index is a shortcut over the same question, so both ways have to give the same answer -
+    // and the way to be sure is to ask both. A false negative here is a directory that accepts a
+    // duplicate login name, which nothing later notices.
+    #[test]
+    fn a_duplicate_is_found_the_same_way_with_an_index_and_without() {
+        let indexed = indexed();
+        let plain = directory();
+        let candidate = user("cn=carol,ou=users,dc=example,dc=com", "ALICE", "carol");
+
+        for (label, directory) in [("index", &indexed), ("scan", &plain)] {
+            let duplicate = check_unique(directory, &candidate, candidate.dn(), &unique())
+                .expect_err("alice already holds that cn");
+            assert_eq!(duplicate.holder, ALICE_DN, "{label}");
+        }
+    }
+
+    // The entry being written is not its own duplicate: a modify keeps its DN and its value, and
+    // an index that ignored the exclusion would refuse every change to an entry with a unique
+    // attribute set.
+    #[test]
+    fn the_entry_being_written_is_not_its_own_duplicate() {
+        let indexed = indexed();
+        let candidate = user(ALICE_DN, "alice", "alice");
+
+        assert_eq!(
+            check_unique(&indexed, &candidate, ALICE_DN, &unique()),
+            Ok(()),
+            "an entry may keep its own value"
+        );
+    }
+
+    // A group called `cn=alice` is not a user called alice: the index returns it, and the scope
+    // filter is what keeps it out. Without that check the fast path would refuse an ordinary
+    // directory - the two spellings live in different containers.
+    #[test]
+    fn a_group_with_the_same_name_does_not_take_the_value() {
+        let group_named_like_a_user = Entry::new(
+            "cn=alice,ou=groups,dc=example,dc=com",
+            Attributes::new()
+                .push(Attribute::new(
+                    "objectClass",
+                    vec!["top".to_string(), "posixGroup".to_string()],
+                ))
+                .push(Attribute::single("cn", "alice"))
+                .push(Attribute::single("gidNumber", "2001")),
+        );
+
+        let only_a_group =
+            Directory::from_entries(BASE, "users", "groups", vec![group_named_like_a_user]);
+
+        for directory in [
+            only_a_group
+                .clone()
+                .with_indexes(&index_config())
+                .expect("index"),
+            only_a_group,
+        ] {
+            let candidate = user("cn=alice2,ou=users,dc=example,dc=com", "alice", "alice2");
+            assert_eq!(
+                check_unique(&directory, &candidate, candidate.dn(), &["cn".to_string()]),
+                Ok(()),
+                "only entries of the users OU are accounts"
+            );
+        }
     }
 
     /// A group listing `members` by DN, the `groupOfNames` spelling.

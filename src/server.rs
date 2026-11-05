@@ -276,7 +276,14 @@ pub async fn serve_connection_as(
         let operation = operation_of(&message.protocol_op);
         let started = std::time::Instant::now();
 
-        match crate::ldap::handle(&mut session, &directory, &policy, message) {
+        // One call, and then the snapshot is let go at once. Nothing below reads it, and a write
+        // among these actions is about to replace exactly this snapshot: holding it here is what
+        // made `apply_in_place` copy the whole directory instead of patching it - measured at
+        // 1.4 s per modify on a million entries, of which the change itself was microseconds.
+        let action = crate::ldap::handle(&mut session, &directory, &policy, message);
+        drop(directory);
+
+        match action {
             Action::Reply(messages) => {
                 let returned = messages
                     .iter()
