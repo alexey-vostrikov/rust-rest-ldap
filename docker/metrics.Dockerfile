@@ -46,12 +46,25 @@ RUN python3 -m venv /opt/venv-tools \
         "tree-sitter>=0.24" "tree-sitter-language-pack==1.22.1" \
         /opt/crapper /opt/dryer /opt/mutator
 
-# The tree-sitter grammars are downloaded on first parse. Behind this network the download
-# times out - which is exactly what a six-hour "hang" turned out to be, not a slow mutation run.
-# They cannot be fetched at build time either, so the cache is mounted by scripts/metrics.sh and
-# scripts/mutate.sh from the host, where crapper has warmed it once. This ENV is what makes the
-# mounted directory the place the language pack looks in.
+# The tree-sitter grammars are downloaded on first parse, and until now that first parse happened
+# on somebody's laptop: scripts/metrics.sh and scripts/mutate.sh mounted a cache warmed by hand on
+# the host. The comment here used to say they could not be fetched at build time either - a
+# six-hour "hang" turned out to be the download timing out - but that is no longer true: measured
+# in this image, fetching the Rust grammar takes four seconds.
+#
+# Baked in, so the image is self-contained: a tool that needs a file from the operator's home
+# directory is a tool that cannot run in CI, on another machine, or after that home is cleaned.
+#
+# Read-only, and that is not tidiness: the pack refuses a cache directory that is group- or
+# other-writable ("mode 777"), and the container runs as the caller's uid, not as the user who
+# warmed it. `a-w` is what makes one baked copy usable by any uid.
 ENV XDG_CACHE_HOME=/opt/cache
+
+RUN mkdir -p /opt/cache \
+    && /opt/venv-tools/bin/python -c "import tree_sitter_language_pack as pack; assert pack.get_parser('rust') is not None, 'the Rust grammar did not load'" \
+    && du -sh /opt/cache \
+    && rm -f /opt/cache/tree-sitter-language-pack/*/.download.lock \
+    && chmod -R a+rX,a-w /opt/cache
 
 # The one local patch, and why it exists: mutator writes each worker to a directory with a fresh
 # UUID per run, and cargo's unit hash includes the package path - so every mutant rebuilds the
