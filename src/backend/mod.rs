@@ -5,6 +5,7 @@
 //! Here the backends are part of the binary and are selected by name from the
 //! configuration; an unknown name is a startup error listing what exists.
 
+use crate::backend::redb_store::Compaction;
 use crate::directory::Directory;
 use crate::model::{Entry, Group, User};
 use thiserror::Error;
@@ -228,6 +229,19 @@ impl Backend {
         match self {
             Backend::Redb(backend) => backend.journal_since(csn),
             _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Rewrites the store, dropping pages nothing points at any more.
+    ///
+    /// Only a store of its own can do this: a JSON document is rewritten whole on every change,
+    /// and the REST backend's storage is not ours to reorganise. For those the answer is
+    /// `None` - "nothing to do here" - rather than an error, because an operator running it
+    /// against the wrong backend has not made a mistake worth failing on.
+    pub fn compact(&mut self) -> Result<Option<Compaction>, BackendError> {
+        match self {
+            Backend::Redb(backend) => Ok(Some(backend.compact()?)),
+            _ => Ok(None),
         }
     }
 

@@ -29,6 +29,7 @@ async fn serve() {
     let note = args.note.clone();
     let from = args.from.clone();
     let reindex = args.reindex;
+    let compact = args.compact;
 
     // The language has to be known before the configuration parses, so that a typo in a
     // Russian config is reported in Russian: the environment answers first, and the raw
@@ -88,11 +89,11 @@ async fn serve() {
 
     // Fail fast: a backend that cannot be built or read is a startup error, not a
     // server that comes up empty and looks healthy.
-    let backend = match Backend::from_config(&config.backend, config.backends.get(&config.backend))
-    {
-        Ok(backend) => backend,
-        Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
-    };
+    let mut backend =
+        match Backend::from_config(&config.backend, config.backends.get(&config.backend)) {
+            Ok(backend) => backend,
+            Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
+        };
     // Verifying the indexes is an offline read: it builds nothing the server would not have
     // built and writes nothing. The exit code is the answer.
     if check_index {
@@ -162,6 +163,28 @@ async fn serve() {
 
         if !report.is_sound() {
             std::process::exit(1);
+        }
+        return;
+    }
+
+    // Before anything reads the store: compaction needs the file to itself, and every read
+    // reference redb sees is a transaction it refuses to move pages under.
+    if compact {
+        match backend.compact() {
+            Ok(Some(report)) if report.performed => println!(
+                "{}",
+                i18n::t(
+                    "check.compact_done",
+                    &[
+                        ("before", &report.before.to_string()),
+                        ("after", &report.after.to_string()),
+                        ("reclaimed", &report.reclaimed().to_string()),
+                    ],
+                )
+            ),
+            Ok(Some(_)) => println!("{}", i18n::t("check.compact_nothing", &[])),
+            Ok(None) => fatal(&i18n::t("error.compact_backend", &[])),
+            Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
         }
         return;
     }
