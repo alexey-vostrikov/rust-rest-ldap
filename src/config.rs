@@ -54,6 +54,8 @@ pub struct Args {
     pub check_config: bool,
     /// Present when the run verifies the indexes against the data.
     pub check_index: bool,
+    /// Rewrite the store, reclaiming the space deleted entries left behind.
+    pub compact: bool,
     /// Present when the run commits the configuration as a new generation.
     pub config_commit: bool,
     /// Present when the run rolls back to a generation.

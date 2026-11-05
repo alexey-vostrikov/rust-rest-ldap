@@ -112,6 +112,31 @@ pub struct ChangeRecord {
     pub entry: Option<StoredEntry>,
 }
 
+/// What a compaction did, for an operator who wants to know whether it was worth the wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compaction {
+    /// False when nothing could be reclaimed: the file already holds only live pages.
+    pub performed: bool,
+    pub before: u64,
+    pub after: u64,
+}
+
+impl Compaction {
+    /// Bytes returned to the filesystem.
+    pub fn reclaimed(&self) -> u64 {
+        self.before.saturating_sub(self.after)
+    }
+}
+
+/// The size of a file, or zero when it cannot be read.
+///
+/// Zero rather than an error: the size is reported, the compaction's own result is what matters,
+/// and failing the command because a `stat` failed would turn a successful compaction into an
+/// error message.
+fn file_size(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
 /// One entry as it is stored: the DN plus every attribute, flags included.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredEntry {
@@ -154,6 +179,9 @@ impl StoredEntry {
 /// writers internally.
 #[derive(Clone)]
 pub struct RedbBackend {
+    /// Where the file is, for the two things that need the file rather than the handle: its size
+    /// before and after compaction, and the operator's ability to find it.
+    path: std::path::PathBuf,
     database: std::sync::Arc<Database>,
     /// `Immediate` fsyncs on commit; `None` defers persistence and may lose the last
     /// commits on power loss — offered only for bulk imports.
@@ -218,12 +246,49 @@ impl RedbBackend {
         })?;
 
         let backend = Self {
+            path: path.to_path_buf(),
             database: std::sync::Arc::new(database),
             durability,
             journal,
         };
         backend.write_format_version()?;
         Ok(backend)
+    }
+
+    /// Rewrites the file, dropping the pages that nothing points at any more.
+    ///
+    /// Redb is copy-on-write: a commit writes new pages and frees the old ones, and the freed
+    /// space is reused by later writes but never returned to the filesystem. A store that grew
+    /// to hold an import and then lost most of it keeps the size - on our three-million-entry
+    /// test the file was 5.8 GB, and a delete of a third of it would not shrink it at all. The
+    /// operator's only recourse was to export, delete the file and import again, which is what
+    /// this replaces.
+    ///
+    /// `&mut self` is not a formality: redb refuses to compact while a transaction, a read
+    /// reference or a savepoint is alive, because moving pages under one would corrupt the
+    /// view it holds. Requiring the unique owner is how the type system says the same thing -
+    /// and the reason this runs before the server starts serving, not during.
+    pub fn compact(&mut self) -> Result<Compaction, BackendError> {
+        let database =
+            std::sync::Arc::get_mut(&mut self.database).ok_or_else(|| BackendError::Redb {
+                path: self.path.display().to_string(),
+                reason: "the database is still held elsewhere, and compacting it under a live \
+                     transaction would move pages out from under it"
+                    .to_string(),
+            })?;
+
+        let before = file_size(&self.path);
+        let performed = database.compact().map_err(|source| BackendError::Redb {
+            path: self.path.display().to_string(),
+            reason: source.to_string(),
+        })?;
+        let after = file_size(&self.path);
+
+        Ok(Compaction {
+            performed,
+            before,
+            after,
+        })
     }
 
     pub fn from_config(config: &serde_json::Value) -> Result<Self, BackendError> {
@@ -718,8 +783,18 @@ impl RedbBackend {
                 path: "<database>".to_string(),
                 reason: source.to_string(),
             })?;
+
+        // Immediate, whatever the store's own setting says. Measured on a three-million-entry
+        // store configured `durability: none`: the snapshot was written, the file grew from 5.84
+        // to 8.00 GB, and after a restart the index was built again from scratch - the commit was
+        // never made durable, so it was rolled back and the space came back. The operator paid
+        // 2.16 GB and got nothing.
+        //
+        // The setting is about entries, where a bulk import is worth risking the last commits
+        // for; it is not about this. A snapshot is a startup cache, and a cache that silently
+        // disappears is worse than no cache, because the cost was already paid.
         transaction
-            .set_durability(self.durability)
+            .set_durability(Durability::Immediate)
             .map_err(|source| BackendError::Redb {
                 path: "<database>".to_string(),
                 reason: source.to_string(),
@@ -992,6 +1067,148 @@ mod tests {
             "nothing is dropped on the strength of a bad stamp"
         );
         assert_eq!(backend.journal_len().expect("len"), 1);
+    }
+
+    #[test]
+    fn compaction_returns_what_deleted_entries_left_behind() {
+        // Redb is copy-on-write: a freed page is reused by later writes but never returned to
+        // the filesystem, so a store that grew and then shrank keeps its size. Without this the
+        // only way to reclaim it was to export, delete the file and import again.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("directory.redb");
+        let mut backend = RedbBackend::open(&path, Durability::Immediate).expect("open");
+
+        let entries: Vec<Entry> = (0..2_000)
+            .map(|index| {
+                entry(
+                    &format!("cn=user{index},ou=users,dc=example,dc=com"),
+                    &format!("user{index}"),
+                    Some(&format!("user{index}@example.com")),
+                    false,
+                )
+            })
+            .collect();
+
+        backend
+            .apply(
+                &entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| EntryChange::Upsert { entry })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("write");
+
+        let full = std::fs::metadata(&path).expect("stat").len();
+        assert!(full > 0, "a store with entries occupies something");
+
+        // Delete almost everything: the pages become free, the file does not notice.
+        let doomed: Vec<EntryChange> = entries[10..]
+            .iter()
+            .map(|entry| EntryChange::delete(entry.dn().to_string(), None))
+            .collect();
+        backend.apply(&doomed).expect("delete");
+
+        assert_eq!(
+            backend.count().expect("count"),
+            10,
+            "only ten entries remain"
+        );
+
+        let report = backend.compact().expect("compact");
+        assert!(report.performed, "there was free space to reclaim");
+        assert!(
+            report.after < report.before,
+            "compaction has to make the file smaller: {} -> {}",
+            report.before,
+            report.after
+        );
+        assert_eq!(
+            report.reclaimed(),
+            report.before - report.after,
+            "the bytes reported as reclaimed are the difference, not an estimate"
+        );
+
+        // What matters more than the size: the entries that stayed are untouched.
+        let remaining = backend.load().expect("load");
+        assert_eq!(
+            remaining.len(),
+            10,
+            "compaction moves pages, it does not lose entries"
+        );
+        assert!(
+            remaining.iter().any(|entry| entry.dn() == entries[0].dn()),
+            "and the survivors are the ones that were not deleted"
+        );
+    }
+
+    #[test]
+    fn compaction_also_returns_the_space_redb_allocated_ahead_of_use() {
+        // The premise this test started with was wrong, and the measurement corrected it: redb
+        // grows the file in regions, so even a store that has never had a deletion holds far more
+        // than its live pages. One entry measured 1 056 768 bytes before compaction and 24 576
+        // after - 1 MB of slack returned, with nothing deleted at all.
+        //
+        // That makes compaction useful in a case it was not written for: a store that was
+        // imported once and never shrank still holds the room the import took while it was
+        // growing.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("directory.redb");
+        let mut backend = RedbBackend::open(&path, Durability::Immediate).expect("open");
+
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: entry("cn=only,ou=users,dc=example,dc=com", "only", None, false),
+            }])
+            .expect("write");
+
+        let report = backend.compact().expect("compact");
+
+        assert_eq!(
+            backend.count().expect("count"),
+            1,
+            "compaction moves pages, it does not lose entries"
+        );
+        assert!(
+            report.after <= report.before,
+            "compaction never makes the file bigger: {} -> {}",
+            report.before,
+            report.after
+        );
+        assert_eq!(
+            report.reclaimed(),
+            report.before.saturating_sub(report.after),
+            "and the bytes it reports are the difference that happened"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_survives_even_when_the_store_defers_durability() {
+        // The defect this guards, measured on a three-million-entry store: with
+        // `durability: none` the snapshot was committed without being made durable. The file
+        // grew from 5.84 to 8.00 GB, and after a restart the index was built again - the commit
+        // had been rolled back and the space returned. The operator paid 2.16 GB for nothing.
+        //
+        // The store's setting is about entries, where a bulk import may risk the last commits.
+        // A startup cache is not that: if it can vanish silently, the cost was paid and the
+        // benefit was not delivered.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("directory.redb");
+
+        {
+            let backend =
+                RedbBackend::open_with_journal(&path, Durability::None, true).expect("open");
+            backend
+                .save_index(b"a snapshot")
+                .expect("save on a store that defers durability");
+        }
+
+        let reopened = RedbBackend::open(&path, Durability::Immediate).expect("reopen");
+        assert_eq!(
+            reopened.load_index().expect("read").as_deref(),
+            Some(b"a snapshot".as_slice()),
+            "the snapshot is written durably whatever the store's setting says"
+        );
     }
 
     #[test]

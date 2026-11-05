@@ -582,6 +582,19 @@ const ENGLISH: &[(&str, &str)] = &[
         "index is NOT sound: of {checked} queries compared with a scan, {missing} would lose entries and {wrong} disagree with it",
     ),
     (
+        "check.compact_done",
+        "compacted: {before} bytes before, {after} after, {reclaimed} returned to the filesystem",
+    ),
+    (
+        "check.compact_nothing",
+        "nothing to reclaim: the store already holds only pages that something points at",
+    ),
+    (
+        "error.compact_backend",
+        "this backend keeps no file of its own, so there is nothing to compact: the JSON \
+         document is rewritten whole on every change, and the REST store is not ours",
+    ),
+    (
         "check.reindex_done",
         "indexed {entries} entries, {attributes} attributes, {bytes} bytes in {millis} ms",
     ),

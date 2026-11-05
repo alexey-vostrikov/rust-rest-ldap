@@ -131,6 +131,15 @@ pub struct Cli {
     #[arg(long = "reindex", conflicts_with_all = ["listen", "import_ldif"])]
     pub reindex: bool,
 
+    /// Rewrite the store, returning the space that deleted entries left behind, then exit
+    ///
+    /// Redb is copy-on-write: a commit writes new pages and frees the old ones, and the freed
+    /// space is reused but never given back to the filesystem. A store that held an import and
+    /// then lost most of it keeps its size, and this is what shrinks it. Needs room on disk for
+    /// a second copy while it runs, and refuses to start while anything else has the file open.
+    #[arg(long = "compact", conflicts_with_all = ["listen", "import_ldif"])]
+    pub compact: bool,
+
     /// Check the configuration, the schema, the data files and the store, then exit
     ///
     /// What `slaptest` does: says whether this configuration would start, without binding a
@@ -156,6 +165,7 @@ impl From<Cli> for config::Args {
             allow_existing_entry: cli.allow_existing_entry,
             check_config: cli.check_config,
             check_index: cli.check_index,
+            compact: cli.compact,
             config_commit: cli.config_commit,
             config_rollback: cli.config_rollback,
             config_history: cli.config_history,
