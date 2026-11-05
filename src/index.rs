@@ -10,6 +10,7 @@
 //! contiguous range of ids and every index is a bitmap over the same numbering.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
@@ -349,57 +350,75 @@ fn bits_kinds(bits: u32) -> Option<BTreeSet<Kind>> {
     Some(kinds)
 }
 
-fn write_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
+// The writers take a sink rather than a `Vec`, and that is not style: a snapshot of three million
+// entries is 2.16 GB, and building it in memory meant holding the directory **and** a second copy
+// of its postings at once. On a 30 GB machine that put the process into swap at start, where it
+// read 82 GB off the disk and wrote almost nothing for sixteen minutes - measured. Handed a file,
+// the same bytes are written once and never held.
+fn write_u32(out: &mut dyn Write, value: u32) -> io::Result<()> {
+    out.write_all(&value.to_le_bytes())
 }
 
-fn write_text(out: &mut Vec<u8>, text: &str) {
-    write_u32(out, text.len() as u32);
-    out.extend_from_slice(text.as_bytes());
+fn write_text(out: &mut dyn Write, text: &str) -> io::Result<()> {
+    write_u32(out, text.len() as u32)?;
+    out.write_all(text.as_bytes())
 }
 
-fn write_names<'a, I>(out: &mut Vec<u8>, names: I)
+fn write_names<'a, I>(out: &mut dyn Write, names: I) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Arc<str>>,
 {
     let names: Vec<&Arc<str>> = names.into_iter().collect();
-    write_u32(out, names.len() as u32);
+    write_u32(out, names.len() as u32)?;
     for name in names {
-        write_text(out, name);
+        write_text(out, name)?;
     }
+    Ok(())
 }
 
-fn write_bitmap(out: &mut Vec<u8>, bitmap: &RoaringBitmap) {
-    write_u32(out, bitmap.len() as u32);
+fn write_bitmap(out: &mut dyn Write, bitmap: &RoaringBitmap) -> io::Result<()> {
+    write_u32(out, bitmap.len() as u32)?;
+    // Four bytes at a time through a buffered writer is a call per id; two million of those is
+    // still faster than one allocation of the whole set, and the buffer is what turns them into
+    // sequential writes.
+    let mut batch = Vec::with_capacity(4 * 1024);
     for id in bitmap {
-        write_u32(out, id);
+        batch.extend_from_slice(&id.to_le_bytes());
+        if batch.len() >= 4 * 1024 {
+            out.write_all(&batch)?;
+            batch.clear();
+        }
     }
+    out.write_all(&batch)
 }
 
-fn write_bitmaps(out: &mut Vec<u8>, map: &HashMap<Arc<str>, RoaringBitmap>) {
-    write_u32(out, map.len() as u32);
+fn write_bitmaps(out: &mut dyn Write, map: &HashMap<Arc<str>, RoaringBitmap>) -> io::Result<()> {
+    write_u32(out, map.len() as u32)?;
     for (name, bitmap) in map {
-        write_text(out, name);
-        write_bitmap(out, bitmap);
+        write_text(out, name)?;
+        write_bitmap(out, bitmap)?;
     }
+    Ok(())
 }
 
 fn write_nested<F>(
-    out: &mut Vec<u8>,
+    out: &mut dyn Write,
     map: &HashMap<Arc<str>, HashMap<String, RoaringBitmap>>,
     key: F,
-) where
-    F: Fn(&mut Vec<u8>, &str),
+) -> io::Result<()>
+where
+    F: Fn(&mut dyn Write, &str) -> io::Result<()>,
 {
-    write_u32(out, map.len() as u32);
+    write_u32(out, map.len() as u32)?;
     for (name, values) in map {
-        write_text(out, name);
-        write_u32(out, values.len() as u32);
+        write_text(out, name)?;
+        write_u32(out, values.len() as u32)?;
         for (value, bitmap) in values {
-            key(out, value);
-            write_bitmap(out, bitmap);
+            key(out, value)?;
+            write_bitmap(out, bitmap)?;
         }
     }
+    Ok(())
 }
 
 /// Reads the format [`Index::encode`] writes, refusing anything short or malformed.
@@ -597,60 +616,75 @@ impl Index {
     /// snapshot was built from, and the reader recomputes it before trusting anything here.
     pub fn encode(&self, fingerprint: u64, ids: &[(String, u32)], next_id: u32) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
-        out.extend_from_slice(&fingerprint.to_le_bytes());
-        out.extend_from_slice(&kinds_bits(&self.default_kinds).to_le_bytes());
+        self.encode_into(&mut out, fingerprint, ids, next_id)
+            .expect("writing to a Vec cannot fail");
+        out
+    }
+
+    /// Writes the same bytes as [`Self::encode`] into any sink.
+    ///
+    /// This is what a start uses, so the snapshot goes from the index to the file in one pass: no
+    /// second copy of the postings in memory, and no 2.16 GB allocation on top of the directory
+    /// that is already resident. The format is written front to back with every count known before
+    /// it is needed, so nothing has to be patched afterwards - which is what makes streaming it
+    /// possible at all.
+    pub fn encode_into(
+        &self,
+        out: &mut dyn Write,
+        fingerprint: u64,
+        ids: &[(String, u32)],
+        next_id: u32,
+    ) -> io::Result<()> {
+        out.write_all(MAGIC)?;
+        out.write_all(&SNAPSHOT_VERSION.to_le_bytes())?;
+        out.write_all(&fingerprint.to_le_bytes())?;
+        out.write_all(&kinds_bits(&self.default_kinds).to_le_bytes())?;
 
         // The numbering travels with the postings, by DN. A posting is a number and nothing else
         // says which entry that number names: after an insert the ids are no longer the canonical
         // positions, and a start that assumed positions would answer about other entries - the
         // defect this whole numbering exists to prevent. Positions cannot carry this, because the
         // canonical order itself changes when entries arrive or go.
-        write_u32(&mut out, next_id);
-        write_u32(&mut out, ids.len() as u32);
+        write_u32(out, next_id)?;
+        write_u32(out, ids.len() as u32)?;
         for (dn, id) in ids {
-            write_text(&mut out, dn);
-            write_u32(&mut out, *id);
+            write_text(out, dn)?;
+            write_u32(out, *id)?;
         }
 
-        write_names(&mut out, &self.case_sensitive);
-        write_names(&mut out, &self.ordered_numeric);
-        write_names(&mut out, &self.ordered_mixed);
+        write_names(out, &self.case_sensitive)?;
+        write_names(out, &self.ordered_numeric)?;
+        write_names(out, &self.ordered_mixed)?;
 
-        write_names(&mut out, self.built.keys());
+        write_names(out, self.built.keys())?;
 
-        write_bitmaps(&mut out, &self.presence);
+        write_bitmaps(out, &self.presence)?;
 
         // The three two-level maps differ only in how a key is spelled, so one pair of helpers
         // writes and reads all of them.
-        write_nested(&mut out, &self.equality, |out, value| {
-            write_text(out, value)
-        });
-        write_nested(&mut out, &self.substrings, |out, value| {
-            write_text(out, value)
-        });
+        write_nested(out, &self.equality, |out, value| write_text(out, value))?;
+        write_nested(out, &self.substrings, |out, value| write_text(out, value))?;
 
-        out.extend_from_slice(&(self.ordered.len() as u32).to_le_bytes());
+        write_u32(out, self.ordered.len() as u32)?;
         for (attribute, values) in &self.ordered {
-            write_text(&mut out, attribute);
-            out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            write_text(out, attribute)?;
+            write_u32(out, values.len() as u32)?;
             for (key, bitmap) in values {
                 match key {
                     OrderKey::Num(number) => {
-                        out.push(0);
-                        out.extend_from_slice(&number.to_le_bytes());
+                        out.write_all(&[0])?;
+                        out.write_all(&number.to_le_bytes())?;
                     }
                     OrderKey::Text(text) => {
-                        out.push(1);
-                        write_text(&mut out, text);
+                        out.write_all(&[1])?;
+                        write_text(out, text)?;
                     }
                 }
-                write_bitmap(&mut out, bitmap);
+                write_bitmap(out, bitmap)?;
             }
         }
 
-        out
+        Ok(())
     }
 
     /// Reads a snapshot, or reports that it cannot be trusted.
@@ -957,39 +991,48 @@ impl Index {
     /// alongside because `StoredEntry` deliberately does not carry it - the journal keys by CSN.
     pub fn encode_delta(changes: &[IndexChange]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(DELTA_MAGIC);
-        out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
-        write_u32(&mut out, changes.len() as u32);
+        Self::encode_delta_into(&mut out, changes).expect("writing to a Vec cannot fail");
+        out
+    }
 
-        let push_entry = |out: &mut Vec<u8>, entry: &Entry| {
-            write_text(out, entry.dn());
+    /// The same bytes, written to a sink.
+    ///
+    /// A delta is small - one change set - but it goes through the same writers as the snapshot,
+    /// and keeping one format is worth more than the two lines a `Vec` would save.
+    pub fn encode_delta_into(out: &mut dyn Write, changes: &[IndexChange]) -> io::Result<()> {
+        out.write_all(DELTA_MAGIC)?;
+        out.write_all(&SNAPSHOT_VERSION.to_le_bytes())?;
+        write_u32(out, changes.len() as u32)?;
+
+        fn push_entry(out: &mut dyn Write, entry: &Entry) -> io::Result<()> {
+            write_text(out, entry.dn())?;
             let json = serde_json::to_vec(&StoredShape::from_entry(entry)).unwrap_or_default();
-            write_u32(out, json.len() as u32);
-            out.extend_from_slice(&json);
-        };
+            write_u32(out, json.len() as u32)?;
+            out.write_all(&json)
+        }
 
         for change in changes {
             match change {
                 IndexChange::Add { id, entry } => {
-                    out.push(0);
-                    write_u32(&mut out, *id);
-                    push_entry(&mut out, entry);
+                    out.write_all(&[0])?;
+                    write_u32(out, *id)?;
+                    push_entry(out, entry)?;
                 }
                 IndexChange::Replace { id, before, after } => {
-                    out.push(1);
-                    write_u32(&mut out, *id);
-                    push_entry(&mut out, before);
-                    push_entry(&mut out, after);
+                    out.write_all(&[1])?;
+                    write_u32(out, *id)?;
+                    push_entry(out, before)?;
+                    push_entry(out, after)?;
                 }
                 IndexChange::Remove { id, entry } => {
-                    out.push(2);
-                    write_u32(&mut out, *id);
-                    push_entry(&mut out, entry);
+                    out.write_all(&[2])?;
+                    write_u32(out, *id)?;
+                    push_entry(out, entry)?;
                 }
             }
         }
 
-        out
+        Ok(())
     }
 
     /// Reads a delta, or reports that it cannot be trusted.

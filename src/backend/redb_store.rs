@@ -32,14 +32,6 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// and a replica reading the journal would then replay a change that never was.
 const CHANGES: TableDefinition<&str, &[u8]> = TableDefinition::new("changes");
 
-/// The search index as it stood when the data did, so a start can read it instead of building it.
-///
-/// A separate table rather than a row in `meta`: the value is large, and it is derived data that
-/// may be dropped at any moment. Keeping it apart means `clear_index` cannot touch the format
-/// version or anything else the store needs to open.
-const INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("index");
-const INDEX_KEY: &str = "snapshot";
-
 /// Posting changes made since the snapshot was written, one record per change set.
 ///
 /// Keyed by the store's change counter, so a gap is visible: the snapshot records the counter it
@@ -64,6 +56,12 @@ struct StoredAttribute {
     values: Vec<String>,
     #[serde(default)]
     flags: AttributeFlags,
+    /// One change per value, in the same order; absent when nothing recorded one.
+    ///
+    /// Stored rather than derived: it is the only record of which node's change wrote a value, and
+    /// a value whose history is lost cannot be merged - only overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value_csns: Option<Vec<String>>,
 }
 
 /// The ordering key of a change: the entry's own `entryCSN`.
@@ -211,6 +209,10 @@ impl StoredEntry {
                     name: attribute.name.to_string(),
                     values: attribute.values.to_vec(),
                     flags: attribute.flags,
+                    value_csns: attribute
+                        .value_csns
+                        .as_ref()
+                        .map(|stamps| stamps.iter().map(|csn| csn.to_string()).collect()),
                 })
                 .collect(),
         }
@@ -223,6 +225,12 @@ impl StoredEntry {
                 name: crate::model::attribute_name(&attribute.name),
                 values: attribute.values.into_boxed_slice(),
                 flags: attribute.flags,
+                value_csns: attribute.value_csns.map(|stamps| {
+                    stamps
+                        .into_iter()
+                        .map(|csn| std::sync::Arc::from(csn.as_str()))
+                        .collect()
+                }),
             });
         }
         Entry::new(dn.to_string(), attributes)
@@ -253,6 +261,17 @@ pub struct RedbBackend {
     /// which a synchronised search already reads as "no journal", and it answers with a full
     /// refresh instead of pretending to know what changed.
     journal: bool,
+    /// Where the index snapshot lives: a plain file next to the store, not a row in it.
+    ///
+    /// It was a row once, and that is where fifteen minutes of every large start went. A single
+    /// value of 2.16 GB is not what a B-tree handles: writing it made redb read **85 GB** and
+    /// write 400 KB, the process sat in `D`, and the port was not open for sixteen minutes on
+    /// three million entries - while the value itself, written sequentially, takes seconds.
+    ///
+    /// It is also a cache, not data: it never has to be consistent with the store in the way a
+    /// change does, it only has to be either the snapshot of a moment or absent. A file replaced
+    /// by `rename` gives exactly that, without a transaction that the write path has to wait for.
+    snapshot_path: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for RedbBackend {
@@ -302,11 +321,18 @@ impl RedbBackend {
             reason: source.to_string(),
         })?;
 
+        // `load.redb` -> `load.redb.index`. Beside the store, because that is where an operator
+        // looks for what belongs to it, and with the same stem so a copy of the store carries it.
+        let mut snapshot_path = path.to_path_buf().into_os_string();
+        snapshot_path.push(".index");
+        let snapshot_path = std::path::PathBuf::from(snapshot_path);
+
         let backend = Self {
             path: path.to_path_buf(),
             database: std::sync::Arc::new(database),
             durability,
             journal,
+            snapshot_path,
         };
         backend.write_format_version()?;
         Ok(backend)
@@ -871,44 +897,70 @@ impl RedbBackend {
     /// `sequence` is the counter value the index was built from. Deltas up to and including it
     /// become unnecessary and are dropped here rather than left to be read and skipped on every
     /// start - the table would otherwise grow with the history instead of with the gap.
-    pub fn save_index(&self, bytes: &[u8], sequence: u64) -> Result<(), BackendError> {
-        let mut transaction = self
+    /// Writes the snapshot straight to its file: the index fills a buffered sink, nothing of it is
+    /// held whole.
+    ///
+    /// See [`Self::save_index`] for why the bytes live in a file at all; this is the form a start
+    /// uses, because building the same 2.16 GB in a `Vec` is a second copy of the postings on top of
+    /// a directory that is already in memory.
+    pub fn save_index_streaming(
+        &self,
+        sequence: u64,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> Result<(), BackendError> {
+        let temporary = self.snapshot_temporary();
+        {
+            let file = std::fs::File::create(&temporary).map_err(|source| BackendError::Redb {
+                path: temporary.display().to_string(),
+                reason: source.to_string(),
+            })?;
+            let mut buffered = std::io::BufWriter::with_capacity(1 << 20, file);
+            produce(&mut buffered).map_err(|source| BackendError::Redb {
+                path: temporary.display().to_string(),
+                reason: source.to_string(),
+            })?;
+            let file = buffered.into_inner().map_err(|err| BackendError::Redb {
+                path: temporary.display().to_string(),
+                reason: err.to_string(),
+            })?;
+            file.sync_all().map_err(|source| BackendError::Redb {
+                path: temporary.display().to_string(),
+                reason: source.to_string(),
+            })?;
+        }
+
+        self.adopt_snapshot(&temporary, sequence)
+    }
+
+    /// Makes a written snapshot current: rename into place, then record what it covers.
+    ///
+    /// The order is the point. A counter that named a snapshot the file does not hold would have a
+    /// start replay deltas onto nothing; a file whose counter was never written is ignored, which
+    /// costs one rebuild and lies to nobody.
+    fn adopt_snapshot(
+        &self,
+        temporary: &std::path::Path,
+        sequence: u64,
+    ) -> Result<(), BackendError> {
+        std::fs::rename(temporary, &self.snapshot_path).map_err(|source| BackendError::Redb {
+            path: self.snapshot_path.display().to_string(),
+            reason: source.to_string(),
+        })?;
+
+        self.record_snapshot_sequence(sequence)
+    }
+
+    /// Records which change the snapshot in the file covers, and drops the deltas it makes
+    /// unnecessary.
+    fn record_snapshot_sequence(&self, sequence: u64) -> Result<(), BackendError> {
+        let transaction = self
             .database
             .begin_write()
             .map_err(|source| BackendError::Redb {
                 path: "<database>".to_string(),
                 reason: source.to_string(),
             })?;
-
-        // Immediate, whatever the store's own setting says. Measured on a three-million-entry
-        // store configured `durability: none`: the snapshot was written, the file grew from 5.84
-        // to 8.00 GB, and after a restart the index was built again from scratch - the commit was
-        // never made durable, so it was rolled back and the space came back. The operator paid
-        // 2.16 GB and got nothing.
-        //
-        // The setting is about entries, where a bulk import is worth risking the last commits
-        // for; it is not about this. A snapshot is a startup cache, and a cache that silently
-        // disappears is worse than no cache, because the cost was already paid.
-        transaction
-            .set_durability(Durability::Immediate)
-            .map_err(|source| BackendError::Redb {
-                path: "<database>".to_string(),
-                reason: source.to_string(),
-            })?;
         {
-            let mut table = transaction
-                .open_table(INDEX)
-                .map_err(|source| BackendError::Redb {
-                    path: "<index>".to_string(),
-                    reason: source.to_string(),
-                })?;
-            table
-                .insert(INDEX_KEY, bytes)
-                .map_err(|source| BackendError::Redb {
-                    path: "<index>".to_string(),
-                    reason: source.to_string(),
-                })?;
-
             let mut meta = transaction
                 .open_table(META)
                 .map_err(|source| BackendError::Redb {
@@ -950,11 +1002,56 @@ impl RedbBackend {
         Ok(())
     }
 
+    /// Writes a snapshot the caller already has in memory.
+    ///
+    /// Kept for the tests, which hold a snapshot and want it stored; a start encodes straight into
+    /// the sink instead (see [`Self::save_index_streaming`]).
+    pub fn save_index(&self, bytes: &[u8], sequence: u64) -> Result<(), BackendError> {
+        let temporary = self.snapshot_temporary();
+        {
+            use std::io::Write as _;
+            let mut file =
+                std::fs::File::create(&temporary).map_err(|source| BackendError::Redb {
+                    path: temporary.display().to_string(),
+                    reason: source.to_string(),
+                })?;
+            file.write_all(bytes).map_err(|source| BackendError::Redb {
+                path: temporary.display().to_string(),
+                reason: source.to_string(),
+            })?;
+            // Durable before it is adopted: a snapshot that vanishes in a power cut leaves the
+            // store naming a file that is not there.
+            file.sync_all().map_err(|source| BackendError::Redb {
+                path: temporary.display().to_string(),
+                reason: source.to_string(),
+            })?;
+        }
+        self.adopt_snapshot(&temporary, sequence)
+    }
+
+    /// The name the new snapshot is written under before it replaces the old one.
+    ///
+    /// The pid in it is not decoration: two processes never hold this store at once (redb takes a
+    /// lock), but a crash can leave a temporary behind, and a leftover from another run must not be
+    /// mistaken for this one's work in progress.
+    fn snapshot_temporary(&self) -> std::path::PathBuf {
+        let mut name = self.snapshot_path.clone().into_os_string();
+        name.push(format!(".{}.tmp", std::process::id()));
+        std::path::PathBuf::from(name)
+    }
+
     /// The stored snapshot and the change it reflects, if there is one.
     ///
-    /// `None` is ordinary and means "build the index": an empty store, a store written by an
-    /// older build, or one whose snapshot was cleared.
+    /// `None` is ordinary and means "build the index": an empty store, a store written by an older
+    /// build, or one whose snapshot was cleared. A file without a counter beside it in the store is
+    /// `None` too - the file was written and the store was not, so the change it covers is unknown,
+    /// and a snapshot whose extent is a guess is not a cache but a way to answer about entries that
+    /// never existed.
     pub fn load_index(&self) -> Result<Option<(Vec<u8>, u64)>, BackendError> {
+        if !self.snapshot_path.exists() {
+            return Ok(None);
+        }
+
         let transaction = self
             .database
             .begin_read()
@@ -962,7 +1059,6 @@ impl RedbBackend {
                 path: "<database>".to_string(),
                 reason: source.to_string(),
             })?;
-
         let meta = match transaction.open_table(META) {
             Ok(meta) => meta,
             Err(_) => return Ok(None),
@@ -970,19 +1066,14 @@ impl RedbBackend {
         let Some(sequence) = snapshot_sequence(&meta)? else {
             return Ok(None);
         };
+        drop(transaction);
 
-        let table = match transaction.open_table(INDEX) {
-            Ok(table) => table,
-            // The table does not exist until something is written into it.
-            Err(_) => return Ok(None),
-        };
-
-        let value = table.get(INDEX_KEY).map_err(|source| BackendError::Redb {
-            path: "<index>".to_string(),
+        let bytes = std::fs::read(&self.snapshot_path).map_err(|source| BackendError::Redb {
+            path: self.snapshot_path.display().to_string(),
             reason: source.to_string(),
         })?;
 
-        Ok(value.map(|value| (value.value().to_vec(), sequence)))
+        Ok(Some((bytes, sequence)))
     }
 
     /// How many bytes of recorded changes sit after `after`, snapshot excluded.
@@ -1121,16 +1212,19 @@ impl RedbBackend {
                 reason: source.to_string(),
             })?;
         {
-            let mut table = transaction
-                .open_table(INDEX)
+            // The file goes first: a counter that says "the snapshot covers up to N" must never
+            // outlive the snapshot it describes, or a start would trust a file that is not there.
+            let _ = std::fs::remove_file(&self.snapshot_path);
+
+            let mut meta = transaction
+                .open_table(META)
                 .map_err(|source| BackendError::Redb {
-                    path: "<index>".to_string(),
+                    path: "<meta>".to_string(),
                     reason: source.to_string(),
                 })?;
-            table
-                .remove(INDEX_KEY)
+            meta.remove(META_INDEX_SEQ)
                 .map_err(|source| BackendError::Redb {
-                    path: "<index>".to_string(),
+                    path: "<meta>".to_string(),
                     reason: source.to_string(),
                 })?;
 
@@ -1145,18 +1239,6 @@ impl RedbBackend {
                 .retain(|_, _| false)
                 .map_err(|source| BackendError::Redb {
                     path: "<index_delta>".to_string(),
-                    reason: source.to_string(),
-                })?;
-
-            let mut meta = transaction
-                .open_table(META)
-                .map_err(|source| BackendError::Redb {
-                    path: "<meta>".to_string(),
-                    reason: source.to_string(),
-                })?;
-            meta.remove(META_INDEX_SEQ)
-                .map_err(|source| BackendError::Redb {
-                    path: "<meta>".to_string(),
                     reason: source.to_string(),
                 })?;
         }
