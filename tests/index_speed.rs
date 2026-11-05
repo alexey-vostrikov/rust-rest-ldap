@@ -56,6 +56,7 @@ fn config() -> IndexConfig {
             )
         })
         .collect(),
+        ..Default::default()
     }
 }
 

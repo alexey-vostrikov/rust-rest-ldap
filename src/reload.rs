@@ -41,6 +41,9 @@ pub struct Source {
     schema_sources: std::sync::RwLock<SchemaSources>,
     schema_mode: SchemaMode,
     indexes: IndexConfig,
+    /// Set while a snapshot rewrite is running, so two cannot encode the same index at once and
+    /// delete each other's deltas.
+    snapshot_rewriting: Arc<std::sync::atomic::AtomicBool>,
     /// Where writes are announced, so a persistent search can be told about them.
     ///
     /// A broadcast channel and not a queue per subscriber: the number of listeners is not known
@@ -174,6 +177,7 @@ impl Source {
             current: RwLock::new(Arc::clone(&directory)),
             generation: RwLock::new(0),
             indexes: config.indexes.clone(),
+            snapshot_rewriting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             schema: crate::security::shared_schema(config.schema.clone()),
             schema_sources: std::sync::RwLock::new(SchemaSources::from_config(config)),
             schema_mode: config.schema_mode,
@@ -406,13 +410,14 @@ impl Source {
     /// single `modify` take about half a second while the directory was being read by everyone
     /// else.
     pub async fn apply(&self, changes: &[EntryChange]) -> Result<usize, BackendError> {
-        self.backend.apply(changes).await?;
-
         if let Some(entries) = self.apply_in_place(changes).await? {
             self.announce(changes);
             return Ok(entries);
         }
 
+        // The path that reads the store back: a backend that does not keep entries verbatim, or a
+        // change this one does not describe. The store is written first so the reload sees it.
+        self.backend.apply(changes).await?;
         let entries = self.reload().await?;
         self.announce(changes);
 
@@ -458,6 +463,21 @@ impl Source {
             eprintln!("{}", crate::i18n::t("warn.schema", &[("detail", &problem)]));
         }
 
+        let mut current = self.current.write().await;
+
+        // The store is written here, under the snapshot lock, and the reason is the counter:
+        // written outside it, two concurrent change sets could be numbered 5 and 6 and then
+        // applied to the snapshot in the other order, so the delta filed as 5 would describe a
+        // snapshot that already includes 6 - and the next start would replay 6 a second time.
+        // Under one lock the numbering is also the application order, which is the only order the
+        // stored deltas can be replayed in. The cost is that a reader waits out one store write,
+        // measured in microseconds, and not the whole reload this path exists to avoid.
+        let sequence = match self.backend.apply(changes).await? {
+            Some(sequence) => sequence,
+            // A backend that cannot number its change sets is not one this path serves.
+            None => return Ok(None),
+        };
+
         // The snapshot moves even though the store was not read again: a paged search that is
         // half way through must notice that the directory changed under it.
         let snapshot = {
@@ -465,8 +485,6 @@ impl Source {
             *generation += 1;
             *generation
         };
-
-        let mut current = self.current.write().await;
 
         // A delete of something this snapshot still holds is a change to it; a delete of
         // something it does not hold is a replica applying a change it has already applied, and
@@ -524,9 +542,8 @@ impl Source {
         // Recorded for the next start, so it does not have to rebuild what this just built. A
         // failure is reported and not fatal: the index in memory is right either way, and the
         // next start simply builds it again.
-        if !applied.is_empty() {
+        {
             let bytes = crate::index::Index::encode_delta(&applied);
-            let sequence = self.backend.sequence()?;
             if let Err(err) = self.backend.append_index_delta(sequence, &bytes) {
                 eprintln!(
                     "{}",
@@ -542,7 +559,115 @@ impl Source {
             .entries(&self.base_dn, crate::directory::Scope::Subtree)
             .len();
 
+        // Taken after the last use of `directory`: what the rewriter gets is this snapshot as it
+        // stands now, together with the counter this change set was given. Anything written after
+        // it carries a larger counter, so its delta stays and the chain remains whole.
+        // The check is cheap - two metadata reads - and it runs here rather than inside the task
+        // for a reason that is not about speed: a task that exists only to discover there is
+        // nothing to do still holds the store open, and a store left open cannot be reopened by
+        // whoever comes next. A task is started only when there is work for it.
+        let due = self.snapshot_rewrite_due(sequence);
+        let retained = Arc::clone(&*current);
+        drop(current);
+
+        if due {
+            self.rewrite_snapshot_soon(retained, sequence);
+        }
+
         Ok(Some(entries))
+    }
+
+    /// Whether the recorded changes have grown past the point where replaying them costs more
+    /// than the snapshot they save.
+    ///
+    /// A read error answers `false` rather than propagating: this decides an optimisation, and a
+    /// write that already reached the store must not be reported as failed because a threshold
+    /// could not be read. The next write asks again.
+    fn snapshot_rewrite_due(&self, sequence: u64) -> bool {
+        let Ok(Some((snapshot_sequence, snapshot_bytes))) = self.backend.index_snapshot_size()
+        else {
+            return false;
+        };
+        if sequence <= snapshot_sequence {
+            return false;
+        }
+        let Ok(recorded) = self.backend.index_delta_bytes(snapshot_sequence) else {
+            return false;
+        };
+
+        recorded >= delta_budget(snapshot_bytes, self.indexes.snapshot_delta_bytes)
+    }
+
+    /// Rewrites the stored snapshot once the deltas have grown past what keeping them is worth.
+    ///
+    /// Deltas exist so that a restart does not rebuild the index. They are only worth their space
+    /// up to the point where replaying them costs more than the snapshot they save - and past that
+    /// point a node that is written to but never restarted accumulates them without limit, in a
+    /// table nobody reads. Measured against the snapshot's own size, so the threshold follows the
+    /// directory rather than a number guessed for one of its sizes.
+    ///
+    /// Nothing of this is on the client's path: a write is answered before the check runs, and the
+    /// encoding - seconds over a large index - happens on a blocking thread. One rewrite at a
+    /// time, because two would encode the same index twice and each delete the other's deltas.
+    fn rewrite_snapshot_soon(&self, directory: Arc<Directory>, sequence: u64) {
+        if self
+            .snapshot_rewriting
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let backend = Arc::clone(&self.backend);
+        let indexes = self.indexes.clone();
+        let flag = Arc::clone(&self.snapshot_rewriting);
+
+        tokio::spawn(async move {
+            let outcome =
+                tokio::task::spawn_blocking(move || -> Result<(usize, u64), BackendError> {
+                    let recorded = match backend.index_snapshot_size()? {
+                        Some((snapshot_sequence, _)) => {
+                            backend.index_delta_bytes(snapshot_sequence)?
+                        }
+                        None => 0,
+                    };
+
+                    let fingerprint =
+                        crate::index::data_fingerprint(directory.entries_in_order(), &indexes);
+                    let bytes = directory.index().encode(
+                        fingerprint,
+                        &directory.numbering(),
+                        directory.next_id(),
+                    );
+                    let written = bytes.len();
+                    backend.save_index(&bytes, sequence)?;
+
+                    Ok((written, recorded))
+                })
+                .await;
+
+            flag.store(false, std::sync::atomic::Ordering::Release);
+
+            match outcome {
+                Ok(Ok((written, recorded))) => println!(
+                    "{}",
+                    crate::i18n::t(
+                        "start.index_rewritten",
+                        &[
+                            ("bytes", &written.to_string()),
+                            ("recorded", &recorded.to_string())
+                        ]
+                    )
+                ),
+                Ok(Err(err)) => eprintln!(
+                    "{}",
+                    crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])
+                ),
+                Err(err) => eprintln!(
+                    "{}",
+                    crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])
+                ),
+            }
+        });
     }
 
     /// Rebuilds the indexes over the snapshot already in memory.
@@ -768,6 +893,19 @@ pub async fn reload_on_interval_with(
 /// `None` when the snapshot cannot be read against the deltas: the numbering has to cover every
 /// entry, and an entry the snapshot never saw and no delta added means the chain is not the whole
 /// story. Rebuilding is correct and costs a minute; guessing is not.
+/// How many bytes of recorded changes are worth keeping before the snapshot is rewritten.
+///
+/// Expressed against the snapshot rather than as an absolute number, because the directory's sizes
+/// differ by four orders of magnitude and a number right for one is wrong for the others: two
+/// gigabytes of snapshot with a megabyte of changes is a rounding error, a megabyte of snapshot
+/// with the same changes is the changes outweighing what they were meant to save.
+fn delta_budget(snapshot_bytes: usize, configured: Option<u64>) -> u64 {
+    if let Some(bytes) = configured {
+        return bytes;
+    }
+    (snapshot_bytes as u64 / 4).max(1024 * 1024)
+}
+
 fn replay(
     directory: &Directory,
     snapshot: &[u8],
@@ -1089,6 +1227,7 @@ mod tests {
         config.indexes = crate::index::IndexConfig {
             default: vec!["pres".to_string()],
             attributes: Default::default(),
+            ..Default::default()
         };
 
         let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");
@@ -1121,6 +1260,7 @@ mod tests {
         config.indexes = crate::index::IndexConfig {
             default: vec!["pres".to_string()],
             attributes: Default::default(),
+            ..Default::default()
         };
 
         let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");

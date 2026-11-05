@@ -32,6 +32,12 @@ fn person(cn: &str, stamp: &str) -> Entry {
 }
 
 fn config(path: &std::path::Path) -> Config {
+    config_with(path, "")
+}
+
+/// The same configuration with extra lines inside `indexes:`, for the tests that set the rewrite
+/// threshold.
+fn config_with(path: &std::path::Path, indexes_extra: &str) -> Config {
     let text = format!(
         "\
 base_dn: {BASE}
@@ -39,7 +45,7 @@ indexes:
   attributes:
     cn: [eq, sub]
     uid: [eq]
-backends:
+{indexes_extra}backends:
   redb:
     path: {}
 ",
@@ -238,4 +244,92 @@ async fn a_deletion_between_starts_is_replayed_too() {
         Some(1),
         "and keeps the one that stayed"
     );
+}
+
+#[tokio::test]
+async fn the_snapshot_is_rewritten_once_the_recorded_changes_outgrow_it() {
+    // The deltas exist so a restart does not rebuild the index, and they are worth their space
+    // only while replaying them costs less than the snapshot they save. A node written to and
+    // never restarted otherwise accumulates them in a table nobody reads.
+    //
+    // The threshold here is one byte, so a single change is past it: what is tested is that the
+    // rewrite happens at all, not where exactly the line is drawn.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+
+    // A first start writes the snapshot the rewrite is measured against.
+    drop(load(&path).await);
+
+    let config = config_with(&path, "  snapshot_delta_bytes: 1\n");
+
+    // Read before a source exists: the source holds the store open, and a second opener is
+    // refused rather than served.
+    let built = stored_snapshot(&path);
+
+    let backend = open(&path);
+    let (source, _) = Source::load(&config, backend).await.expect("load");
+
+    source
+        .apply(&[EntryChange::Upsert {
+            entry: person("carol", "20260101000000.000000Z#000002#001#000000"),
+        }])
+        .await
+        .expect("apply");
+
+    // The rewrite is deliberately off the client's path, and the task holds the store open while
+    // it runs - so the source has to go before the store can be read back at all.
+    drop(source);
+    let rewritten = wait_for_snapshot_change(&path, &built).await;
+    assert!(
+        rewritten,
+        "the snapshot is rewritten once the recorded changes are past the threshold"
+    );
+
+    // What the rewrite bought: no deltas left to replay, and a snapshot that still answers for
+    // the entry which only ever arrived through one.
+    let deltas = open(&path).index_delta_bytes(0).expect("deltas");
+    assert_eq!(deltas, 0, "the changes the new snapshot covers are dropped");
+
+    let after = load(&path).await;
+    assert_eq!(
+        matches_from_index(&after, "carol").await,
+        Some(1),
+        "the rewritten snapshot includes the entry that arrived after the old one"
+    );
+    assert_eq!(
+        matches_from_index(&after, "alice").await,
+        Some(1),
+        "and the one from before it"
+    );
+}
+
+/// Waits for the background rewrite, which runs on a blocking thread after the write is answered.
+///
+/// The store is opened without the panic `open` uses, because the rewrite task holds it open
+/// while it runs and that is the normal state this function is waiting out, not a failure.
+async fn wait_for_snapshot_change(path: &std::path::Path, built: &[u8]) -> bool {
+    for _ in 0..600 {
+        let opened = Backend::from_config(
+            "redb",
+            Some(&serde_json::json!({"path": path.display().to_string()})),
+        );
+        if let Ok(backend) = opened
+            && let Ok(Some((bytes, _))) = backend.load_index()
+            && bytes != built
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
 }
