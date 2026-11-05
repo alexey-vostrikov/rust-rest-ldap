@@ -265,14 +265,6 @@ impl Backend {
     }
 
     /// Records one change set's posting changes for the next start.
-    /// The stored snapshot's size and the counter it covers, without reading the bytes.
-    pub fn index_snapshot_size(&self) -> Result<Option<(u64, usize)>, BackendError> {
-        match self {
-            Backend::Redb(backend) => backend.index_snapshot_size(),
-            _ => Ok(None),
-        }
-    }
-
     /// Bytes of recorded index changes after `after`. Zero where the backend keeps none.
     pub fn index_delta_bytes(&self, after: u64) -> Result<u64, BackendError> {
         match self {

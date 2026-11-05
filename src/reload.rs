@@ -22,6 +22,35 @@ use crate::index::IndexConfig;
 use crate::model::Entry;
 use crate::schema::{Mode as SchemaMode, Schema};
 
+/// What the stored index snapshot is, as the process knows it: its counter and its size.
+///
+/// Both are written on the same three occasions - a snapshot read, built, or rewritten - and read
+/// on every write, which is why they are atomics rather than a lock: a write needs the answer, not
+/// exclusive access to it.
+#[derive(Debug, Default)]
+pub struct SnapshotKnown {
+    sequence: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+impl SnapshotKnown {
+    /// Records a snapshot: the counter it covers and its size.
+    fn remember(&self, sequence: u64, bytes: usize) {
+        self.sequence
+            .store(sequence, std::sync::atomic::Ordering::Release);
+        self.bytes
+            .store(bytes as u64, std::sync::atomic::Ordering::Release);
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Holds the current directory snapshot and knows how to rebuild it.
 pub struct Source {
     backend: Arc<Backend>,
@@ -44,6 +73,13 @@ pub struct Source {
     /// Set while a snapshot rewrite is running, so two cannot encode the same index at once and
     /// delete each other's deltas.
     snapshot_rewriting: Arc<std::sync::atomic::AtomicBool>,
+    /// What the store holds: the counter the snapshot covers and how many bytes it is.
+    ///
+    /// Kept here rather than asked of the store, because asking costs a copy of the snapshot
+    /// itself: on a million entries the blob is about 700 MB, and `snapshot_rewrite_due` runs on
+    /// every write - 164 ms per modify, measured, for a number that had not changed. Two words of
+    /// memory instead.
+    snapshot_known: Arc<SnapshotKnown>,
     /// Where writes are announced, so a persistent search can be told about them.
     ///
     /// A broadcast channel and not a queue per subscriber: the number of listeners is not known
@@ -89,6 +125,13 @@ impl Source {
         let sequence = backend.sequence()?;
 
         let stored = backend.load_index()?;
+        // What the store holds, as the process will remember it. The number is the one the
+        // snapshot covers, not the counter's current value: the deltas after it are what a start
+        // would replay, and what a rewrite measures itself against.
+        let known = SnapshotKnown::default();
+        if let Some((bytes, snapshot_sequence)) = &stored {
+            known.remember(*snapshot_sequence, bytes.len());
+        }
         let reused = match stored {
             Some((bytes, snapshot_sequence)) => {
                 match crate::index::Index::decode_with_ids(&bytes, fingerprint) {
@@ -149,11 +192,12 @@ impl Source {
                     &directory.numbering(),
                     directory.next_id(),
                 );
-                if let Err(err) = backend.save_index(&bytes, sequence) {
-                    eprintln!(
+                match backend.save_index(&bytes, sequence) {
+                    Ok(()) => known.remember(sequence, bytes.len()),
+                    Err(err) => eprintln!(
                         "{}",
                         crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])
-                    );
+                    ),
                 }
 
                 directory
@@ -178,6 +222,7 @@ impl Source {
             generation: RwLock::new(0),
             indexes: config.indexes.clone(),
             snapshot_rewriting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            snapshot_known: Arc::new(known),
             schema: crate::security::shared_schema(config.schema.clone()),
             schema_sources: std::sync::RwLock::new(SchemaSources::from_config(config)),
             schema_mode: config.schema_mode,
@@ -542,7 +587,7 @@ impl Source {
         // Recorded for the next start, so it does not have to rebuild what this just built. A
         // failure is reported and not fatal: the index in memory is right either way, and the
         // next start simply builds it again.
-        {
+        if !applied.is_empty() {
             let bytes = crate::index::Index::encode_delta(&applied);
             if let Err(err) = self.backend.append_index_delta(sequence, &bytes) {
                 eprintln!(
@@ -555,9 +600,10 @@ impl Source {
         directory.set_snapshot(snapshot);
         directory.set_csn(self.backend.journal_head()?);
         directory.set_floor(self.backend.journal_floor()?);
-        let entries = directory
-            .entries(&self.base_dn, crate::directory::Scope::Subtree)
-            .len();
+        // Counted by the directory as it changed, not by walking it here: a pass over every entry
+        // with a suffix comparison on each ran on every write, to report a number that moved by
+        // one.
+        let entries = directory.entry_count();
 
         // Taken after the last use of `directory`: what the rewriter gets is this snapshot as it
         // stands now, together with the counter this change set was given. Anything written after
@@ -584,10 +630,8 @@ impl Source {
     /// write that already reached the store must not be reported as failed because a threshold
     /// could not be read. The next write asks again.
     fn snapshot_rewrite_due(&self, sequence: u64) -> bool {
-        let Ok(Some((snapshot_sequence, snapshot_bytes))) = self.backend.index_snapshot_size()
-        else {
-            return false;
-        };
+        let snapshot_sequence = self.snapshot_known.sequence();
+        let snapshot_bytes = self.snapshot_known.bytes() as usize;
         if sequence <= snapshot_sequence {
             return false;
         }
@@ -620,16 +664,15 @@ impl Source {
         let backend = Arc::clone(&self.backend);
         let indexes = self.indexes.clone();
         let flag = Arc::clone(&self.snapshot_rewriting);
+        let known = Arc::clone(&self.snapshot_known);
 
         tokio::spawn(async move {
             let outcome =
                 tokio::task::spawn_blocking(move || -> Result<(usize, u64), BackendError> {
-                    let recorded = match backend.index_snapshot_size()? {
-                        Some((snapshot_sequence, _)) => {
-                            backend.index_delta_bytes(snapshot_sequence)?
-                        }
-                        None => 0,
-                    };
+                    // What the rewrite replaces, for the log line: the changes the new snapshot
+                    // covers. Not a size to compare - the decision was taken before the task
+                    // started, from counters in memory.
+                    let recorded = backend.index_delta_bytes(known.sequence())?;
 
                     let fingerprint =
                         crate::index::data_fingerprint(directory.entries_in_order(), &indexes);
@@ -640,6 +683,7 @@ impl Source {
                     );
                     let written = bytes.len();
                     backend.save_index(&bytes, sequence)?;
+                    known.remember(sequence, written);
 
                     Ok((written, recorded))
                 })
@@ -709,9 +753,7 @@ impl Source {
         let directory = data
             .into_directory(&self.base_dn, &self.users_ou_name, &self.groups_ou_name)
             .with_indexes(&self.indexes)?;
-        let entries = directory
-            .entries(&self.base_dn, crate::directory::Scope::Subtree)
-            .len();
+        let entries = directory.entry_count();
 
         check_schema(&directory, &self.schema(), self.schema_mode)?;
 

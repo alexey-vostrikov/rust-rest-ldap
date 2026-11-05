@@ -631,6 +631,11 @@ pub async fn apply(
         uuid: change.uuid.clone(),
     };
 
+    // Let go before the change is applied: `local` is an answer about one DN, and holding the
+    // snapshot while the same directory is replaced made every replicated change copy the whole
+    // directory - the same defect the write path had (see `server.rs`).
+    drop(directory);
+
     let decision = crate::replication::merge(&local, &incoming);
 
     // Counted before it is carried out: an entry that fails to write is still a change the peer

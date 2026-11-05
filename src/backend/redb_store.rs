@@ -985,40 +985,6 @@ impl RedbBackend {
         Ok(value.map(|value| (value.value().to_vec(), sequence)))
     }
 
-    /// The size of the stored snapshot and the counter it covers, without reading it.
-    ///
-    /// `load_index` returns the bytes, which on three million entries is 2.16 GB copied out of the
-    /// store just to ask how big it is. Deciding whether the snapshot is worth rewriting needs the
-    /// number, not the content.
-    pub fn index_snapshot_size(&self) -> Result<Option<(u64, usize)>, BackendError> {
-        let transaction = self
-            .database
-            .begin_read()
-            .map_err(|source| BackendError::Redb {
-                path: "<database>".to_string(),
-                reason: source.to_string(),
-            })?;
-
-        let meta = match transaction.open_table(META) {
-            Ok(meta) => meta,
-            Err(_) => return Ok(None),
-        };
-        let Some(sequence) = snapshot_sequence(&meta)? else {
-            return Ok(None);
-        };
-
-        let table = match transaction.open_table(INDEX) {
-            Ok(table) => table,
-            Err(_) => return Ok(None),
-        };
-        let value = table.get(INDEX_KEY).map_err(|source| BackendError::Redb {
-            path: "<index>".to_string(),
-            reason: source.to_string(),
-        })?;
-
-        Ok(value.map(|value| (sequence, value.value().len())))
-    }
-
     /// How many bytes of recorded changes sit after `after`, snapshot excluded.
     ///
     /// This is what the rewrite threshold is measured against: the deltas exist to be replayed at
