@@ -39,6 +39,21 @@ const CHANGES: TableDefinition<&str, &[u8]> = TableDefinition::new("changes");
 /// version or anything else the store needs to open.
 const INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("index");
 const INDEX_KEY: &str = "snapshot";
+
+/// Posting changes made since the snapshot was written, one record per change set.
+///
+/// Keyed by the store's change counter, so a gap is visible: the snapshot records the counter it
+/// reflects, and a start that finds every value from there up to the current one knows the chain
+/// is unbroken. A start that finds a hole rebuilds - which is what a crash between the data
+/// commit and this one leaves, and the only honest reading of it.
+const INDEX_DELTA: TableDefinition<u64, &[u8]> = TableDefinition::new("index_delta");
+
+/// How many change sets the store has applied. Bumped in the same transaction as the data, so it
+/// says what the store holds rather than what some later step intended.
+const META_SEQ: &str = "store_seq";
+
+/// The counter value the stored snapshot reflects.
+const META_INDEX_SEQ: &str = "index_seq";
 const FORMAT_VERSION: &str = "1";
 const META_FORMAT: &str = "format";
 
@@ -126,6 +141,48 @@ impl Compaction {
     pub fn reclaimed(&self) -> u64 {
         self.before.saturating_sub(self.after)
     }
+}
+
+/// The change counter as the store records it.
+pub fn sequence_of<T>(meta: &T) -> Result<u64, BackendError>
+where
+    T: redb::ReadableTable<&'static str, &'static [u8]>,
+{
+    let value = meta.get(META_SEQ).map_err(|source| BackendError::Redb {
+        path: "<meta>".to_string(),
+        reason: source.to_string(),
+    })?;
+
+    Ok(value
+        .map(|value| {
+            let bytes = value.value();
+            let mut array = [0u8; 8];
+            let take = bytes.len().min(8);
+            array[..take].copy_from_slice(&bytes[..take]);
+            u64::from_le_bytes(array)
+        })
+        .unwrap_or(0))
+}
+
+/// The counter value a stored snapshot reflects, if there is one.
+fn snapshot_sequence<T>(meta: &T) -> Result<Option<u64>, BackendError>
+where
+    T: redb::ReadableTable<&'static str, &'static [u8]>,
+{
+    let value = meta
+        .get(META_INDEX_SEQ)
+        .map_err(|source| BackendError::Redb {
+            path: "<meta>".to_string(),
+            reason: source.to_string(),
+        })?;
+
+    Ok(value.map(|value| {
+        let bytes = value.value();
+        let mut array = [0u8; 8];
+        let take = bytes.len().min(8);
+        array[..take].copy_from_slice(&bytes[..take]);
+        u64::from_le_bytes(array)
+    }))
 }
 
 /// The size of a file, or zero when it cannot be read.
@@ -427,6 +484,13 @@ impl RedbBackend {
                         reason: source.to_string(),
                     })?;
 
+            let mut meta = transaction
+                .open_table(META)
+                .map_err(|source| BackendError::Redb {
+                    path: "<meta>".to_string(),
+                    reason: source.to_string(),
+                })?;
+
             for change in changes {
                 match change {
                     EntryChange::Upsert { entry } => {
@@ -522,6 +586,16 @@ impl RedbBackend {
                     }
                 }
             }
+
+            // The counter moves with the data, in the same transaction: a start compares it with
+            // what the index chain covers, and a counter that could lag the data would let a
+            // stale index look current.
+            let next = sequence_of(&meta)? + 1;
+            meta.insert(META_SEQ, next.to_le_bytes().as_slice())
+                .map_err(|source| BackendError::Redb {
+                    path: "<meta>".to_string(),
+                    reason: source.to_string(),
+                })?;
         }
 
         transaction.commit().map_err(|source| BackendError::Redb {
@@ -768,14 +842,28 @@ impl RedbBackend {
         Ok(doomed.len())
     }
 
-    /// Stores the index snapshot, replacing any previous one.
+    /// The store's change counter.
+    pub fn sequence(&self) -> Result<u64, BackendError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        let meta = match transaction.open_table(META) {
+            Ok(meta) => meta,
+            Err(_) => return Ok(0),
+        };
+        sequence_of(&meta)
+    }
+
+    /// Stores the index snapshot, replacing any previous one, and says which change it reflects.
     ///
-    /// Written in its own transaction, after the data it describes: the snapshot names a
-    /// fingerprint of that data, so a start that reads it and finds the fingerprint unchanged
-    /// knows the two agree. Writing it in the same transaction as a change would be wrong for the
-    /// opposite reason - the snapshot is the state of an index over the whole directory, and a
-    /// single change does not update it in place.
-    pub fn save_index(&self, bytes: &[u8]) -> Result<(), BackendError> {
+    /// `sequence` is the counter value the index was built from. Deltas up to and including it
+    /// become unnecessary and are dropped here rather than left to be read and skipped on every
+    /// start - the table would otherwise grow with the history instead of with the gap.
+    pub fn save_index(&self, bytes: &[u8], sequence: u64) -> Result<(), BackendError> {
         let mut transaction = self
             .database
             .begin_write()
@@ -812,6 +900,40 @@ impl RedbBackend {
                     path: "<index>".to_string(),
                     reason: source.to_string(),
                 })?;
+
+            let mut meta = transaction
+                .open_table(META)
+                .map_err(|source| BackendError::Redb {
+                    path: "<meta>".to_string(),
+                    reason: source.to_string(),
+                })?;
+            meta.insert(META_INDEX_SEQ, sequence.to_le_bytes().as_slice())
+                .map_err(|source| BackendError::Redb {
+                    path: "<meta>".to_string(),
+                    reason: source.to_string(),
+                })?;
+
+            let mut deltas =
+                transaction
+                    .open_table(INDEX_DELTA)
+                    .map_err(|source| BackendError::Redb {
+                        path: "<index_delta>".to_string(),
+                        reason: source.to_string(),
+                    })?;
+            let covered: Vec<u64> = deltas
+                .range(..=sequence)
+                .map_err(|source| BackendError::Redb {
+                    path: "<index_delta>".to_string(),
+                    reason: source.to_string(),
+                })?
+                .filter_map(|item| item.ok().map(|(key, _)| key.value()))
+                .collect();
+            for key in covered {
+                deltas.remove(key).map_err(|source| BackendError::Redb {
+                    path: "<index_delta>".to_string(),
+                    reason: source.to_string(),
+                })?;
+            }
         }
         transaction.commit().map_err(|source| BackendError::Redb {
             path: "<database>".to_string(),
@@ -820,11 +942,11 @@ impl RedbBackend {
         Ok(())
     }
 
-    /// The stored snapshot, if there is one.
+    /// The stored snapshot and the change it reflects, if there is one.
     ///
     /// `None` is ordinary and means "build the index": an empty store, a store written by an
     /// older build, or one whose snapshot was cleared.
-    pub fn load_index(&self) -> Result<Option<Vec<u8>>, BackendError> {
+    pub fn load_index(&self) -> Result<Option<(Vec<u8>, u64)>, BackendError> {
         let transaction = self
             .database
             .begin_read()
@@ -832,6 +954,14 @@ impl RedbBackend {
                 path: "<database>".to_string(),
                 reason: source.to_string(),
             })?;
+
+        let meta = match transaction.open_table(META) {
+            Ok(meta) => meta,
+            Err(_) => return Ok(None),
+        };
+        let Some(sequence) = snapshot_sequence(&meta)? else {
+            return Ok(None);
+        };
 
         let table = match transaction.open_table(INDEX) {
             Ok(table) => table,
@@ -844,13 +974,98 @@ impl RedbBackend {
             reason: source.to_string(),
         })?;
 
-        Ok(value.map(|value| value.value().to_vec()))
+        Ok(value.map(|value| (value.value().to_vec(), sequence)))
     }
 
-    /// Forgets the snapshot.
+    /// Records the posting changes of one change set, under its counter value.
+    pub fn append_index_delta(&self, sequence: u64, bytes: &[u8]) -> Result<(), BackendError> {
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        {
+            let mut table =
+                transaction
+                    .open_table(INDEX_DELTA)
+                    .map_err(|source| BackendError::Redb {
+                        path: "<index_delta>".to_string(),
+                        reason: source.to_string(),
+                    })?;
+            table
+                .insert(sequence, bytes)
+                .map_err(|source| BackendError::Redb {
+                    path: "<index_delta>".to_string(),
+                    reason: source.to_string(),
+                })?;
+        }
+        transaction.commit().map_err(|source| BackendError::Redb {
+            path: "<database>".to_string(),
+            reason: source.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// The deltas after `after` and up to and including `until`, oldest first.
     ///
-    /// Called when the data changed in a way the snapshot cannot describe - an import, a bulk
-    /// write - so the next start does not trust a fingerprint that was never updated.
+    /// `None` when the chain has a hole: a delta that was never written, which is what a crash
+    /// between the data commit and this one leaves. The caller rebuilds, because replaying a
+    /// partial chain would produce an index that answers about data it never saw.
+    pub fn index_deltas(
+        &self,
+        after: u64,
+        until: u64,
+    ) -> Result<Option<Vec<Vec<u8>>>, BackendError> {
+        if until <= after {
+            return Ok(Some(Vec::new()));
+        }
+
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        let table = match transaction.open_table(INDEX_DELTA) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+
+        let mut deltas = Vec::new();
+        let mut expected = after + 1;
+        for item in table.range(..=until).map_err(|source| BackendError::Redb {
+            path: "<index_delta>".to_string(),
+            reason: source.to_string(),
+        })? {
+            let (key, value) = item.map_err(|source| BackendError::Redb {
+                path: "<index_delta>".to_string(),
+                reason: source.to_string(),
+            })?;
+            let key = key.value();
+            if key < expected {
+                continue;
+            }
+            if key != expected {
+                // A gap: everything after it is unverifiable.
+                return Ok(None);
+            }
+            deltas.push(value.value().to_vec());
+            expected += 1;
+        }
+
+        if expected != until + 1 {
+            return Ok(None);
+        }
+        Ok(Some(deltas))
+    }
+
+    /// Forgets the snapshot and the changes recorded since it.
+    ///
+    /// Called when the data changed in a way no delta describes - an import, a bulk write - so
+    /// the next start does not build on a chain that skipped something.
     pub fn clear_index(&self) -> Result<(), BackendError> {
         let transaction = self
             .database
@@ -872,6 +1087,32 @@ impl RedbBackend {
                     path: "<index>".to_string(),
                     reason: source.to_string(),
                 })?;
+
+            let mut deltas =
+                transaction
+                    .open_table(INDEX_DELTA)
+                    .map_err(|source| BackendError::Redb {
+                        path: "<index_delta>".to_string(),
+                        reason: source.to_string(),
+                    })?;
+            deltas
+                .retain(|_, _| false)
+                .map_err(|source| BackendError::Redb {
+                    path: "<index_delta>".to_string(),
+                    reason: source.to_string(),
+                })?;
+
+            let mut meta = transaction
+                .open_table(META)
+                .map_err(|source| BackendError::Redb {
+                    path: "<meta>".to_string(),
+                    reason: source.to_string(),
+                })?;
+            meta.remove(META_INDEX_SEQ)
+                .map_err(|source| BackendError::Redb {
+                    path: "<meta>".to_string(),
+                    reason: source.to_string(),
+                })?;
         }
         transaction.commit().map_err(|source| BackendError::Redb {
             path: "<database>".to_string(),
@@ -880,7 +1121,7 @@ impl RedbBackend {
         Ok(())
     }
 
-    /// Number of stored entries; used by tests and logging.
+    /// Number of stored entries; used by tests and logging.    /// Number of stored entries; used by tests and logging.
     pub fn count(&self) -> Result<usize, BackendError> {
         Ok(self.load()?.len())
     }
@@ -1199,14 +1440,14 @@ mod tests {
             let backend =
                 RedbBackend::open_with_journal(&path, Durability::None, true).expect("open");
             backend
-                .save_index(b"a snapshot")
+                .save_index(b"a snapshot", 1)
                 .expect("save on a store that defers durability");
         }
 
         let reopened = RedbBackend::open(&path, Durability::Immediate).expect("reopen");
         assert_eq!(
-            reopened.load_index().expect("read").as_deref(),
-            Some(b"a snapshot".as_slice()),
+            reopened.load_index().expect("read").map(|(bytes, _)| bytes),
+            Some(b"a snapshot".to_vec()),
             "the snapshot is written durably whatever the store's setting says"
         );
     }

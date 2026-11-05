@@ -249,10 +249,38 @@ impl Backend {
     ///
     /// `None` for every backend that does not, and for a store that has never written one: the
     /// caller builds the index, which is always correct.
-    pub fn load_index(&self) -> Result<Option<Vec<u8>>, BackendError> {
+    pub fn load_index(&self) -> Result<Option<(Vec<u8>, u64)>, BackendError> {
         match self {
             Backend::Redb(backend) => backend.load_index(),
             _ => Ok(None),
+        }
+    }
+
+    /// The store's change counter, or zero for a backend that has none.
+    pub fn sequence(&self) -> Result<u64, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.sequence(),
+            _ => Ok(0),
+        }
+    }
+
+    /// Records one change set's posting changes for the next start.
+    pub fn append_index_delta(&self, sequence: u64, bytes: &[u8]) -> Result<(), BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.append_index_delta(sequence, bytes),
+            _ => Ok(()),
+        }
+    }
+
+    /// The deltas between two counter values, or `None` when the chain has a hole.
+    pub fn index_deltas(
+        &self,
+        after: u64,
+        until: u64,
+    ) -> Result<Option<Vec<Vec<u8>>>, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.index_deltas(after, until),
+            _ => Ok(Some(Vec::new())),
         }
     }
 
@@ -260,9 +288,9 @@ impl Backend {
     ///
     /// A backend that cannot is not an error: the index is derived, and building it is what every
     /// backend did before this existed.
-    pub fn save_index(&self, bytes: &[u8]) -> Result<(), BackendError> {
+    pub fn save_index(&self, bytes: &[u8], sequence: u64) -> Result<(), BackendError> {
         match self {
-            Backend::Redb(backend) => backend.save_index(bytes),
+            Backend::Redb(backend) => backend.save_index(bytes, sequence),
             _ => Ok(()),
         }
     }

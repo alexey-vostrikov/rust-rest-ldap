@@ -523,6 +523,58 @@ impl Directory {
         self
     }
 
+    /// Adopts an index together with the numbering it was built under.
+    ///
+    /// The two travel together or not at all: postings are ids, and an index taken without its
+    /// numbering answers about whichever entries happen to sit at those positions now. `None`
+    /// when the numbering does not describe this directory - a different number of entries, so
+    /// the pairing is unknown - and the caller rebuilds.
+    pub fn with_numbered_index(
+        mut self,
+        index: Index,
+        numbering: &std::collections::HashMap<String, u32>,
+        next_id: u32,
+    ) -> Option<Self> {
+        let mut ids = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            // Every entry has to be in the numbering. One that is not came from somewhere the
+            // snapshot never saw, and guessing an id would let its postings land on another
+            // entry - the caller rebuilds instead.
+            ids.push(*numbering.get(entry.dn())?);
+        }
+
+        let by_id: std::collections::HashMap<u32, usize> = ids
+            .iter()
+            .enumerate()
+            .map(|(position, id)| (*id, position))
+            .collect();
+        if by_id.len() != ids.len() {
+            // A repeated id is a numbering that lost an entry somewhere; nothing can be trusted
+            // after it.
+            return None;
+        }
+
+        self.ids = ids;
+        self.next_id = next_id.max(self.ids.iter().copied().max().unwrap_or(0) + 1);
+        self.by_id = by_id;
+        self.index = Arc::new(index);
+        Some(self)
+    }
+
+    /// The numbering in force, as `(dn, id)` pairs, for a snapshot to carry.
+    pub fn numbering(&self) -> Vec<(String, u32)> {
+        self.entries
+            .iter()
+            .zip(self.ids.iter())
+            .map(|(entry, id)| (entry.dn().to_string(), *id))
+            .collect()
+    }
+
+    /// The next id this directory would issue.
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
     /// The entries in canonical order, which is the order the index ids point at.
     pub fn entries_in_order(&self) -> &[Entry] {
         &self.entries

@@ -414,6 +414,10 @@ const ENGLISH: &[(&str, &str)] = &[
         "index: read from the store, the data has not changed since it was built",
     ),
     (
+        "start.index_replayed",
+        "index: read from the store and brought up to date from the recorded changes",
+    ),
+    (
         "start.index_built",
         "index: built from the data in {seconds}s",
     ),
