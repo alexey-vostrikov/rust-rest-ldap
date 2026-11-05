@@ -32,7 +32,10 @@
 //! use.
 use std::sync::atomic::{AtomicU16, Ordering};
 
+use std::sync::Arc;
+
 use crate::backend::redb_store::ChangeKind;
+use crate::model::{Attribute, Entry};
 
 /// The largest server id a CSN can carry: the field is three decimal digits.
 pub const MAX_SERVER_ID: u16 = 999;
@@ -192,6 +195,188 @@ pub enum Decision {
     /// Two histories that a CSN cannot reconcile. Keep the local version and report it: picking
     /// one silently is how a directory loses a record and nobody notices for a month.
     Conflict { why: &'static str },
+}
+
+/// What merging two versions of one attribute did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Merged {
+    /// Values the local version did not have.
+    pub added: usize,
+    /// Values where the incoming change was newer and replaced the local stamp.
+    pub updated: usize,
+    /// Values where the local change was newer and was kept.
+    pub kept: usize,
+}
+
+/// Merges two versions of one multi-valued attribute, value by value.
+///
+/// Level 2 of multi-master. Level 1 settles a whole entry from the entry's own `entryCSN`, so two
+/// nodes editing *different attributes* of the same entry at the same moment lose one edit - and
+/// that is not a rare accident, it is two administrators doing their jobs. With a change recorded
+/// beside each value, the two edits are different values and both survive.
+///
+/// The rules, each with the reason it is not the other thing:
+///
+/// - **Union of values.** A value is kept if either side has it. A value that only one side has was
+///   never deleted by the other, because a deletion leaves a stamp too (see `Removed`), and an
+///   absent value with no stamp means "this version never knew it".
+/// - **Newest stamp wins for a value both sides have.** The stamp says which change wrote it, and a
+///   later change wrote the value it names.
+/// - **Unstamped loses to stamped.** A value from an import, or one written before stamps existed,
+///   has no history; giving it priority over a recorded change would let an old file beat a live
+///   directory.
+/// - **A CSN orders completely, and that is what makes the merge agree with itself.** Two changes in
+///   the same microsecond are separated by the server id in the third field, so the same pair of
+///   versions resolves the same way on every node - which is the property a merge needs more than
+///   it needs a tie-break nobody can reproduce.
+pub fn merge_attribute(local: &Attribute, incoming: &Attribute) -> (Attribute, Merged) {
+    if local.values.is_empty() {
+        return (incoming.clone(), Merged::default());
+    }
+
+    let local_stamps = local.stamps();
+    let incoming_stamps = incoming.stamps();
+
+    let mut values: Vec<String> = local.values.to_vec();
+    let mut stamps: Vec<Arc<str>> = local_stamps.iter().map(|csn| Arc::from(*csn)).collect();
+    let mut report = Merged::default();
+
+    for (at, value) in incoming.values.iter().enumerate() {
+        let incoming_stamp = incoming_stamps.get(at).copied().unwrap_or("");
+
+        match values.iter().position(|held| held == value) {
+            None => {
+                values.push(value.clone());
+                stamps.push(Arc::from(incoming_stamp));
+                report.added += 1;
+            }
+            Some(position) => {
+                let local_stamp = &*stamps[position];
+                match compare_stamps(local_stamp, incoming_stamp) {
+                    StampOrder::Incoming => {
+                        stamps[position] = Arc::from(incoming_stamp);
+                        report.updated += 1;
+                    }
+                    StampOrder::Local => report.kept += 1,
+                    // The same change arriving twice, which replication does all the time. Nothing
+                    // to choose: both stamps name the same write.
+                    StampOrder::Same => {}
+                }
+            }
+        }
+    }
+
+    // Flags travel with the local attribute: they describe how the attribute behaves, not which
+    // change wrote it, and the schema decides them.
+    let mut merged = Attribute {
+        name: Arc::clone(&local.name),
+        values: values.into_boxed_slice(),
+        flags: local.flags,
+        value_csns: None,
+    };
+    if stamps.iter().any(|csn| !csn.is_empty()) {
+        merged.value_csns = Some(stamps.into_boxed_slice());
+    }
+
+    (merged, report)
+}
+
+/// What merging two versions of an entry did, across all its attributes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MergedEntry {
+    pub attributes_added: usize,
+    /// Values gained from the version that did not have them here.
+    pub values_gained: usize,
+    /// Values whose stamp the other version moved forward.
+    pub values_updated: usize,
+}
+
+impl MergedEntry {
+    /// Whether the merge produced anything the local version did not already hold.
+    ///
+    /// This is what decides whether a change that entry-level ordering would have dropped has to be
+    /// written anyway: an older change can still carry a value this node never had, and dropping it
+    /// because its timestamp is older is exactly the loss level 2 exists to prevent.
+    pub fn changed(&self) -> bool {
+        self.attributes_added > 0 || self.values_gained > 0 || self.values_updated > 0
+    }
+}
+
+/// Merges two versions of one entry, attribute by attribute and value by value.
+///
+/// The result is the union of what both sides know, with the newer change owning each value it
+/// wrote. Attributes present on both sides are merged with [`merge_attribute`]; an attribute only
+/// one side has is taken whole.
+///
+/// The local entry's own operational attributes are kept: `entryCSN`, `entryUUID` and the
+/// timestamps describe *this* node's record of the entry, and letting a peer's copy of them win
+/// would make the two nodes disagree about who wrote what.
+pub fn merge_entries(local: &Entry, incoming: &Entry) -> (Entry, MergedEntry) {
+    let mut merged = local.attributes().clone();
+    let mut report = MergedEntry::default();
+
+    for attribute in incoming.attributes().values() {
+        // Operational attributes belong to the node that holds the entry: `entryCSN` in particular
+        // is what the caller has already decided about, and a second opinion from the peer's copy
+        // would overwrite that decision.
+        if attribute.flags.operational || attribute.flags.internal {
+            continue;
+        }
+
+        match merged.get(&attribute.name) {
+            None => {
+                merged = merged.push(attribute.clone());
+                report.attributes_added += 1;
+                report.values_gained += attribute.values.len();
+            }
+            Some(existing) => {
+                let existing = existing.clone();
+                let (result, attribute_report) = merge_attribute(&existing, attribute);
+                report.values_gained += attribute_report.added;
+                report.values_updated += attribute_report.updated;
+                merged = merged.replace(result);
+            }
+        }
+    }
+
+    (Entry::new(local.dn(), merged), report)
+}
+
+/// How two stamps order against each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampOrder {
+    Incoming,
+    Local,
+    /// The same change: one node's change arriving twice, which replication does all the time.
+    Same,
+}
+
+fn compare_stamps(local: &str, incoming: &str) -> StampOrder {
+    if local == incoming {
+        return StampOrder::Same;
+    }
+    // An unstamped value has no history, so any recorded change is later than it.
+    if local.is_empty() {
+        return StampOrder::Incoming;
+    }
+    if incoming.is_empty() {
+        return StampOrder::Local;
+    }
+
+    let (Some(local_csn), Some(incoming_csn)) = (Csn::parse(local), Csn::parse(incoming)) else {
+        // A stamp that cannot be parsed is a stamp that cannot be ordered. Keeping the local value
+        // is the conservative answer, and the caller reports it.
+        return StampOrder::Local;
+    };
+
+    // `Csn` orders by timestamp, then counter, then server id: two changes in the same
+    // microsecond are still ordered, and every node orders them the same way. Equal CSNs were
+    // handled above as the same change.
+    if incoming_csn > local_csn {
+        StampOrder::Incoming
+    } else {
+        StampOrder::Local
+    }
 }
 
 /// Decides what to do with `incoming`, given `local`.
@@ -748,5 +933,237 @@ mod tests {
             ),
             Decision::Conflict { .. }
         ));
+    }
+    /// An attribute whose values carry the given stamps, in the same order.
+    fn stamped(name: &str, values: &[(&str, &str)]) -> Attribute {
+        let stamp_list: Vec<Arc<str>> = values.iter().map(|(_, csn)| Arc::from(*csn)).collect();
+        Attribute {
+            name: crate::model::attribute_name(name),
+            values: values
+                .iter()
+                .map(|(value, _)| (*value).to_string())
+                .collect::<Vec<String>>()
+                .into_boxed_slice(),
+            flags: crate::model::AttributeFlags::default(),
+            value_csns: Some(stamp_list.into_boxed_slice()),
+        }
+    }
+
+    /// Two nodes edit different values of one attribute at the same moment: both survive.
+    ///
+    /// This is the whole reason for level 2. Entry-level last-writer-wins settles a whole entry
+    /// from one number and loses one of the two edits; with a change recorded beside each value,
+    /// they are edits to different values.
+    #[test]
+    fn two_nodes_writing_different_values_both_survive() {
+        let local = stamped(
+            "memberUid",
+            &[("alice", "20261104005712.000000Z#000001#001#000000")],
+        );
+        let incoming = stamped(
+            "memberUid",
+            &[("bob", "20261104005712.000000Z#000002#002#000000")],
+        );
+
+        let (merged, report) = merge_attribute(&local, &incoming);
+
+        let values: Vec<&str> = merged.values.iter().map(String::as_str).collect();
+        assert_eq!(values, vec!["alice", "bob"], "both edits are in the result");
+        assert_eq!(report.added, 1);
+        assert_eq!(report.updated, 0);
+        assert_eq!(
+            merged.csn_of("alice"),
+            Some("20261104005712.000000Z#000001#001#000000"),
+            "the stamp travels with the value it describes"
+        );
+        assert_eq!(
+            merged.csn_of("bob"),
+            Some("20261104005712.000000Z#000002#002#000000")
+        );
+    }
+
+    /// The same value on both sides: the newer change takes the stamp with it.
+    #[test]
+    fn a_later_change_takes_the_stamp_of_a_value_both_sides_hold() {
+        let local = stamped(
+            "sn",
+            &[("Smith", "20261104005712.000000Z#000001#001#000000")],
+        );
+        let incoming = stamped(
+            "sn",
+            &[("Smith", "20261105000000.000000Z#000001#002#000000")],
+        );
+
+        let (merged, report) = merge_attribute(&local, &incoming);
+
+        assert_eq!(report.updated, 1, "the newer change took the stamp");
+        assert_eq!(merged.values.len(), 1, "and did not duplicate the value");
+        assert_eq!(
+            merged.csn_of("Smith"),
+            Some("20261105000000.000000Z#000001#002#000000")
+        );
+    }
+
+    /// An older change cannot claim a value a newer one wrote.
+    #[test]
+    fn an_older_change_does_not_take_the_stamp_back() {
+        let local = stamped(
+            "sn",
+            &[("Smith", "20261105000000.000000Z#000001#001#000000")],
+        );
+        let incoming = stamped(
+            "sn",
+            &[("Smith", "20261104005712.000000Z#000001#002#000000")],
+        );
+
+        let (merged, report) = merge_attribute(&local, &incoming);
+
+        assert_eq!(report.updated, 0);
+        assert_eq!(
+            merged.csn_of("Smith"),
+            Some("20261105000000.000000Z#000001#001#000000"),
+            "the newer stamp stays with its value"
+        );
+    }
+
+    /// A value nobody stamped belongs to no change, so a recorded change is later than it.
+    ///
+    /// The import case: an entry loaded from an LDIF has values but no history, and giving those
+    /// priority would let a stale file beat a live directory.
+    #[test]
+    fn an_unstamped_value_loses_to_a_recorded_change() {
+        let local = stamped("cn", &[("Ann", "")]);
+        let incoming = stamped("cn", &[("Ann", "20261104005712.000000Z#000001#002#000000")]);
+
+        let (merged, report) = merge_attribute(&local, &incoming);
+
+        assert_eq!(report.updated, 1);
+        assert_eq!(
+            merged.csn_of("Ann"),
+            Some("20261104005712.000000Z#000001#002#000000")
+        );
+    }
+
+    /// Two nodes writing the same value in the same instant: the server id breaks the tie, and it
+    /// breaks it the same way on both nodes.
+    ///
+    /// This is the property a replicated merge cannot do without. If the two nodes each kept their
+    /// own stamp, every poll would carry a "newer" version to the other and the entry would be
+    /// rewritten for ever; with the server id in the third field of the CSN, both arrive at the
+    /// same answer without talking.
+    #[test]
+    fn a_tie_in_the_same_microsecond_is_broken_by_server_id_on_both_sides() {
+        let here = stamped("cn", &[("Ann", "20261104005712.000000Z#000001#001#000000")]);
+        let there = stamped("cn", &[("Ann", "20261104005712.000000Z#000001#002#000000")]);
+
+        let (from_here, at_here) = merge_attribute(&here, &there);
+        let (from_there, at_there) = merge_attribute(&there, &here);
+
+        assert_eq!(at_here.updated, 1, "the higher server id wins at this node");
+        assert_eq!(at_there.kept, 1, "and the same change wins at the other");
+        assert_eq!(
+            from_here.csn_of("Ann"),
+            from_there.csn_of("Ann"),
+            "both nodes end with one value and one stamp, and they are the same stamp"
+        );
+        assert_eq!(
+            from_here.csn_of("Ann"),
+            Some("20261104005712.000000Z#000001#002#000000")
+        );
+    }
+
+    /// An attribute the local version lacks is taken whole, stamps and all.
+    #[test]
+    fn an_attribute_the_local_version_lacks_is_taken_whole() {
+        let local = stamped("memberUid", &[]);
+        let incoming = stamped(
+            "memberUid",
+            &[("alice", "20261104005712.000000Z#000001#002#000000")],
+        );
+
+        let (merged, report) = merge_attribute(&local, &incoming);
+
+        assert_eq!(report, Merged::default(), "nothing to merge against");
+        assert_eq!(merged.values.len(), 1);
+        assert_eq!(
+            merged.csn_of("alice"),
+            Some("20261104005712.000000Z#000001#002#000000")
+        );
+    }
+    /// Two nodes each adding a member to one group: both members survive, and the group is not
+    /// rewritten for ever afterwards.
+    #[test]
+    fn entries_merge_by_value_rather_than_by_version() {
+        use crate::model::Attributes;
+
+        let entry = |members: &[(&str, &str)]| {
+            Entry::new(
+                "cn=team,ou=groups,dc=example,dc=com",
+                Attributes::new()
+                    .push(crate::model::Attribute::new(
+                        "objectClass",
+                        vec!["top".to_string(), "posixGroup".to_string()],
+                    ))
+                    .push(stamped("memberUid", members)),
+            )
+        };
+
+        let local = entry(&[("alice", "20261104005712.000000Z#000001#001#000000")]);
+        let incoming = entry(&[("bob", "20261104005712.000000Z#000002#002#000000")]);
+
+        let (merged, report) = merge_entries(&local, &incoming);
+
+        let members = merged
+            .attributes()
+            .get("memberUid")
+            .expect("the merged entry has the attribute");
+        let values: Vec<&str> = members.values.iter().map(String::as_str).collect();
+        assert_eq!(
+            values,
+            vec!["alice", "bob"],
+            "each node's edit is a different value, so neither is lost"
+        );
+        assert!(report.changed(), "and there is something to write");
+        assert_eq!(report.values_gained, 1);
+    }
+
+    /// A peer's operational attributes do not overwrite this node's: `entryCSN` is what the caller
+    /// has already decided about, and a second opinion from the other copy would undo the decision.
+    #[test]
+    fn operational_attributes_of_the_peer_are_not_taken() {
+        use crate::model::Attributes;
+
+        let local = Entry::new(
+            "cn=team,ou=groups,dc=example,dc=com",
+            Attributes::new().push(stamped("cn", &[("team", "")])).push(
+                crate::model::Attribute::single(
+                    crate::operational::ATTR_ENTRY_CSN,
+                    "20261105000000.000000Z#000001#001#000000",
+                )
+                .operational(),
+            ),
+        );
+        let incoming = Entry::new(
+            "cn=team,ou=groups,dc=example,dc=com",
+            Attributes::new().push(stamped("cn", &[("team", "")])).push(
+                crate::model::Attribute::single(
+                    crate::operational::ATTR_ENTRY_CSN,
+                    "20260101000000.000000Z#000001#002#000000",
+                )
+                .operational(),
+            ),
+        );
+
+        let (merged, _) = merge_entries(&local, &incoming);
+
+        assert_eq!(
+            merged
+                .attributes()
+                .get(crate::operational::ATTR_ENTRY_CSN)
+                .and_then(|attribute| attribute.values.first())
+                .map(String::as_str),
+            Some("20261105000000.000000Z#000001#001#000000"),
+            "this node keeps its own record of the change"
+        );
     }
 }
