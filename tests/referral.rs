@@ -42,6 +42,7 @@ async fn serve(
     let _ = Directory::from_entries(base, "users", "groups", entries.clone());
 
     let config = Config {
+        cldap: Default::default(),
         cache: Default::default(),
         backend: "null".to_string(),
         base_dn: base.to_string(),

@@ -53,6 +53,7 @@ fn raw_person(cn: &str) -> Entry {
 
 async fn serve(entries: Vec<Entry>) -> String {
     let config = Config {
+        cldap: Default::default(),
         cache: Default::default(),
         backend: "redb".to_string(),
         base_dn: BASE.to_string(),

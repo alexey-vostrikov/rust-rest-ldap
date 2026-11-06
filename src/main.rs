@@ -659,6 +659,43 @@ async fn serve() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // CLDAP, when asked for: a Windows machine finds its controller by pinging UDP 389, and without
+    // an answer here it reports that no controller could be found - which is routinely mistaken for
+    // a Kerberos problem. The address is the same host as the TCP listener, port 389.
+    let _cldap_task = if config.cldap.enabled {
+        let port = config.cldap.port.unwrap_or(389);
+        let bind = match listener.local_addr().map(|addr| addr.ip()) {
+            Ok(std::net::IpAddr::V4(address)) => std::net::SocketAddr::from((address, port)),
+            Ok(std::net::IpAddr::V6(address)) => std::net::SocketAddr::from((address, port)),
+            Err(_) => std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        };
+
+        match rust_rest_ldap::cldap::Settings::resolve(&config.cldap, &config.base_dn, bind) {
+            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+            Ok(settings) => match tokio::net::UdpSocket::bind(bind).await {
+                Ok(socket) => {
+                    println!(
+                        "cldap: answering pings on {bind} as {} ({}), kdc flag not set",
+                        settings.advertised.dns_host, settings.advertised.netbios_host
+                    );
+                    Some(tokio::spawn(rust_rest_ldap::cldap::serve(
+                        socket,
+                        settings,
+                        Arc::clone(&source),
+                        Arc::clone(&metrics),
+                        shutdown_rx.clone(),
+                    )))
+                }
+                Err(err) => fatal(&i18n::t(
+                    "error.server",
+                    &[("detail", &format!("cldap '{bind}': {err}"))],
+                )),
+            },
+        }
+    } else {
+        None
+    };
+
     let reloading = tokio::spawn(rust_rest_ldap::reload::reload_on_interval_with(
         Arc::clone(&source),
         config.update_interval,

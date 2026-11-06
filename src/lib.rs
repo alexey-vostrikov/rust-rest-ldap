@@ -17,6 +17,7 @@ pub mod acl;
 pub mod ad_schema;
 pub mod backend;
 pub mod bootstrap;
+pub mod cldap;
 pub mod cli;
 pub mod cli_connection;
 pub mod client;

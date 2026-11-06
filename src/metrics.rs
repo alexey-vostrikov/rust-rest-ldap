@@ -109,6 +109,14 @@ pub struct Metrics {
     /// Replaced on reload, because a reload builds a new cache - the counters restart then, which
     /// is what a counter reset means and what the scrape will show.
     cache: std::sync::RwLock<Option<std::sync::Arc<crate::record_cache::RecordCache>>>,
+    /// CLDAP pings answered, refused and failed.
+    ///
+    /// Three counters and not one: "nobody is pinging us", "machines are pinging and we refuse
+    /// them" and "we cannot answer" are three different problems, and a single number would hide
+    /// which one is happening.
+    cldap_answered: AtomicU64,
+    cldap_refused: AtomicU64,
+    cldap_failed: AtomicU64,
     started: Mutex<Option<std::time::SystemTime>>,
     /// One series group per configured peer, keyed by its URL.
     ///
@@ -262,6 +270,30 @@ impl Metrics {
     ///
     /// Called at start and again after every reload: a reload builds a new cache, and a metrics
     /// object still holding the old one would report the hits of a cache nothing reads any more.
+    /// A ping answered.
+    pub fn cldap_answered(&self) {
+        self.cldap_answered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A datagram that was not a ping this server could answer, with the reason for the log.
+    pub fn cldap_refused(&self, reason: &str) {
+        self.cldap_refused.fetch_add(1, Ordering::Relaxed);
+        // Said once per distinct reason would need state; said on the first few instead, because
+        // an operator who turned the listener on needs to know why it is not answering, and a
+        // machine that pings for a month must not be able to fill a disk.
+        if self.cldap_refused.load(Ordering::Relaxed) <= 5 {
+            eprintln!("cldap: refused a datagram: {reason}");
+        }
+    }
+
+    /// A reply that could not be sent.
+    pub fn cldap_failed(&self, reason: &str) {
+        self.cldap_failed.fetch_add(1, Ordering::Relaxed);
+        if self.cldap_failed.load(Ordering::Relaxed) <= 5 {
+            eprintln!("cldap: could not answer: {reason}");
+        }
+    }
+
     pub fn attach_cache(&self, cache: std::sync::Arc<crate::record_cache::RecordCache>) {
         if let Ok(mut slot) = self.cache.write() {
             *slot = Some(cache);
@@ -415,6 +447,34 @@ impl Metrics {
             out,
             "ldap_writes_total {}\n",
             self.writes_total.load(Ordering::Relaxed)
+        );
+
+        out.push_str(
+            "# HELP ldap_cldap_answered_total CLDAP pings answered with a Netlogon structure.\n",
+        );
+        out.push_str("# TYPE ldap_cldap_answered_total counter\n");
+        let _ = writeln!(
+            out,
+            "ldap_cldap_answered_total {}\n",
+            self.cldap_answered.load(Ordering::Relaxed)
+        );
+
+        out.push_str(
+            "# HELP ldap_cldap_refused_total Datagrams that were not a ping this server answers.\n",
+        );
+        out.push_str("# TYPE ldap_cldap_refused_total counter\n");
+        let _ = writeln!(
+            out,
+            "ldap_cldap_refused_total {}\n",
+            self.cldap_refused.load(Ordering::Relaxed)
+        );
+
+        out.push_str("# HELP ldap_cldap_failed_total Replies that could not be sent.\n");
+        out.push_str("# TYPE ldap_cldap_failed_total counter\n");
+        let _ = writeln!(
+            out,
+            "ldap_cldap_failed_total {}\n",
+            self.cldap_failed.load(Ordering::Relaxed)
         );
 
         if let Some(cache) = self.cache() {

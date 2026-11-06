@@ -1033,6 +1033,7 @@ mod tests {
             .expect("seed");
 
         let config = crate::config::Config {
+            cldap: Default::default(),
             cache: crate::record_cache::CacheConfig::default(),
             backend: "redb".to_string(),
             base_dn: "dc=example,dc=com".to_string(),

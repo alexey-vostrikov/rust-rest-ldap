@@ -308,6 +308,11 @@ pub struct Config {
     pub limits: crate::limits::Limits,
     /// How many materialised records to keep, when the snapshot holds skeletons.
     pub cache: crate::record_cache::CacheConfig,
+    /// Whether to answer CLDAP pings on UDP 389, and what to advertise.
+    ///
+    /// Off unless an operator turns it on: a reply to a ping says "this address is a domain
+    /// controller", and this server runs no KDC, so a machine sent here would fail one step later.
+    pub cldap: crate::cldap::CldapConfig,
     /// Where the change journal goes, if anywhere.
     pub observability: ObservabilityConfig,
     /// The first administrator of an empty store, if the operator configured one.
@@ -472,6 +477,9 @@ struct FileConfig {
     /// How many records to keep materialised, under the memory ceiling.
     #[serde(default)]
     cache: crate::record_cache::CacheConfig,
+    /// CLDAP ping, off unless asked for.
+    #[serde(default)]
+    cldap: crate::cldap::CldapConfig,
     /// Subtrees held elsewhere: `- dn: dc=remote,dc=com` with the URL a client should ask.
     #[serde(default)]
     referrals: Vec<ReferralConfig>,
@@ -842,6 +850,7 @@ pub fn resolve(
         integrity: file.integrity,
         limits: crate::limits::Limits::from_config(&file.limits),
         cache: file.cache,
+        cldap: file.cldap,
         observability: file.observability,
         locale: {
             // The configuration wins over the host: an operator who wrote `locale: ru`
