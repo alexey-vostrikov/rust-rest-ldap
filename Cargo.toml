@@ -26,6 +26,9 @@ hyper = { version = "1.12.0", features = ["client", "http1"] }
 http-body-util = "0.1.5"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 humantime = "2.4.0"
+# The one place this crate steps outside safe Rust, and only to map a file it owns: see
+# `src/index_file.rs`. Everything else - protocol parsing, TLS, HTTP, storage - is safe code.
+memmap2 = "0.9"
 md-5 = "0.11.0"
 pbkdf2 = "0.13.0"
 rasn = "0.30.0"

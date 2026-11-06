@@ -4,10 +4,14 @@
 //! a backend (file or REST) on an interval or on demand, and answers LDAP
 //! requests (bind, search, compare, modify) over BER.
 //!
-//! The crate forbids `unsafe`: protocol parsing, TLS and HTTP all come from safe
-//! crates, and nothing here needs to step outside them.
+//! The crate denies `unsafe`: protocol parsing, TLS and HTTP all come from safe crates, and nothing
+//! here needs to step outside them - with exactly one documented exception, `index_file`, where a
+//! file is mapped. `deny` instead of `forbid` is what makes that exception expressible: `forbid`
+//! cannot be lifted by an `allow` anywhere, and the alternative was a crate-wide permission for one
+//! `unsafe` call in one module. Every other module is still checked, and the exception is named
+//! where it lives rather than here.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod acl;
 pub mod ad_schema;
@@ -26,6 +30,7 @@ pub mod i18n;
 pub mod import;
 pub mod index;
 pub mod index_check;
+pub mod index_file;
 pub mod integrity;
 pub mod ldap;
 pub mod ldif;

@@ -22,6 +22,21 @@ use crate::index::IndexConfig;
 use crate::model::Entry;
 use crate::schema::{Mode as SchemaMode, Schema};
 
+/// Records fetched one at a time from the store, for a snapshot that holds identities only.
+///
+/// Holds the backend behind an `Arc`, the same one the `Source` holds: the store has a single
+/// writer and a file lock, so a second handle would not open at all, and a clone would be a second
+/// `Database` over one file.
+struct BackendEntrySource {
+    backend: Arc<Backend>,
+}
+
+impl crate::directory::EntrySource for BackendEntrySource {
+    fn get(&self, dn: &str) -> Option<Entry> {
+        self.backend.entry(dn)
+    }
+}
+
 /// A sink that counts what passes through it, so a streamed snapshot still reports its size.
 struct CountingWriter<'a> {
     inner: &'a mut dyn std::io::Write,
@@ -123,6 +138,22 @@ impl Source {
         config: &Config,
         backend: Backend,
     ) -> Result<(Arc<Self>, Arc<Directory>), BackendError> {
+        let backend = Arc::new(backend);
+
+        // Before the store is read, not after it: the whole point of the snapshot is that a start
+        // on three million entries should not read three million records to answer a question about
+        // one. Doing this afterwards - which is what the code did - meant the snapshot saved the
+        // index build (148 s) and paid the rest of the start anyway (103 s of reading, 45 s of
+        // hashing), and neither the saving nor the cost is what an operator notices.
+        if backend.reads_by_key()
+            && let Some(directory) = Self::from_snapshot_only(config, &backend)?
+        {
+            println!("{}", crate::i18n::t("start.index_skeleton", &[]));
+            // Zero store reads, and the number says so rather than hiding it: an operator looking
+            // at `ldap_store_reads_total` sees a start that did not walk the store.
+            return Self::finish(config, backend, directory.0, directory.1, 0);
+        }
+
         let data = backend.load().await?;
         let directory = data.into_directory(
             &config.base_dn,
@@ -260,11 +291,106 @@ impl Source {
         // The journal head travels with the first snapshot for the same reason it does on every
         // reload: a synchronised search hands it to the client, and a missing head would make a
         // resumed refresh send the whole directory again.
+        Self::finish(config, backend, directory, known, 1)
+    }
+
+    /// Builds the directory from the stored index alone, or says why it cannot.
+    ///
+    /// What is needed and what is not, settled by measurement: the postings and the numbering give
+    /// every answer a filter can be narrowed by, and the records themselves are read when an entry
+    /// is returned. The skeletons are therefore identities - a DN and an id - and not copies of the
+    /// entries, because the postings hold their values **folded** for case-insensitive matching and
+    /// a folded value is not the value the client stored.
+    ///
+    /// `None` means "read the store": no snapshot, a counter that disagrees, a snapshot that does
+    /// not decode, or a backend that cannot fetch one record by key. Every one of those is a slower
+    /// start, never a wrong one.
+    fn from_snapshot_only(
+        config: &Config,
+        backend: &Arc<Backend>,
+    ) -> Result<Option<(Directory, SnapshotKnown)>, BackendError> {
+        let sequence = backend.sequence()?;
+        let Some((bytes, snapshot_sequence)) = backend.load_index()? else {
+            return Ok(None);
+        };
+
+        let known = SnapshotKnown::default();
+        known.remember(snapshot_sequence, bytes.len());
+
+        let (index, numbering, next_id) = match snapshot_sequence.cmp(&sequence) {
+            std::cmp::Ordering::Equal => match crate::index::Index::decode_unchecked(&bytes) {
+                Some((index, numbering, next_id)) => (
+                    index,
+                    numbering
+                        .into_iter()
+                        .collect::<std::collections::HashMap<_, _>>(),
+                    next_id,
+                ),
+                None => return Ok(None),
+            },
+            std::cmp::Ordering::Less => {
+                // The store moved. The deltas were written in the same breath as the changes they
+                // describe, so replaying them gives an index that matches the store - and the
+                // numbering that comes out of it decides which identities the skeletons are.
+                let Some(deltas) = backend.index_deltas(snapshot_sequence, sequence)? else {
+                    return Ok(None);
+                };
+                match replay_numbering(&bytes, &deltas, &config.indexes) {
+                    Some(replayed) => replayed,
+                    None => return Ok(None),
+                }
+            }
+            // A snapshot from a newer store than this one: different worlds, read the store.
+            std::cmp::Ordering::Greater => return Ok(None),
+        };
+
+        let listed: Vec<(String, u32)> =
+            numbering.iter().map(|(dn, id)| (dn.clone(), *id)).collect();
+        let skeletons = index.skeletons(&listed);
+
+        let Some(directory) = Directory::from_skeletons(
+            &config.base_dn,
+            &config.users_ou_name,
+            &config.groups_ou_name,
+            skeletons,
+            index,
+            &numbering,
+            next_id,
+        ) else {
+            return Ok(None);
+        };
+
+        let source = Arc::new(BackendEntrySource {
+            backend: Arc::clone(backend),
+        });
+        Ok(Some((directory.with_source(source), known)))
+    }
+
+    /// Everything a start does once it knows what the directory holds.
+    ///
+    /// Split out because there are now two ways to arrive here: reading the store, which is the
+    /// ordinary one, and reading the snapshot alone, which is what a large directory needs to be
+    /// answering in seconds rather than minutes. The part that follows - the journal head, the
+    /// schema check, the memory report, the source itself - is the same either way, and duplicating
+    /// it would be the one place the two paths could start to differ.
+    fn finish(
+        config: &Config,
+        backend: Arc<Backend>,
+        directory: Directory,
+        known: SnapshotKnown,
+        store_reads: u64,
+    ) -> Result<(Arc<Self>, Arc<Directory>), BackendError> {
         let head = backend.journal_head()?;
         let floor = backend.journal_floor()?;
         let directory = Arc::new(directory.with_csn(head).with_floor(floor));
 
-        check_schema(&directory, &config.schema, config.schema_mode)?;
+        // A snapshot of identities has nothing to check: its entries carry a DN and no attributes,
+        // and every attribute they will ever show came from a record that was checked when it was
+        // written. Checking here would report three million entries missing `objectClass` and
+        // refuse to start under `strict` - which is the opposite of what the mode is for.
+        if !directory.is_skeleton() {
+            check_schema(&directory, &config.schema, config.schema_mode)?;
+        }
 
         // Said once, at start, against the ceiling the operator set. Not a refusal: see
         // `crate::memory` for why an unavailable server is the worse failure.
@@ -291,7 +417,6 @@ impl Source {
         }
 
         let source = Arc::new(Self {
-            backend: Arc::new(backend),
             base_dn: config.base_dn.clone(),
             users_ou_name: config.users_ou_name.clone(),
             groups_ou_name: config.groups_ou_name.clone(),
@@ -300,10 +425,11 @@ impl Source {
             indexes: config.indexes.clone(),
             snapshot_rewriting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             snapshot_known: Arc::new(known),
+            backend,
             schema: crate::security::shared_schema(config.schema.clone()),
             schema_sources: std::sync::RwLock::new(SchemaSources::from_config(config)),
             schema_mode: config.schema_mode,
-            store_reads: std::sync::atomic::AtomicU64::new(1),
+            store_reads: std::sync::atomic::AtomicU64::new(store_reads),
             notices: tokio::sync::broadcast::channel(NOTICE_BUFFER).0,
         });
 
@@ -1043,6 +1169,26 @@ fn replay(
     deltas: &[Vec<u8>],
     config: &crate::index::IndexConfig,
 ) -> Option<Directory> {
+    let (index, numbering, next_id) = replay_numbering(snapshot, deltas, config)?;
+    directory
+        .clone()
+        .with_numbered_index(index, &numbering, next_id)
+}
+
+/// Replays recorded changes onto a snapshot, and reports the numbering that results.
+///
+/// Split from [`replay`] because the two callers need different halves of it: a directory that read
+/// the store wants the index applied to its own entries, and a start that holds identities only
+/// wants the numbering - which entries exist - because its skeletons are built from it.
+fn replay_numbering(
+    snapshot: &[u8],
+    deltas: &[Vec<u8>],
+    config: &crate::index::IndexConfig,
+) -> Option<(
+    crate::index::Index,
+    std::collections::HashMap<String, u32>,
+    u32,
+)> {
     // The snapshot's fingerprint cannot match: the data moved, which is why a delta exists. The
     // stored value is read past rather than checked, and the deltas are what vouch for the
     // result - each one was written in the same breath as the change it describes.
@@ -1067,9 +1213,7 @@ fn replay(
         }
     }
 
-    directory
-        .clone()
-        .with_numbered_index(index, &numbering, next_id)
+    Some((index, numbering, next_id))
 }
 
 /// Where the schema is built from: files on disk and definitions the protocol added.

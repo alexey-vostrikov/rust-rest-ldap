@@ -260,6 +260,95 @@ const DELTA_MAGIC: &[u8; 4] = b"RRDL";
 type StoredShape = crate::backend::redb_store::StoredEntry;
 
 impl Index {
+    /// Everything the mapped file format needs, flattened.
+    ///
+    /// The four maps are handed over as they are - presence, equality, substring, and the ordered
+    /// one is left out on purpose: a range lookup needs keys whose byte order is numeric order, and
+    /// that encoding does not exist yet. A start that maps the file answers `=`, `=*` and substrings
+    /// from it and falls back to a scan for `>=` and `<=`, which is a slower answer and never a wrong
+    /// one.
+    pub fn records(&self, numbering: Vec<(String, u32)>) -> crate::index_file::Records {
+        let presence: Vec<(&str, RoaringBitmap)> = self
+            .presence
+            .iter()
+            .map(|(attribute, bitmap)| (attribute.as_ref(), bitmap.clone()))
+            .collect();
+
+        let mut equality: Vec<(&str, &str, RoaringBitmap)> = Vec::new();
+        for (attribute, values) in &self.equality {
+            for (value, bitmap) in values {
+                equality.push((attribute.as_ref(), value.as_str(), bitmap.clone()));
+            }
+        }
+
+        let mut substrings: Vec<(&str, &str, RoaringBitmap)> = Vec::new();
+        for (attribute, values) in &self.substrings {
+            for (value, bitmap) in values {
+                substrings.push((attribute.as_ref(), value.as_str(), bitmap.clone()));
+            }
+        }
+
+        crate::index_file::Records::new(presence, equality, substrings, numbering)
+    }
+
+    /// The index built from what a mapped file holds.
+    ///
+    /// The inverse of [`Self::records`], used by the first write after a mapped start: the postings
+    /// are unpacked into the structures a write can patch. Ordered ranges are not in the file, so a
+    /// directory materialised this way is rebuilt rather than trusted for a range lookup - see
+    /// [`Self::covers`].
+    pub fn from_records(records: std::collections::BTreeMap<Vec<u8>, RoaringBitmap>) -> Self {
+        let mut index = Self::default();
+
+        for (key, bitmap) in records {
+            let Some((&tag, rest)) = key.split_first() else {
+                continue;
+            };
+            let Some(separator) = rest.iter().position(|byte| *byte == 0) else {
+                continue;
+            };
+            let attribute = String::from_utf8_lossy(&rest[..separator]).to_string();
+            let value = String::from_utf8_lossy(&rest[separator + 1..]).to_string();
+            let name: Arc<str> = Arc::from(attribute.as_str());
+
+            match crate::index_file::Tag::from_byte(tag) {
+                Some(crate::index_file::Tag::Presence) => {
+                    index.presence.insert(name, bitmap);
+                }
+                Some(crate::index_file::Tag::Equality) => {
+                    index
+                        .equality
+                        .entry(name)
+                        .or_default()
+                        .insert(value, bitmap);
+                }
+                Some(crate::index_file::Tag::Substring) => {
+                    index
+                        .substrings
+                        .entry(name)
+                        .or_default()
+                        .insert(value, bitmap);
+                }
+                _ => {}
+            }
+        }
+
+        index
+    }
+
+    /// Whether this index can answer every kind of query the configuration asked for.
+    ///
+    /// A mapped file answers `=`, `=*` and substrings. Ordered ranges are not in it, so a directory
+    /// materialised from a file says so rather than quietly returning `None` for `>=` - which the
+    /// search path already reads as "scan", so the answer stays right and only the speed changes.
+    pub fn covers(&self, plan: &BTreeMap<Arc<str>, BTreeSet<Kind>>) -> bool {
+        plan.iter().all(|(attribute, kinds)| {
+            self.built
+                .get(attribute)
+                .is_some_and(|built| kinds.iter().all(|kind| built.contains(kind)))
+        })
+    }
+
     /// Which entries the snapshot knows, by DN and id - and deliberately nothing else.
     ///
     /// The tempting version of this returned attribute values, rebuilt by inverting the postings.
