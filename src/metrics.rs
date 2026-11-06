@@ -100,6 +100,15 @@ pub struct Metrics {
     entries_returned: AtomicU64,
     /// Sum of microseconds spent serving searches.
     search_micros: AtomicU64,
+    /// The record cache, when this server runs with one.
+    ///
+    /// Held here rather than counted here: the cache already counts its own hits and misses, and a
+    /// second set of counters in `Metrics` would disagree with the first the moment either is
+    /// updated in a path the other does not see.
+    ///
+    /// Replaced on reload, because a reload builds a new cache - the counters restart then, which
+    /// is what a counter reset means and what the scrape will show.
+    cache: std::sync::RwLock<Option<std::sync::Arc<crate::record_cache::RecordCache>>>,
     started: Mutex<Option<std::time::SystemTime>>,
     /// One series group per configured peer, keyed by its URL.
     ///
@@ -249,6 +258,31 @@ impl Metrics {
         self.entries.store(entries as u64, Ordering::Relaxed);
     }
 
+    /// Points the scrape at the cache this server is serving from.
+    ///
+    /// Called at start and again after every reload: a reload builds a new cache, and a metrics
+    /// object still holding the old one would report the hits of a cache nothing reads any more.
+    pub fn attach_cache(&self, cache: std::sync::Arc<crate::record_cache::RecordCache>) {
+        if let Ok(mut slot) = self.cache.write() {
+            *slot = Some(cache);
+        }
+    }
+
+    /// Stops reporting a cache, for a reload that brought every record back into memory.
+    pub fn clear_cache(&self) {
+        if let Ok(mut slot) = self.cache.write() {
+            *slot = None;
+        }
+    }
+
+    /// The cache being served from, if any.
+    fn cache(&self) -> Option<std::sync::Arc<crate::record_cache::RecordCache>> {
+        self.cache
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone))
+    }
+
     pub fn reload_succeeded(&self) {
         self.reloads_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -382,6 +416,31 @@ impl Metrics {
             "ldap_writes_total {}\n",
             self.writes_total.load(Ordering::Relaxed)
         );
+
+        if let Some(cache) = self.cache() {
+            let (hits, misses, evictions) = cache.statistics();
+            out.push_str("# HELP ldap_cache_hits_total Reads answered without the store.\n");
+            out.push_str("# TYPE ldap_cache_hits_total counter\n");
+            let _ = writeln!(out, "ldap_cache_hits_total {hits}\n");
+
+            out.push_str("# HELP ldap_cache_misses_total Reads that had to go to the store.\n");
+            out.push_str("# TYPE ldap_cache_misses_total counter\n");
+            let _ = writeln!(out, "ldap_cache_misses_total {misses}\n");
+
+            out.push_str(
+                "# HELP ldap_cache_evictions_total Records dropped to stay under the budget.\n",
+            );
+            out.push_str("# TYPE ldap_cache_evictions_total counter\n");
+            let _ = writeln!(out, "ldap_cache_evictions_total {evictions}\n");
+
+            out.push_str("# HELP ldap_cache_bytes Records held, as the budget counts them.\n");
+            out.push_str("# TYPE ldap_cache_bytes gauge\n");
+            let _ = writeln!(out, "ldap_cache_bytes {}\n", cache.bytes());
+
+            out.push_str("# HELP ldap_cache_entries Records held.\n");
+            out.push_str("# TYPE ldap_cache_entries gauge\n");
+            let _ = writeln!(out, "ldap_cache_entries {}\n", cache.len());
+        }
 
         out.push_str(
             "# HELP ldap_replication_conflicts_total Entries a peer and this node disagreed about \
@@ -1453,5 +1512,34 @@ mod tests {
             1,
             "and the new one holds just the new line"
         );
+    }
+
+    #[test]
+    fn the_cache_is_reported_when_one_is_attached_and_not_before() {
+        let metrics = Metrics::new();
+        let quiet = metrics.render();
+        assert!(
+            !quiet.contains("ldap_cache_"),
+            "a server without a cache must not report cache series at all"
+        );
+
+        let cache = std::sync::Arc::new(crate::record_cache::RecordCache::new(1024 * 1024));
+        let mut attributes = crate::model::Attributes::new();
+        attributes = attributes.replace(crate::model::Attribute::single("cn", "alice"));
+        cache.insert("cn=alice", crate::model::Entry::new("cn=alice", attributes));
+        cache.get("cn=alice");
+        cache.get("cn=absent");
+        metrics.attach_cache(cache);
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("ldap_cache_hits_total 1"));
+        assert!(rendered.contains("ldap_cache_misses_total 1"));
+        assert!(rendered.contains("ldap_cache_entries 1"));
+        assert!(rendered.contains("ldap_cache_bytes "));
+
+        // A reload that brings every record into memory stops reporting the cache rather than
+        // keeping the last numbers it happened to have.
+        metrics.clear_cache();
+        assert!(!metrics.render().contains("ldap_cache_"));
     }
 }

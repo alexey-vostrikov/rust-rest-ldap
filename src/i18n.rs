@@ -419,6 +419,10 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("start.memory", "memory: {usage}"),
     (
+        "start.cache",
+        "records: up to {budget} kept in memory; what is not there is read from the store",
+    ),
+    (
         "warn.memory_over",
         "memory: {usage} - the directory does not fit under the ceiling by {excess}; running anyway, and answers over large scopes will be slower. Raise limits.memory_bytes, or index the attributes you filter on",
     ),

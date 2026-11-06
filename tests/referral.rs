@@ -42,6 +42,7 @@ async fn serve(
     let _ = Directory::from_entries(base, "users", "groups", entries.clone());
 
     let config = Config {
+        cache: Default::default(),
         backend: "null".to_string(),
         base_dn: base.to_string(),
         listen_addr: "127.0.0.1:0".to_string(),

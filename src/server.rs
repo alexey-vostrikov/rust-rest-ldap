@@ -899,6 +899,7 @@ mod tests {
 
     fn test_config() -> crate::config::Config {
         crate::config::Config {
+            cache: crate::record_cache::CacheConfig::default(),
             backend: "file".to_string(),
             base_dn: BASE.to_string(),
             listen_addr: "127.0.0.1:0".to_string(),

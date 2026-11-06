@@ -53,6 +53,7 @@ fn raw_person(cn: &str) -> Entry {
 
 async fn serve(entries: Vec<Entry>) -> String {
     let config = Config {
+        cache: Default::default(),
         backend: "redb".to_string(),
         base_dn: BASE.to_string(),
         listen_addr: "127.0.0.1:0".to_string(),

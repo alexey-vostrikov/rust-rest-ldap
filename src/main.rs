@@ -608,6 +608,11 @@ async fn serve() {
     // the accept loop and every connection task can share this without contention.
     let metrics = rust_rest_ldap::metrics::Metrics::new();
     metrics.set_entries(directory.entry_count());
+    // The cache counters are the cache's own; the scrape reads them through here. Whether there is
+    // a cache at all is decided by which path the load took, so this asks rather than assumes.
+    if let Some(cache) = directory.cache() {
+        metrics.attach_cache(Arc::clone(cache));
+    }
     // Let go of the snapshot the load handed back. It is the same `Arc` the source keeps, and
     // holding one here is enough to make `Arc::get_mut` fail on every write - so every write
     // copied the whole directory instead of patching it in place. Measured on a million entries:
@@ -791,6 +796,10 @@ fn spawn_usr1_reloader(
                     Ok(entries) => {
                         metrics.set_entries(entries);
                         metrics.reload_succeeded();
+                        // A full reload brings every record back into memory, so nothing is read
+                        // through the cache any more and its counters would freeze at whatever they
+                        // said. Reporting nothing is honest; reporting a stale number is not.
+                        metrics.clear_cache();
                         println!("reload (SIGUSR1): {entries} entries");
                     }
                     Err(err) => {

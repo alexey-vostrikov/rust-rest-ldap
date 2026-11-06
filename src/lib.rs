@@ -44,6 +44,7 @@ pub mod mutate;
 pub mod operational;
 pub mod password;
 pub mod peers;
+pub mod record_cache;
 pub mod referral;
 pub mod reload;
 pub mod replication;
