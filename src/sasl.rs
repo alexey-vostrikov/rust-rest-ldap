@@ -54,6 +54,13 @@ pub struct SaslConfig {
     /// Empty with a `keytab` set is a configuration error, not a permissive default: a ticket
     /// from a realm nobody configured has no subtree to land in.
     pub realms: Vec<RealmConfig>,
+    /// How much of a PAC to trust, and whether its groups become memberships here.
+    ///
+    /// Absent means `mode: ignore`: the ticket's own signature proves the client, and no claim
+    /// from the PAC is read. That is the behaviour every deployment had before this setting
+    /// existed, and the safe default for a server whose KDC may not be an Active Directory.
+    #[serde(default)]
+    pub pac: crate::pac_policy::PacConfig,
 }
 
 /// One `realms:` entry.
@@ -137,6 +144,8 @@ pub struct Gssapi {
     keytab: rskrb5::keytab::Keytab,
     service_principal: Option<Vec<String>>,
     realms: BTreeMap<String, Realm>,
+    /// What this server trusts a PAC for.
+    pac: crate::pac_policy::PacConfig,
     /// One cache for every connection.
     ///
     /// Per connection would be no cache at all: a captured AP-REQ replayed on a *new* connection
@@ -185,6 +194,11 @@ impl Gssapi {
     }
 
     /// Loads the keytab and builds the acceptor.
+    /// What this server trusts a PAC for.
+    pub fn pac(&self) -> crate::pac_policy::PacConfig {
+        self.pac
+    }
+
     pub fn load(config: &SaslConfig, base_dn: &str) -> Result<Option<Self>, SaslError> {
         let Some(path) = &config.keytab else {
             // A `realms:` list with no keytab describes something the server cannot do; saying so
@@ -243,6 +257,7 @@ impl Gssapi {
             keytab,
             service_principal,
             realms,
+            pac: config.pac,
             replay: rskrb5::service::SharedReplayCache::new(),
         }))
     }
@@ -388,6 +403,7 @@ mod tests {
         )]);
 
         let gssapi = Gssapi {
+            pac: crate::pac_policy::PacConfig::default(),
             keytab: rskrb5::keytab::Keytab::new(),
             service_principal: None,
             realms,
@@ -415,6 +431,7 @@ mod tests {
         )]);
 
         let gssapi = Gssapi {
+            pac: crate::pac_policy::PacConfig::default(),
             keytab: rskrb5::keytab::Keytab::new(),
             service_principal: None,
             realms,
@@ -439,6 +456,7 @@ mod tests {
         )]);
 
         let gssapi = Gssapi {
+            pac: crate::pac_policy::PacConfig::default(),
             keytab: rskrb5::keytab::Keytab::new(),
             service_principal: None,
             realms,
@@ -494,6 +512,7 @@ mod tests {
         // bind.
         let error = Gssapi::load(
             &SaslConfig {
+                pac: Default::default(),
                 keytab: Some(PathBuf::from("/tmp/nonexistent.keytab")),
                 service_principal: None,
                 realms: vec![realm("EXAMPLE.COM", Some("uid={user},dc=other,dc=org"))],
@@ -511,6 +530,7 @@ mod tests {
     fn a_realm_list_without_a_keytab_is_refused() {
         let error = Gssapi::load(
             &SaslConfig {
+                pac: Default::default(),
                 keytab: None,
                 service_principal: None,
                 realms: vec![realm("EXAMPLE.COM", None)],
@@ -559,6 +579,7 @@ mod tests {
 
         let gssapi = Gssapi::load(
             &SaslConfig {
+                pac: Default::default(),
                 keytab: Some(path),
                 service_principal: Some("ldap/host.example.com@EXAMPLE.COM".to_string()),
                 realms: vec![realm("example.com", None)],
@@ -581,6 +602,7 @@ mod tests {
     fn a_keytab_that_is_not_there_is_a_startup_error_naming_the_file() {
         let error = Gssapi::load(
             &SaslConfig {
+                pac: Default::default(),
                 keytab: Some(PathBuf::from("/nonexistent/dir/ldap.keytab")),
                 ..SaslConfig::default()
             },
@@ -606,6 +628,7 @@ mod tests {
 
         let error = Gssapi::load(
             &SaslConfig {
+                pac: Default::default(),
                 keytab: Some(path),
                 ..SaslConfig::default()
             },
@@ -622,6 +645,7 @@ mod tests {
         // that on a hardened host belongs to root and to the service account.
         Gssapi::validate(
             &SaslConfig {
+                pac: Default::default(),
                 keytab: Some(PathBuf::from("/root/only/ldap.keytab")),
                 service_principal: None,
                 realms: vec![realm("EXAMPLE.COM", None)],
@@ -632,6 +656,7 @@ mod tests {
 
         let error = Gssapi::validate(
             &SaslConfig {
+                pac: Default::default(),
                 keytab: Some(PathBuf::from("/root/only/ldap.keytab")),
                 service_principal: None,
                 realms: vec![realm("EXAMPLE.COM", Some("uid={user},dc=other,dc=org"))],
@@ -650,6 +675,7 @@ mod tests {
 
         let gssapi = Gssapi::load(
             &SaslConfig {
+                pac: Default::default(),
                 keytab: Some(path),
                 service_principal: None,
                 realms: vec![realm("EXAMPLE.COM", None)],

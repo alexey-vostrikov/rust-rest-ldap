@@ -42,6 +42,7 @@ pub mod metrics;
 pub mod model;
 pub mod mutate;
 pub mod operational;
+pub mod pac_policy;
 pub mod password;
 pub mod peers;
 pub mod record_cache;
