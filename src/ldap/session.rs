@@ -14,6 +14,15 @@ pub struct Identity {
     pub dn: String,
     /// LDAP administrators may act on every entry.
     pub admin: bool,
+    /// Group entries this identity holds by its Kerberos ticket rather than by `memberUid`.
+    ///
+    /// A Windows client's group list arrives in the PAC, not in this directory's group entries:
+    /// the client never asked to be a `memberUid` anywhere. Resolving the PAC's SIDs to DNs here
+    /// keeps the access rules working unchanged - a rule that names a group asks whether the
+    /// session holds that group, and it does not have to care which of the two ways it got it.
+    ///
+    /// Empty for every bind that is not a ticket with a PAC, which is the ordinary case.
+    pub groups: Vec<String>,
 }
 
 impl Identity {
@@ -21,7 +30,15 @@ impl Identity {
         Self {
             dn: dn::normalize(dn),
             admin,
+            groups: Vec::new(),
         }
+    }
+
+    /// The same identity, holding these group entries.
+    #[must_use]
+    pub fn with_groups(mut self, groups: Vec<String>) -> Self {
+        self.groups = groups;
+        self
     }
 }
 
@@ -63,6 +80,7 @@ impl Session {
             Some(identity) => Requester {
                 dn: Some(identity.dn.clone()),
                 admin: identity.admin,
+                groups: identity.groups.clone(),
             },
             None => Requester::anonymous(),
         }

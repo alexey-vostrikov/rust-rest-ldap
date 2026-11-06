@@ -212,6 +212,19 @@ access:
 #  realms:
 #    - name: example.com
 #      dn: "uid={user},ou=users,{base}"
+#  # What a ticket's PAC is allowed to decide. `ignore` (the default) reads nothing: the ticket's
+#  # own signature proves the client and every authorisation decision comes from the entry.
+#  # `verify` checks the PAC against the service key and honours its logon expiry, and still accepts
+#  # a ticket with no PAC. `require` does the same and refuses a ticket that carries none - set it
+#  # only when every ticket in the realm comes from an Active Directory.
+#  #
+#  # The KDC signature over the PAC is NOT checked, and cannot be: it is an HMAC under the krbtgt
+#  # key, which a service does not hold. The service signature is what a service can verify.
+#  pac:
+#    mode: verify
+#    # Turn the PAC's group SIDs into memberships of this directory by `objectSid`, so a client
+#    # from an AD world falls under `group=` access rules without a `memberUid` entry.
+#    groups: true
 
 # Subtrees this server does not hold, and where a client is sent for them. Referrals are how a
 # naming context points at a part of the tree somebody else keeps: nothing is copied and nothing

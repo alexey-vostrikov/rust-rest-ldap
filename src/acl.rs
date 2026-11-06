@@ -120,10 +120,7 @@ impl Rule {
                 .is_some_and(|bound| bound == dn::normalize(entry_dn)),
             Subject::Admin => requester.admin,
             Subject::Dn(rule_dn) => requester.dn.as_deref() == Some(rule_dn.as_str()),
-            Subject::Group(group) => requester
-                .dn
-                .as_deref()
-                .is_some_and(|bound| directory.is_member(group, bound)),
+            Subject::Group(group) => requester.holds_group(group, directory),
         }
     }
 
@@ -148,6 +145,12 @@ pub struct Requester {
     pub dn: Option<String>,
     /// The bound entry carries the backend's admin flag.
     pub admin: bool,
+    /// Group entries the session holds by its ticket rather than by `memberUid`.
+    ///
+    /// A Windows client's memberships come from the PAC; this directory's groups were never told
+    /// about them. Kept here so the rules below ask one question - "does this session hold that
+    /// group" - and not two.
+    pub groups: Vec<String>,
 }
 
 impl Requester {
@@ -159,7 +162,26 @@ impl Requester {
         Self {
             dn: Some(dn::normalize(dn)),
             admin,
+            groups: Vec::new(),
         }
+    }
+
+    /// Whether the session holds this group, by the directory's own membership or by its ticket.
+    ///
+    /// `group` is the name a rule wrote (`group=admins`), matched against the naming attribute of
+    /// the group entries the ticket granted - the same way [`Directory::is_member`] matches it
+    /// against the directory's own groups.
+    pub fn holds_group(&self, group: &str, directory: &Directory) -> bool {
+        if let Some(bound) = self.dn.as_deref()
+            && directory.is_member(group, bound)
+        {
+            return true;
+        }
+
+        let wanted = group.trim().to_lowercase();
+        self.groups.iter().any(|dn| {
+            crate::dn::first_value(dn).is_some_and(|name| name.eq_ignore_ascii_case(&wanted))
+        })
     }
 }
 
@@ -363,6 +385,66 @@ mod tests {
 
     fn alice() -> Requester {
         Requester::new(ALICE_DN, false)
+    }
+
+    fn rule_for(subject: &str) -> Acl {
+        from_config(Some(&[AccessRuleConfig {
+            subject: subject.to_string(),
+            base: None,
+            attributes: Vec::new(),
+            rights: vec!["read".to_string(), "search".to_string()],
+        }]))
+        .expect("the rule parses")
+    }
+
+    #[test]
+    fn a_group_from_a_ticket_counts_as_membership_without_a_member_uid_entry() {
+        // The Windows case: the client's groups arrive in the PAC, and no entry in this directory
+        // lists the client as a `memberUid` - it never asked to be one. A rule that names the group
+        // has to hold all the same, or every AD client with kerberos is denied what its groups
+        // grant. Driven through `rights`, which is the decision a search actually asks for, so the
+        // test fails if `matches_subject` stops consulting the ticket.
+        let directory = directory();
+
+        // `auditors` lists alice as a member, and alice's ticket can say the same thing: two
+        // paths, one answer.
+        let by_directory = rule_for("group=auditors");
+        assert!(
+            by_directory
+                .rights(&alice(), &directory, ALICE_DN, None)
+                .read
+        );
+        let ticket_says_so = Requester {
+            dn: Some(dn::normalize(ALICE_DN)),
+            admin: false,
+            groups: vec!["cn=auditors,ou=groups,dc=example,dc=com".to_string()],
+        };
+        assert!(
+            by_directory
+                .rights(&ticket_says_so, &directory, ALICE_DN, None)
+                .read
+        );
+
+        // A group the ticket holds and the directory knows nothing about still counts, which is
+        // the whole point: it is how an AD group reaches a rule here without being imported.
+        let admins = rule_for("group=Domain Admins");
+        let outsider = Requester {
+            dn: Some(dn::normalize(ALICE_DN)),
+            admin: false,
+            groups: vec!["cn=Domain Admins,ou=groups,dc=example,dc=com".to_string()],
+        };
+        assert!(admins.rights(&outsider, &directory, ALICE_DN, None).read);
+        assert!(
+            !admins.rights(&alice(), &directory, ALICE_DN, None).read,
+            "without the ticket there is no membership, so the two paths are not confused"
+        );
+
+        // And the directory's own answer is not widened by having a ticket at all.
+        assert!(
+            !by_directory
+                .rights(&admin(), &directory, ALICE_DN, None)
+                .read
+        );
     }
 
     #[test]

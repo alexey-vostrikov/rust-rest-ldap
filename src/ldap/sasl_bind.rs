@@ -284,13 +284,17 @@ fn begin(
     let (ap_req, framing) = unwrap(token)?;
 
     let mut validator = rskrb5::service::ServiceValidator::new(gssapi.keytab())
-        .with_shared_replay_cache(gssapi.replay())
-        // No PAC validation: this server takes no authorization decision from the PAC - who may
-        // do what comes from the entry and the access rules, not from a Windows group list. The
-        // ticket's own signature, checked with the service key, is what proves the client.
-        // Left on, a KDC that issues a PAC this library cannot parse refuses every good ticket;
-        // a live run against MIT's KDC showed exactly that.
-        .without_pac_validation();
+        .with_shared_replay_cache(gssapi.replay());
+
+    // Whether the PAC's signature is checked at all is the operator's setting, and the default is
+    // "not at all" - see `pac_policy`. Kept off unless asked for, because a KDC that issues a PAC
+    // this library cannot parse refuses every otherwise valid ticket; a live run against MIT's KDC
+    // showed exactly that. Turning it on is a statement that every ticket in the realm comes from
+    // an Active Directory.
+    let pac = gssapi.pac();
+    if !pac.validates() {
+        validator = validator.without_pac_validation();
+    }
 
     if let Some(parts) = gssapi.service_principal() {
         let components: Vec<&str> = parts.iter().map(String::as_str).collect();
@@ -301,7 +305,44 @@ fn begin(
         .validate_ap_req(&ap_req)
         .map_err(|err| SaslError::Ticket(err.to_string()))?;
 
-    let identity = resolve_identity(gssapi, directory, &validated.client)?;
+    // The policy, applied to what the ticket claims. A refusal here is a failed bind with the
+    // reason attached: the client's Kerberos credentials are genuine and the ticket is still
+    // unusable, which is a different answer from "wrong password" and has to read as one.
+    let claim = validated
+        .pac
+        .as_ref()
+        .and_then(crate::pac_policy::Claim::of);
+    let admitted = crate::pac_policy::admit(claim, pac, std::time::SystemTime::now())
+        .map_err(|refusal| SaslError::Ticket(refusal.to_string()))?;
+
+    let mut identity = resolve_identity(gssapi, directory, &validated.client)?;
+
+    // The groups the ticket granted, resolved to entries of this directory. Off unless the operator
+    // asked for it: it changes what `memberOf` and a `group=` access rule answer for a session, and
+    // that is a decision about the directory rather than a side effect of accepting tickets.
+    if pac.groups
+        && let Some(admitted) = admitted.as_ref()
+    {
+        let (found, unmatched) = crate::pac_policy::resolve_groups(
+            directory
+                .all()
+                .iter()
+                .map(|entry| (entry.dn(), entry.attributes())),
+            &admitted.group_sids,
+        );
+        if !unmatched.is_empty() {
+            // Said once per bind, and only when it happened: a SID nobody holds is a group where a
+            // search must not match, and silence about it makes a missing import look like a
+            // working group.
+            eprintln!(
+                "gssapi: {} group SID(s) from the PAC of {} match no entry here: {}",
+                unmatched.len(),
+                admitted.login,
+                unmatched.join(", ")
+            );
+        }
+        identity = identity.with_groups(found.into_iter().map(|(dn, _)| dn).collect());
+    }
 
     // The AP-REP is what proves the server holds the service key. Built with an explicit
     // confounder because the library asks for one rather than drawing its own.
@@ -930,6 +971,7 @@ mod tests {
 
         let gssapi = crate::sasl::Gssapi::load(
             &crate::sasl::SaslConfig {
+                pac: crate::pac_policy::PacConfig::default(),
                 keytab: Some(path),
                 service_principal: None,
                 realms: vec![crate::sasl::RealmConfig {
