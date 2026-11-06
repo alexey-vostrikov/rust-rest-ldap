@@ -26,6 +26,10 @@ check: fmt-check lint test
 # What this buys: the crate forbids unsafe, so undefined behaviour cannot be written here - what
 # Miri checks is that this code does not rely on undefined behaviour in the standard library on
 # the paths it actually executes.
+# `index_file` is absent on purpose, and the reason is not size: Miri supports neither a file
+# mapping nor a temporary directory, so those tests abort inside `tempfile` before the code under
+# test is reached. Their job - the bounds arithmetic - is done by the tests themselves: a truncated
+# file, a foreign plan, a table pointing into the records.
 MIRI_MODULES = dn ldap::codec ldap::filter ldap::filter_parse ldap::assertion ldap::paged sort index mutate schema
 
 miri:

@@ -412,7 +412,15 @@ impl IndexFile {
 /// A shared handle, since every connection reads the same snapshot.
 pub type Shared = Arc<IndexFile>;
 
+// Miri runs these nowhere: the format is a file, and Miri supports neither a temporary directory
+// under isolation nor a file mapping at all - it aborts inside `tempfile` before the code under test
+// is reached. What it would be checking is the bounds arithmetic, and that is checked by the tests
+// themselves: a truncated file, a foreign plan, a table pointing into the records.
+//
+// Named here rather than discovered later: `make miri` lists its modules explicitly, and this one is
+// not among them. The `ignore` is a second belt so that adding it would still not turn the job red.
 #[cfg(test)]
+#[cfg_attr(miri, allow(dead_code))]
 mod tests {
     use super::*;
 
