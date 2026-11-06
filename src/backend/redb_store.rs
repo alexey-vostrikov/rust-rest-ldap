@@ -1044,6 +1044,58 @@ impl RedbBackend {
         Ok(())
     }
 
+    /// Writes the mapped file format: sorted postings, an offset table and the numbering.
+    ///
+    /// Goes through the same temporary-file-and-rename as the dump format, so a crash leaves either
+    /// the previous snapshot or the new one - never half of either. The counter is written after
+    /// the file, in its own small transaction, for the same reason as before: a counter naming a
+    /// file that is not there would have a start replay deltas onto nothing.
+    pub fn save_records(
+        &self,
+        records: &crate::index_file::Records,
+        sequence: u64,
+        plan: u64,
+    ) -> Result<u64, BackendError> {
+        let temporary = self.snapshot_temporary();
+        let written: u64;
+        {
+            let file = std::fs::File::create(&temporary).map_err(|source| BackendError::Redb {
+                path: temporary.display().to_string(),
+                reason: source.to_string(),
+            })?;
+            let mut buffered = std::io::BufWriter::with_capacity(1 << 20, file);
+            records
+                .write(&mut buffered, sequence, 0, plan)
+                .map_err(|source| BackendError::Redb {
+                    path: temporary.display().to_string(),
+                    reason: source.to_string(),
+                })?;
+            let file = buffered.into_inner().map_err(|err| BackendError::Redb {
+                path: temporary.display().to_string(),
+                reason: err.to_string(),
+            })?;
+            written = file
+                .metadata()
+                .map_err(|source| BackendError::Redb {
+                    path: temporary.display().to_string(),
+                    reason: source.to_string(),
+                })?
+                .len();
+            file.sync_all().map_err(|source| BackendError::Redb {
+                path: temporary.display().to_string(),
+                reason: source.to_string(),
+            })?;
+        }
+
+        self.adopt_snapshot(&temporary, sequence)?;
+        Ok(written)
+    }
+
+    /// Opens the mapped file format, or says why it will not be used.
+    pub fn open_index(&self, plan: u64) -> Option<crate::index_file::IndexFile> {
+        crate::index_file::IndexFile::open(&self.snapshot_path, plan)
+    }
+
     /// Writes a snapshot the caller already has in memory.
     ///
     /// Kept for the tests, which hold a snapshot and want it stored; a start encodes straight into

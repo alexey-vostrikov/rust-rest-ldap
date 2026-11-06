@@ -37,25 +37,6 @@ impl crate::directory::EntrySource for BackendEntrySource {
     }
 }
 
-/// A sink that counts what passes through it, so a streamed snapshot still reports its size.
-struct CountingWriter<'a> {
-    inner: &'a mut dyn std::io::Write,
-    written: &'a std::sync::atomic::AtomicUsize,
-}
-
-impl std::io::Write for CountingWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let written = self.inner.write(bytes)?;
-        self.written
-            .fetch_add(written, std::sync::atomic::Ordering::Relaxed);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 /// What the stored index snapshot is, as the process knows it: its counter and its size.
 ///
 /// Both are written on the same three occasions - a snapshot read, built, or rewritten - and read
@@ -261,24 +242,13 @@ impl Source {
                 // second copy of them is what made a three-million-entry start swap - 7.1 GB of
                 // swap, 82 GB read off the disk, the port closed for sixteen minutes.
                 let numbering = directory.numbering();
-                let next_id = directory.next_id();
                 let index = directory.index();
-                let produced = std::sync::atomic::AtomicUsize::new(0);
-                let mut produce = |out: &mut dyn std::io::Write| {
-                    let mut counted = CountingWriter {
-                        inner: out,
-                        written: &produced,
-                    };
-                    // Zero in the fingerprint field: it is not computed on this path any more,
-                    // and a value nobody verifies would be worse than an honest zero. Validity
-                    // comes from the counter chain (see the comment at the start of this function).
-                    index.encode_into(&mut counted, 0, &numbering, next_id)
-                };
-                match backend.save_index_streaming(sequence, &mut produce) {
-                    Ok(()) => known.remember(
-                        sequence,
-                        produced.load(std::sync::atomic::Ordering::Relaxed),
-                    ),
+                let plan = crate::index::plan_hash(&config.indexes);
+                // The mapped format: sorted postings and a table of offsets, so the next start
+                // reads a few pages instead of parsing this in full.
+                let records = index.records(numbering);
+                match backend.save_records(&records, sequence, plan) {
+                    Ok(bytes) => known.remember(sequence, bytes as usize),
                     Err(err) => eprintln!(
                         "{}",
                         crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])
@@ -310,6 +280,81 @@ impl Source {
         backend: &Arc<Backend>,
     ) -> Result<Option<(Directory, SnapshotKnown)>, BackendError> {
         let sequence = backend.sequence()?;
+        let plan = crate::index::plan_hash(&config.indexes);
+
+        // The mapped format first: it needs no decoding at all, and its header says which counter it
+        // covers. Only if that fails does the older dump format get read, which keeps a store written
+        // by the previous build starting without a rebuild.
+        if let Some(file) = backend.open_index(plan) {
+            let file = Arc::new(file);
+            let snapshot_sequence = file.sequence();
+
+            let known = SnapshotKnown::default();
+            known.remember(snapshot_sequence, file.length() as usize);
+
+            let state = match snapshot_sequence.cmp(&sequence) {
+                // Nothing has been written since the snapshot: the postings are the index, and the
+                // numbering is the identity map. No decoding, no materialising.
+                std::cmp::Ordering::Equal => file.numbering().map(|numbered| {
+                    (
+                        crate::index::Index::from_plan(&config.indexes)
+                            .with_mapped(Arc::clone(&file)),
+                        numbered
+                            .into_iter()
+                            .collect::<std::collections::HashMap<_, _>>(),
+                        file.next_id(),
+                    )
+                }),
+                // The store moved: the deltas say how. They were written by the write path, so the
+                // index is materialised from the file and the changes replayed onto it - the price
+                // of a start after writes, and of nothing else.
+                std::cmp::Ordering::Less => backend
+                    .index_deltas(snapshot_sequence, sequence)?
+                    .and_then(|deltas| {
+                        let numbering = file
+                            .numbering()?
+                            .into_iter()
+                            .collect::<std::collections::HashMap<_, _>>();
+                        apply_recorded(
+                            crate::index::Index::from_records(file.materialize()),
+                            numbering,
+                            file.next_id(),
+                            &deltas,
+                            &config.indexes,
+                        )
+                    }),
+                // A snapshot ahead of the store: different worlds, read the store.
+                std::cmp::Ordering::Greater => None,
+            };
+
+            if let Some((index, numbering, next_id)) = state {
+                let listed: Vec<(String, u32)> =
+                    numbering.iter().map(|(dn, id)| (dn.clone(), *id)).collect();
+                let mapped = index.is_mapped();
+
+                if let Some(directory) = Directory::from_skeletons(
+                    &config.base_dn,
+                    &config.users_ou_name,
+                    &config.groups_ou_name,
+                    index.skeletons(&listed),
+                    index,
+                    &numbering,
+                    next_id,
+                ) {
+                    let source = Arc::new(BackendEntrySource {
+                        backend: Arc::clone(backend),
+                    });
+                    // The records are skeletons either way - the store was not read - so the
+                    // source stays. What differs is only where the postings are: the file, or
+                    // memory after a replay.
+                    let _ = mapped;
+                    let directory = directory.with_source(source);
+                    println!("{}", crate::i18n::t("start.index_skeleton", &[]));
+                    return Ok(Some((directory, known)));
+                }
+            }
+        }
+
         let Some((bytes, snapshot_sequence)) = backend.load_index()? else {
             return Ok(None);
         };
@@ -867,6 +912,7 @@ impl Source {
         let backend = Arc::clone(&self.backend);
         let flag = Arc::clone(&self.snapshot_rewriting);
         let known = Arc::clone(&self.snapshot_known);
+        let indexes = self.indexes.clone();
 
         tokio::spawn(async move {
             let outcome =
@@ -876,31 +922,18 @@ impl Source {
                     // started, from counters in memory.
                     let recorded = backend.index_delta_bytes(known.sequence())?;
 
-                    // The same streaming as at start, for the same reason: this runs while the
-                    // server is serving, and a 2.16 GB allocation here would be felt by every
-                    // search in flight.
+                    // The same format as at start, and for the same reason: the next start reads
+                    // this file in place, and a rewrite that emitted the old dump would silently
+                    // cost it the whole saving. One format, one reader.
                     let numbering = directory.numbering();
-                    let next_id = directory.next_id();
                     let index = directory.index();
-                    let produced = std::sync::atomic::AtomicUsize::new(0);
-                    {
-                        let produced = &produced;
-                        let mut produce = |out: &mut dyn std::io::Write| {
-                            let mut counted = CountingWriter {
-                                inner: out,
-                                written: produced,
-                            };
-                            // Zero, as at start: nothing verifies this field any more, and a
-                            // rewrite that hashes three million entries would cost 45 seconds on a
-                            // blocking thread while the server is serving.
-                            index.encode_into(&mut counted, 0, &numbering, next_id)
-                        };
-                        backend.save_index_streaming(sequence, &mut produce)?;
-                    }
-                    let written = produced.load(std::sync::atomic::Ordering::Relaxed);
-                    known.remember(sequence, written);
+                    let plan = crate::index::plan_hash(&indexes);
+                    let records = index.records(numbering);
 
-                    Ok((written, recorded))
+                    let written = backend.save_records(&records, sequence, plan)?;
+                    known.remember(sequence, written as usize);
+
+                    Ok((written as usize, recorded))
                 })
                 .await;
 
@@ -1192,9 +1225,28 @@ fn replay_numbering(
     // The snapshot's fingerprint cannot match: the data moved, which is why a delta exists. The
     // stored value is read past rather than checked, and the deltas are what vouch for the
     // result - each one was written in the same breath as the change it describes.
-    let (mut index, numbering, mut next_id) = crate::index::Index::decode_unchecked(snapshot)?;
-    let mut numbering: std::collections::HashMap<String, u32> = numbering.into_iter().collect();
+    let (index, numbering, next_id) = crate::index::Index::decode_unchecked(snapshot)?;
+    let numbering: std::collections::HashMap<String, u32> = numbering.into_iter().collect();
 
+    apply_recorded(index, numbering, next_id, deltas, config)
+}
+
+/// Applies recorded change sets to an index, whatever it came from.
+///
+/// Two callers reach here: one that decoded the dump format, one that materialised the mapped one.
+/// The loop is the same work - the deltas were written by the write path and say which entries
+/// changed - so it lives once.
+fn apply_recorded(
+    mut index: crate::index::Index,
+    mut numbering: std::collections::HashMap<String, u32>,
+    mut next_id: u32,
+    deltas: &[Vec<u8>],
+    config: &crate::index::IndexConfig,
+) -> Option<(
+    crate::index::Index,
+    std::collections::HashMap<String, u32>,
+    u32,
+)> {
     for delta in deltas {
         let changes = crate::index::Index::decode_delta(delta)?;
         index.apply_delta(&changes, config).ok()?;
