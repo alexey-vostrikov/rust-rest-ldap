@@ -230,6 +230,18 @@ access:
 # naming context points at a part of the tree somebody else keeps: nothing is copied and nothing
 # is cached. A base under no referral and outside this tree is still `noSuchObject`, so a typo in
 # a DN stays a typo.
+# CLDAP ping: the question a Windows machine asks over UDP 389 before it can find a domain
+# controller. Off by default, and the default is honest: a reply says "this address is a domain
+# controller", and this server runs no KDC, so a machine sent here fails at the next step. The reply
+# leaves DS_KDC_FLAG clear, so a client that checks it learns that before it tries.
+#cldap:
+#  enabled: true
+#  dns_domain: example.com          # must agree with the naming context
+#  dns_host: dc1.example.com        # defaults to <hostname>.<domain>
+#  netbios_domain: EXAMPLE
+#  netbios_host: DC1
+#  address: 192.0.2.10              # what a client is told to connect to
+
 #referrals:
 #  - dn: dc=remote,dc=com
 #    url: ldaps://ldap.remote.example.com

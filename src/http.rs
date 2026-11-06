@@ -185,6 +185,7 @@ mod tests {
         std::fs::write(&groups_path, "[]").expect("groups");
 
         let config = crate::config::Config {
+            cldap: Default::default(),
             cache: crate::record_cache::CacheConfig::default(),
             backend: "file".to_string(),
             base_dn: "dc=example,dc=com".to_string(),

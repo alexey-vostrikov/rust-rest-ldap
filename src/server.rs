@@ -899,6 +899,7 @@ mod tests {
 
     fn test_config() -> crate::config::Config {
         crate::config::Config {
+            cldap: Default::default(),
             cache: crate::record_cache::CacheConfig::default(),
             backend: "file".to_string(),
             base_dn: BASE.to_string(),
