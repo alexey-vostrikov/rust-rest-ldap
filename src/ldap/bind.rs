@@ -138,7 +138,10 @@ fn authenticate(
         );
     }
 
-    let entry = match directory.find(&bind_dn) {
+    // `record`, not `find`: a skeleton snapshot holds the identity and not the values, and this
+    // path needs `userPassword`. Same answer, one keyed read when the snapshot was built that way.
+    let fetched = directory.record(&bind_dn);
+    let entry = match fetched.as_deref() {
         Some(entry) => entry,
         None => {
             return bind_response(

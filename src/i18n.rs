@@ -410,6 +410,10 @@ const ENGLISH: &[(&str, &str)] = &[
         "sasl: accepting Kerberos tickets for realm(s) {realms}",
     ),
     (
+        "start.index_skeleton",
+        "index: read from the store; records are fetched as they are needed, so this start does not read the directory",
+    ),
+    (
         "start.index_reused",
         "index: read from the store, the data has not changed since it was built",
     ),

@@ -256,6 +256,14 @@ pub fn handle_search(
     // where it is asked for rather than at start for everybody.
     let in_scope: Vec<(usize, std::borrow::Cow<'_, crate::model::Entry>)> = match &candidates {
         Some(candidates) => directory.resolved_at(candidates),
+        // A skeleton holds identities, so a filter cannot be evaluated against it at all - not even
+        // `(objectClass=*)`. The records in scope are read first, and that is the price of the mode,
+        // paid here rather than at start for everybody. Without a skeleton this arm is the ordinary
+        // one and nothing is copied.
+        None if directory.is_skeleton() => {
+            let ids = directory.scope_ids(&base_object, scope);
+            directory.resolved_at(&ids)
+        }
         None => directory
             .entries_with_ids(&base_object, scope)
             .into_iter()

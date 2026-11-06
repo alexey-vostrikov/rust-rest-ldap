@@ -690,6 +690,36 @@ impl Directory {
             .collect()
     }
 
+    /// The record for one DN, whatever this snapshot holds.
+    ///
+    /// `find` answers from what is in memory, which in a skeleton snapshot is an identity with no
+    /// attributes - right for a filter that only needs to know *which* entry, wrong for everything
+    /// that reads a value: a bind needs `userPassword`, an ACL rule needs the groups, an integrity
+    /// check needs the unique attributes. Those paths ask here, and pay one keyed read when the
+    /// snapshot is a skeleton and nothing when it is not.
+    ///
+    /// Returns `None` when neither the snapshot nor the store has the DN.
+    pub fn record(&self, dn: &str) -> Option<std::borrow::Cow<'_, Entry>> {
+        // The DN as `find` would resolve it, including the `uid=alice` for `cn=alice` spelling
+        // gorestldap accepted: a client that binds that way must keep working, and resolving here
+        // is what makes the two paths agree.
+        let normalized = dn::normalize(dn);
+        let resolved = if self.by_dn.contains_key(&normalized) {
+            normalized
+        } else {
+            self.find(&normalized)?.dn().to_string()
+        };
+        let position = self.position(&resolved)?;
+
+        match &self.source {
+            // The ordinary case: the entry is here, complete.
+            None => self.entries.get(position).map(std::borrow::Cow::Borrowed),
+            // A skeleton: the identity is here, the attributes are a read away - read under the DN
+            // the store knows, which is the one `find` resolved to.
+            Some(slot) => slot.0.get(&resolved).map(std::borrow::Cow::Owned),
+        }
+    }
+
     /// The same entries, with the record itself where this snapshot holds only a skeleton.
     ///
     /// A skeleton is enough to decide *whether* an entry matches anything the index can narrow, and
