@@ -427,6 +427,48 @@ impl RedbBackend {
     }
 
     /// Reads every stored entry.
+    /// One record, by DN: the read a skeleton snapshot makes per matched entry.
+    ///
+    /// A keyed lookup in the same table `load` walks, which is why it costs microseconds where the
+    /// walk costs a minute. `None` when the store does not hold the record - the caller decides
+    /// whether that is an error, and for a skeleton it is not: the entry may have been deleted by
+    /// a change the index has not caught up with.
+    pub fn entry(&self, dn: &str) -> Result<Option<Entry>, BackendError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+
+        let table = match transaction.open_table(ENTRIES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(source) => {
+                return Err(BackendError::Redb {
+                    path: "<entries>".to_string(),
+                    reason: source.to_string(),
+                });
+            }
+        };
+
+        let value = table.get(dn).map_err(|source| BackendError::Redb {
+            path: dn.to_string(),
+            reason: source.to_string(),
+        })?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+
+        let stored: StoredEntry =
+            serde_json::from_slice(value.value()).map_err(|err| BackendError::Redb {
+                path: dn.to_string(),
+                reason: format!("stored entry is not readable: {err}"),
+            })?;
+        Ok(Some(stored.into_entry(dn)))
+    }
+
     pub fn load(&self) -> Result<Vec<Entry>, BackendError> {
         let transaction = self
             .database

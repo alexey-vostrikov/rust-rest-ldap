@@ -31,6 +31,44 @@ pub enum Scope {
     Subtree,
 }
 
+/// Where a full record comes from when a snapshot holds only skeletons.
+///
+/// The point of the skeleton is that a start does not read three million records to answer a
+/// question about one. What it cannot do is answer with attributes it never read, so the entries
+/// that do match are fetched here - one keyed read each, from the store that already holds them.
+///
+/// `Send + Sync` because a `Directory` is shared by every connection: a search runs on any of the
+/// runtime's threads, and a source that could not cross threads would make the whole snapshot
+/// single-threaded.
+pub trait EntrySource: Send + Sync {
+    /// The record with this DN, or `None` when the store does not hold it.
+    fn get(&self, dn: &str) -> Option<Entry>;
+}
+
+/// Where the records come from, in the form `Directory` can hold and compare.
+///
+/// A trait object cannot derive `Debug`, `PartialEq` or `Eq`, and `Directory` derives all three
+/// because tests compare whole snapshots. The wrapper answers what it honestly can: no useful
+/// `Debug`, and equality by identity of the source object - two directories reading from the same
+/// store are the same, two reading from different stores are not, and neither claim says anything
+/// about the *contents*, which is what `Directory`'s own fields compare.
+#[derive(Clone)]
+struct SourceSlot(Arc<dyn EntrySource>);
+
+impl std::fmt::Debug for SourceSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<entry source>")
+    }
+}
+
+impl PartialEq for SourceSlot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SourceSlot {}
+
 /// Directory contents loaded from a backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directory {
@@ -73,6 +111,12 @@ pub struct Directory {
     in_scope: usize,
     /// Search indexes over the same id numbering. Empty unless `with_indexes` ran.
     index: Arc<Index>,
+    /// Where full records come from, when this snapshot holds skeletons instead of records.
+    ///
+    /// `None` in the ordinary case: the directory read the store and holds what it read. `Some`
+    /// only when the start took the skeleton path, and then every entry in `entries` carries its
+    /// DN and its indexed attributes and nothing else.
+    source: Option<SourceSlot>,
     /// Which snapshot of the directory this is.
     ///
     /// A paged search hands the client a cookie that says where the next page starts. An offset
@@ -306,6 +350,7 @@ impl Directory {
             csn: None,
             floor: None,
             index: Arc::new(Index::default()),
+            source: None,
         }
     }
 
@@ -643,6 +688,86 @@ impl Directory {
                 Some((position, &self.entries[position]))
             })
             .collect()
+    }
+
+    /// The same entries, with the record itself where this snapshot holds only a skeleton.
+    ///
+    /// A skeleton is enough to decide *whether* an entry matches anything the index can narrow, and
+    /// not enough to answer with it: the caller needs every attribute the client asked for. So the
+    /// record is fetched here, and only for the entries that got this far.
+    ///
+    /// A record the store no longer holds is skipped rather than answered as a skeleton: an answer
+    /// with half the attributes of an entry is worse than no answer, because nothing about it says
+    /// it is incomplete.
+    pub fn resolved_at(
+        &self,
+        ids: &roaring::RoaringBitmap,
+    ) -> Vec<(usize, std::borrow::Cow<'_, Entry>)> {
+        let Some(source) = self.source.as_ref().map(|slot| &slot.0) else {
+            // The ordinary case, and it costs nothing: the snapshot holds the records, so they are
+            // borrowed and not copied. A `Cow` here is what keeps the skeleton path from making
+            // every other path pay for a clone it does not need.
+            return self
+                .entries_at(ids)
+                .into_iter()
+                .map(|(position, entry)| (position, std::borrow::Cow::Borrowed(entry)))
+                .collect();
+        };
+
+        let mut resolved = Vec::with_capacity(ids.len() as usize);
+        for id in ids {
+            let Some(position) = self.by_id.get(&id) else {
+                continue;
+            };
+            let skeleton = &self.entries[*position];
+            // Skipped rather than answered as a skeleton: half an entry is worse than none,
+            // because nothing in the answer says it is incomplete.
+            if let Some(entry) = source.get(skeleton.dn()) {
+                resolved.push((*position, std::borrow::Cow::Owned(entry)));
+            }
+        }
+        resolved
+    }
+
+    /// Whether this snapshot holds skeletons rather than records.
+    pub fn is_skeleton(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// The same directory, fetching full records from `source`.
+    ///
+    /// Takes the entries it already holds as skeletons: their DN and their indexed attributes are
+    /// what the index needs, and everything else is a read away.
+    #[must_use]
+    pub fn with_source(mut self, source: Arc<dyn EntrySource>) -> Self {
+        self.source = Some(SourceSlot(source));
+        self
+    }
+
+    /// Builds a snapshot from skeletons and the numbering a stored index was built under.
+    ///
+    /// The entries are placed canonically, and then the ids are taken from `numbering` rather than
+    /// issued fresh - a posting that says "entry 42" has to name the entry the previous run called
+    /// 42, or the snapshot answers about other entries entirely.
+    pub fn from_skeletons(
+        base_dn: &str,
+        users_ou_name: &str,
+        groups_ou_name: &str,
+        skeletons: Vec<(String, crate::model::Attributes)>,
+        index: Index,
+        numbering: &std::collections::HashMap<String, u32>,
+        next_id: u32,
+    ) -> Option<Self> {
+        let entries: Vec<Entry> = skeletons
+            .into_iter()
+            .map(|(dn, attributes)| Entry::new(dn, attributes))
+            .collect();
+
+        // The same placement a store read goes through, so a skeleton sits where a record would:
+        // the two ranges that `users()` and `groups()` slice depend on it, and a search that walks
+        // them must not see an empty half of the directory.
+        Self::from_entries(base_dn, users_ou_name, groups_ou_name, entries)
+            .with_numbered_index(index, numbering, next_id)
     }
 
     /// Ids of the entries under `base_object` for this scope, as a bitmap.

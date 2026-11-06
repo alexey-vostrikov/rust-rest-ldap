@@ -17,7 +17,7 @@ use roaring::RoaringBitmap;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::model::Entry;
+use crate::model::{Attributes, Entry};
 
 /// What an index can answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -258,6 +258,29 @@ const DELTA_MAGIC: &[u8; 4] = b"RRDL";
 
 /// The stored shape of an entry, borrowed from the journal so a delta has no format of its own.
 type StoredShape = crate::backend::redb_store::StoredEntry;
+
+impl Index {
+    /// Which entries the snapshot knows, by DN and id - and deliberately nothing else.
+    ///
+    /// The tempting version of this returned attribute values, rebuilt by inverting the postings.
+    /// It cannot be done, and a test settled it: the equality map keys are **case-folded**
+    /// (`ann`, not `Ann`), because that is how a case-insensitive match works. A size wouldn't even
+    /// be the problem - answering a client with `ann` when the record says `Ann` is wrong, and
+    /// nothing in the answer says it was folded.
+    ///
+    /// So a skeleton carries an identity, not a copy. That is also all a skeleton is good for: a
+    /// filter has to be evaluated against real attributes, so every candidate is read from the
+    /// store before it is matched, and the narrowing comes from the postings the snapshot already
+    /// holds. Which means the useful structure is exactly this list of (DN, id) - three million
+    /// names and numbers, not three million records.
+    pub fn skeletons(&self, numbering: &[(String, u32)]) -> Vec<(String, Attributes)> {
+        let _ = self;
+        numbering
+            .iter()
+            .map(|(dn, _)| (dn.clone(), Attributes::new()))
+            .collect()
+    }
+}
 
 /// A fingerprint of everything the index is derived from.
 ///
@@ -1530,6 +1553,29 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    // The contract that matters, and the one the previous version of this function broke: a
+    // skeleton is an identity. It does not carry values, because the postings hold them folded and
+    // answering a client with a folded value is answering with data the client never stored.
+    #[test]
+    fn a_skeleton_is_an_identity_and_not_a_copy_of_the_values() {
+        let numbering = vec![
+            ("uid=alice,ou=users,dc=example,dc=com".to_string(), 0u32),
+            ("uid=bob,ou=users,dc=example,dc=com".to_string(), 1u32),
+        ];
+        let index = Index::default();
+
+        let skeletons = index.skeletons(&numbering);
+
+        assert_eq!(skeletons.len(), 2, "one per numbered entry, none invented");
+        assert_eq!(skeletons[0].0, "uid=alice,ou=users,dc=example,dc=com");
+        assert!(
+            skeletons
+                .iter()
+                .all(|(_, attributes)| attributes.values().is_empty()),
+            "an identity carries no attributes: a folded value would be a lie about the record"
+        );
     }
 
     /// `(attribute=*part*)`, the shape the filter parser produces for a bare substring.
