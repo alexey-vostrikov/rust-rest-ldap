@@ -145,11 +145,14 @@ impl Source {
         // transaction as the data, the snapshot records the counter it covers, and the deltas close
         // the gap - three facts that cannot disagree without a transaction boundary in between.
         //
-        // What the fingerprint still does, it does where it is cheap and where it is asked for:
-        // `--check-index` recomputes and compares it, and a start reads it out of the snapshot only
-        // to record what the snapshot claims. A store restored from a backup with a snapshot from
-        // another machine is the case this gives up detecting silently; that is what `--check-index`
-        // is for, and it is a check an operator runs once after a restore, not on every start.
+        // What is given up: a store restored from a backup beside a snapshot from another machine
+        // whose counter happens to match. `--check-index` is the answer, and it does *not* compare
+        // fingerprints - it checks that every search the index answers agrees with a full scan,
+        // which is a stronger question than "did the data move". It is a check an operator runs
+        // once after a restore, not on every start.
+        //
+        // `data_fingerprint` itself remains in `index.rs`, used by the tests that pin down what the
+        // snapshot format refuses. It is not on any start path any more.
         let sequence = backend.sequence()?;
         let stored = backend.load_index()?;
         // What the store holds, as the process will remember it. The number is the one the
