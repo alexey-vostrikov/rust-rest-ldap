@@ -1473,6 +1473,66 @@ impl Index {
     }
 
     /// Candidate ids for `query`, or `None` when the index cannot narrow it.
+    /// Roughly what these postings occupy, for a start line that says how much of the ceiling this
+    /// directory spends on the index alone.
+    ///
+    /// An estimate, and named as one: bitmaps hold variable-length containers, and walking them to
+    /// count exactly would cost more than the number is worth. What it must do is order the parts
+    /// correctly - keys, values and postings - so an operator can see whether the index is a
+    /// fraction of the ceiling or all of it.
+    pub fn heap_bytes(&self) -> u64 {
+        fn bitmap(bytes: &mut u64, map: &RoaringBitmap) {
+            *bytes += u64::try_from(map.serialized_size()).unwrap_or(u64::MAX);
+        }
+
+        let mut bytes = 0u64;
+        for (attribute, map) in &self.presence {
+            bytes += attribute.len() as u64;
+            bitmap(&mut bytes, map);
+        }
+        for (attribute, values) in &self.equality {
+            bytes += attribute.len() as u64;
+            for (value, map) in values {
+                bytes += value.len() as u64;
+                bitmap(&mut bytes, map);
+            }
+        }
+        for (attribute, values) in &self.substrings {
+            bytes += attribute.len() as u64;
+            for (value, map) in values {
+                bytes += value.len() as u64;
+                bitmap(&mut bytes, map);
+            }
+        }
+        for (attribute, values) in &self.ordered {
+            bytes += attribute.len() as u64;
+            for map in values.values() {
+                bitmap(&mut bytes, map);
+            }
+        }
+        // What the maps cost to hold their entries: a pointer and a hash each. Counted so the
+        // estimate follows the load factor instead of pretending it is free.
+        let entries = self.presence.len()
+            + self
+                .equality
+                .values()
+                .map(std::collections::HashMap::len)
+                .sum::<usize>()
+            + self
+                .substrings
+                .values()
+                .map(std::collections::HashMap::len)
+                .sum::<usize>()
+            + self
+                .ordered
+                .values()
+                .map(std::collections::BTreeMap::len)
+                .sum::<usize>();
+        bytes += (entries as u64) * 16;
+
+        bytes
+    }
+
     pub fn candidates(&self, query: &Query) -> Option<RoaringBitmap> {
         // The file first, when the postings live there. Only the kinds it holds are asked: a range
         // is not in the format, and answering `None` for it - which the search path reads as
