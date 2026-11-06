@@ -105,6 +105,18 @@ indexes:
 #limits:
 #  size_limit: 5000
 #  time_limit: 30
+#  # Resident memory this server may use. Exceeding it is reported, never a refusal:
+#  # an unavailable server is worse than a slow one.
+#  memory_bytes: 16G
+
+# Records kept in memory when the catalog is too large to hold whole. A start over a snapshot
+# reads the index and the identities only; every attribute comes from the store when a request
+# needs it, and the records asked for most often are kept here. Zero turns the cache off.
+#
+# The budget is what the cache may hold, not what the process uses: an entry is counted by its
+# strings and its bookkeeping, and the estimate is deliberately close rather than exact.
+#cache:
+#  entries_max_bytes: 256M
 
 # Access control. Rules are checked in order and the first match decides; without a match
 # the request is refused, so the list has to end with an allow for the people who need it.

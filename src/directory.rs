@@ -69,6 +69,29 @@ impl PartialEq for SourceSlot {
 
 impl Eq for SourceSlot {}
 
+/// The record cache, in the form `Directory` can hold and compare.
+///
+/// The same wrapper as `SourceSlot` and for the same reason: `Directory` derives `PartialEq` because
+/// tests compare whole snapshots, and a cache has no meaningful structural equality - two directories
+/// differ by what they have cached at this instant, which says nothing about the directory. Equality
+/// by identity answers the question the derivation is really asking: same cache object, or not.
+#[derive(Clone)]
+struct CacheSlot(Arc<crate::record_cache::RecordCache>);
+
+impl std::fmt::Debug for CacheSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<record cache>")
+    }
+}
+
+impl PartialEq for CacheSlot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CacheSlot {}
+
 /// Directory contents loaded from a backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directory {
@@ -111,6 +134,11 @@ pub struct Directory {
     in_scope: usize,
     /// Search indexes over the same id numbering. Empty unless `with_indexes` ran.
     index: Arc<Index>,
+    /// Records already read back from the store, when that is where they come from.
+    ///
+    /// Only ever set together with `source`: a snapshot that holds its records complete has nothing
+    /// to cache, because reading one is a slice of memory it already owns.
+    cache: Option<CacheSlot>,
     /// Where full records come from, when this snapshot holds skeletons instead of records.
     ///
     /// `None` in the ordinary case: the directory read the store and holds what it read. `Some`
@@ -350,6 +378,7 @@ impl Directory {
             csn: None,
             floor: None,
             index: Arc::new(Index::default()),
+            cache: None,
             source: None,
         }
     }
@@ -418,6 +447,10 @@ impl Directory {
         // when a reader copied it earlier the copy costs microseconds rather than the directory.
         let index = Arc::make_mut(&mut self.index);
         index.replace(stable, &old, &entry, config)?;
+
+        // After the patch, not before: a failure above leaves the directory unchanged, and a cache
+        // entry dropped for a write that did not happen only costs the next read.
+        self.forget_cached(entry.dn());
 
         Ok(true)
     }
@@ -488,6 +521,10 @@ impl Directory {
         // the reader keeps the view it had.
         let index = Arc::make_mut(&mut self.index);
         index.add(id, &self.entries[position], config)?;
+
+        // A record cached under this DN was read before the entry existed - or belongs to an entry
+        // this one replaced. Either way it is not this entry.
+        self.forget_cached(self.entries[position].dn());
         Ok(true)
     }
 
@@ -523,6 +560,10 @@ impl Directory {
 
         let index = Arc::make_mut(&mut self.index);
         index.remove(id, &removed, config)?;
+
+        // The record is gone from the directory, so serving it from the cache would answer for an
+        // entry a search no longer returns.
+        self.forget_cached(removed.dn());
         Ok(Some(removed))
     }
 
@@ -711,13 +752,24 @@ impl Directory {
         };
         let position = self.position(&resolved)?;
 
-        match &self.source {
-            // The ordinary case: the entry is here, complete.
-            None => self.entries.get(position).map(std::borrow::Cow::Borrowed),
-            // A skeleton: the identity is here, the attributes are a read away - read under the DN
-            // the store knows, which is the one `find` resolved to.
-            Some(slot) => slot.0.get(&resolved).map(std::borrow::Cow::Owned),
+        let Some(source) = self.source.as_ref().map(|slot| &slot.0) else {
+            // The ordinary case: the entry is here, complete. Reading it is a slice of memory the
+            // directory already owns, so there is nothing to cache and nothing to borrow from.
+            return self.entries.get(position).map(std::borrow::Cow::Borrowed);
+        };
+
+        // A skeleton: the identity is here, the attributes are a read away - read under the DN the
+        // store knows, which is the one `find` resolved to. Filed afterwards, because this is the
+        // path a bind takes on every request: one account, read over and over.
+        if let Some(cached) = self.cache.as_ref().and_then(|slot| slot.0.get(&resolved)) {
+            return Some(std::borrow::Cow::Owned((*cached).clone()));
         }
+
+        let entry = source.get(&resolved)?;
+        if let Some(cache) = self.cache.as_ref() {
+            cache.0.insert(&resolved, entry.clone());
+        }
+        Some(std::borrow::Cow::Owned(entry))
     }
 
     /// The same entries, with the record itself where this snapshot holds only a skeleton.
@@ -750,6 +802,19 @@ impl Directory {
                 continue;
             };
             let skeleton = &self.entries[*position];
+
+            // Consulted, never filled: a search that reaches every entry would file three million
+            // records and evict exactly the few a client reuses. The cache pays on repeat reads of
+            // the same record, and a bulk answer has no repeats by construction.
+            if let Some(entry) = self
+                .cache
+                .as_ref()
+                .and_then(|slot| slot.0.get(skeleton.dn()))
+            {
+                resolved.push((*position, std::borrow::Cow::Owned((*entry).clone())));
+                continue;
+            }
+
             // Skipped rather than answered as a skeleton: half an entry is worse than none,
             // because nothing in the answer says it is incomplete.
             if let Some(entry) = source.get(skeleton.dn()) {
@@ -772,6 +837,32 @@ impl Directory {
     pub fn with_source(mut self, source: Arc<dyn EntrySource>) -> Self {
         self.source = Some(SourceSlot(source));
         self
+    }
+
+    /// The same directory, keeping recently read records of up to `budget` bytes.
+    ///
+    /// Set beside the source and only meaningful with one: without it, every record is already in
+    /// memory and there is nothing to keep.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<crate::record_cache::RecordCache>) -> Self {
+        self.cache = Some(CacheSlot(cache));
+        self
+    }
+
+    /// The cache this snapshot reads through, when it has one.
+    pub fn cache(&self) -> Option<&Arc<crate::record_cache::RecordCache>> {
+        self.cache.as_ref().map(|slot| &slot.0)
+    }
+
+    /// Drops a cached record, so the next read sees what was just written.
+    ///
+    /// Called by every path that changes a record in place. Without it a bind after a password
+    /// change would authenticate against the password the cache read before the change - the worst
+    /// kind of staleness, because it is a security answer rather than a display.
+    fn forget_cached(&self, dn: &str) {
+        if let Some(cache) = self.cache.as_ref() {
+            cache.0.forget(&crate::dn::normalize(dn));
+        }
     }
 
     /// Builds a snapshot from skeletons and the numbering a stored index was built under.
@@ -998,10 +1089,192 @@ fn is_direct_child(entry_dn: &str, base_object: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A source that counts reads, so "answered from the cache" is a measurable claim rather than
+    /// an expectation about a field.
+    struct CountingSource {
+        records: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Entry>>>,
+        reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl EntrySource for CountingSource {
+        fn get(&self, dn: &str) -> Option<Entry> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let records = self
+                .records
+                .lock()
+                .expect("the source lock is not poisoned");
+            records.get(&dn::normalize(dn)).cloned()
+        }
+    }
+
     const BASE: &str = "dc=example,dc=com";
     const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
     const ALICE_DN: &str = "cn=alice cooper,ou=users,dc=example,dc=com";
     const GROUP_DN: &str = "cn=group_a,ou=groups,dc=example,dc=com";
+
+    /// What the "store" holds, how many reads it answered, and a directory reading through it.
+    ///
+    /// The store is a real one in the sense that matters: when an entry changes, the store is
+    /// updated too, so a cache that forgot to drop the old record answers with a value that no
+    /// longer exists anywhere - which is exactly the failure the test is looking for.
+    struct Stand {
+        directory: Directory,
+        reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        store: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Entry>>>,
+    }
+
+    impl Stand {
+        fn new(budget: usize, entries: &[Entry]) -> Self {
+            let mut records = std::collections::HashMap::new();
+            for entry in entries {
+                records.insert(dn::normalize(entry.dn()), entry.clone());
+            }
+            let store = std::sync::Arc::new(std::sync::Mutex::new(records));
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+            let source = std::sync::Arc::new(CountingSource {
+                records: std::sync::Arc::clone(&store),
+                reads: std::sync::Arc::clone(&reads),
+            });
+            let directory = Directory::from_entries(BASE, "users", "groups", entries.to_vec())
+                .with_source(source)
+                .with_cache(std::sync::Arc::new(crate::record_cache::RecordCache::new(
+                    budget,
+                )));
+
+            Self {
+                directory,
+                reads,
+                store,
+            }
+        }
+
+        /// Writes the entry to the store, as a commit would before the snapshot is patched.
+        fn stored(&self, entry: &Entry) {
+            self.store
+                .lock()
+                .expect("the store lock is not poisoned")
+                .insert(dn::normalize(entry.dn()), entry.clone());
+        }
+    }
+
+    fn account(dn: &str, password: &str) -> Entry {
+        let attributes = crate::model::Attributes::new()
+            .replace(crate::model::Attribute::single("cn", dn))
+            .replace(crate::model::Attribute::single("userPassword", password));
+        Entry::new(dn, attributes)
+    }
+
+    #[test]
+    fn a_record_read_twice_reaches_the_store_once() {
+        let stand = Stand::new(1024 * 1024, &[account(ALICE_DN, "first")]);
+
+        let first = stand
+            .directory
+            .record(ALICE_DN)
+            .expect("the record is there");
+        let second = stand
+            .directory
+            .record(ALICE_DN)
+            .expect("the record is there");
+
+        assert_eq!(
+            first
+                .attributes()
+                .get("userPassword")
+                .and_then(|attribute| attribute.values.first().map(String::as_str)),
+            Some("first")
+        );
+        assert_eq!(second.dn(), first.dn());
+        assert_eq!(
+            stand.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second read must come from the cache"
+        );
+    }
+
+    #[test]
+    fn a_cached_record_is_dropped_when_the_entry_changes() {
+        // The failure this rules out is the worst kind: a bind answering with the password that was
+        // current when the record was first read, while the store holds a different one.
+        let changed = account(ALICE_DN, "after");
+        let mut stand = Stand::new(1024 * 1024, &[account(ALICE_DN, "before")]);
+        stand
+            .directory
+            .record(ALICE_DN)
+            .expect("the record is there");
+
+        stand.stored(&changed);
+        let replaced = stand
+            .directory
+            .replace_entry_in_place(changed, &crate::index::IndexConfig::default())
+            .expect("the replacement is indexed");
+        assert!(
+            replaced,
+            "the entry existed, so the replacement must have happened"
+        );
+
+        let record = stand
+            .directory
+            .record(ALICE_DN)
+            .expect("the record is there");
+        assert_eq!(
+            record
+                .attributes()
+                .get("userPassword")
+                .and_then(|attribute| attribute.values.first().map(String::as_str)),
+            Some("after"),
+            "a stale password here would authenticate against the old one"
+        );
+        assert_eq!(stand.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_search_answers_from_the_cache_but_does_not_fill_it() {
+        // A bulk answer files nothing: three million records would evict every record a client
+        // actually reuses, and the cache would cost memory without earning any.
+        let stand = Stand::new(
+            1024 * 1024,
+            &[
+                account(ALICE_DN, "p"),
+                account("cn=bob,ou=users,dc=example,dc=com", "q"),
+            ],
+        );
+        let cache = stand.directory.cache().expect("the cache is set");
+
+        let ids = stand.directory.scope_ids(BASE, Scope::Subtree);
+        let resolved = stand.directory.resolved_at(&ids);
+        let first_search = stand.reads.load(std::sync::atomic::Ordering::SeqCst);
+
+        // The scope also names the naming context and the two organizational units. This store
+        // holds neither, so those candidates are asked for and skipped - an entry the store no
+        // longer holds is never answered as a skeleton - which is why five were asked and two
+        // answered.
+        assert_eq!(
+            resolved.len(),
+            2,
+            "the two accounts are the records the store holds"
+        );
+        assert_eq!(cache.len(), 0, "a search must not file what it read");
+        assert_eq!(cache.statistics().1, ids.len(), "one miss per candidate");
+        assert_eq!(first_search, ids.len(), "one keyed read per candidate");
+
+        // The single-record path does file, and then a search is answered without the store.
+        stand
+            .directory
+            .record(ALICE_DN)
+            .expect("the record is there");
+        assert_eq!(cache.len(), 1);
+
+        let before = stand.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = stand.directory.resolved_at(&ids);
+        assert_eq!(
+            stand.reads.load(std::sync::atomic::Ordering::SeqCst) - before,
+            first_search - 1,
+            "the cached record is not read from the store again"
+        );
+        assert_eq!(cache.len(), 1, "and the search still files nothing");
+    }
 
     fn admin() -> User {
         User {

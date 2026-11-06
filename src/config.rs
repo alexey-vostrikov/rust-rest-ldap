@@ -306,6 +306,8 @@ pub struct Config {
     pub integrity: IntegrityConfig,
     /// The server's own size and time limits; unlimited unless the operator said otherwise.
     pub limits: crate::limits::Limits,
+    /// How many materialised records to keep, when the snapshot holds skeletons.
+    pub cache: crate::record_cache::CacheConfig,
     /// Where the change journal goes, if anywhere.
     pub observability: ObservabilityConfig,
     /// The first administrator of an empty store, if the operator configured one.
@@ -467,6 +469,9 @@ struct FileConfig {
     /// What the server refuses to do, whatever the client asked for.
     #[serde(default)]
     limits: crate::limits::LimitsConfig,
+    /// How many records to keep materialised, under the memory ceiling.
+    #[serde(default)]
+    cache: crate::record_cache::CacheConfig,
     /// Subtrees held elsewhere: `- dn: dc=remote,dc=com` with the URL a client should ask.
     #[serde(default)]
     referrals: Vec<ReferralConfig>,
@@ -836,6 +841,7 @@ pub fn resolve(
         server_key: file.server_key,
         integrity: file.integrity,
         limits: crate::limits::Limits::from_config(&file.limits),
+        cache: file.cache,
         observability: file.observability,
         locale: {
             // The configuration wins over the host: an operator who wrote `locale: ru`

@@ -275,6 +275,25 @@ impl Source {
     /// `None` means "read the store": no snapshot, a counter that disagrees, a snapshot that does
     /// not decode, or a backend that cannot fetch one record by key. Every one of those is a slower
     /// start, never a wrong one.
+    /// The snapshot with its records a read away, and the cache that keeps the hot ones.
+    ///
+    /// One place because there are two ways to arrive here - the mapped file and the replayed dump -
+    /// and a cache configured on one path but not the other is a settings that works until a store
+    /// is written by a different build.
+    fn skeleton(directory: Directory, backend: &Arc<Backend>, config: &Config) -> Directory {
+        let source = Arc::new(BackendEntrySource {
+            backend: Arc::clone(backend),
+        });
+        let directory = directory.with_source(source);
+
+        // Zero means the operator asked for no cache, and the answer is to read every time rather
+        // than to invent a budget they did not set.
+        match config.cache.budget() {
+            0 => directory,
+            budget => directory.with_cache(Arc::new(crate::record_cache::RecordCache::new(budget))),
+        }
+    }
+
     fn from_snapshot_only(
         config: &Config,
         backend: &Arc<Backend>,
@@ -349,15 +368,27 @@ impl Source {
                     next_id,
                 ) {
                     eprintln!("PHASE skeletons {}ms", t_build.elapsed().as_millis());
-                    let source = Arc::new(BackendEntrySource {
-                        backend: Arc::clone(backend),
-                    });
                     // The records are skeletons either way - the store was not read - so the
                     // source stays. What differs is only where the postings are: the file, or
                     // memory after a replay.
                     let _ = mapped;
-                    let directory = directory.with_source(source);
+                    let directory = Self::skeleton(directory, backend, config);
                     println!("{}", crate::i18n::t("start.index_skeleton", &[]));
+                    // Said once, at start, and only when there is a cache: a budget nobody is told
+                    // about is a number the operator cannot check against what the process uses.
+                    if let Some(cache) = directory.cache() {
+                        println!(
+                            "{}",
+                            crate::i18n::t(
+                                "start.cache",
+                                &[(
+                                    "budget",
+                                    &crate::limits::Size(config.cache.budget() as u64).to_string()
+                                )]
+                            )
+                        );
+                        let _ = cache;
+                    }
                     return Ok(Some((directory, known)));
                 }
             }
@@ -413,10 +444,7 @@ impl Source {
             return Ok(None);
         };
 
-        let source = Arc::new(BackendEntrySource {
-            backend: Arc::clone(backend),
-        });
-        Ok(Some((directory.with_source(source), known)))
+        Ok(Some((Self::skeleton(directory, backend, config), known)))
     }
 
     /// Everything a start does once it knows what the directory holds.
@@ -1302,6 +1330,7 @@ mod tests {
 
     fn config(users: &str, groups: &str) -> Config {
         let mut config = Config {
+            cache: crate::record_cache::CacheConfig::default(),
             backend: "file".to_string(),
             base_dn: "dc=example,dc=com".to_string(),
             listen_addr: "127.0.0.1:0".to_string(),
