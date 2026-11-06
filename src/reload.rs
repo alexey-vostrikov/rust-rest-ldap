@@ -286,6 +286,7 @@ impl Source {
         // covers. Only if that fails does the older dump format get read, which keeps a store written
         // by the previous build starting without a rebuild.
         if let Some(file) = backend.open_index(plan) {
+            let t_open = std::time::Instant::now();
             let file = Arc::new(file);
             let snapshot_sequence = file.sequence();
 
@@ -296,6 +297,11 @@ impl Source {
                 // Nothing has been written since the snapshot: the postings are the index, and the
                 // numbering is the identity map. No decoding, no materialising.
                 std::cmp::Ordering::Equal => file.numbering().map(|numbered| {
+                    eprintln!(
+                        "PHASE numbering {}ms ({} dn)",
+                        t_open.elapsed().as_millis(),
+                        numbered.len()
+                    );
                     (
                         crate::index::Index::from_plan(&config.indexes)
                             .with_mapped(Arc::clone(&file)),
@@ -332,6 +338,7 @@ impl Source {
                     numbering.iter().map(|(dn, id)| (dn.clone(), *id)).collect();
                 let mapped = index.is_mapped();
 
+                let t_build = std::time::Instant::now();
                 if let Some(directory) = Directory::from_skeletons(
                     &config.base_dn,
                     &config.users_ou_name,
@@ -341,6 +348,7 @@ impl Source {
                     &numbering,
                     next_id,
                 ) {
+                    eprintln!("PHASE skeletons {}ms", t_build.elapsed().as_millis());
                     let source = Arc::new(BackendEntrySource {
                         backend: Arc::clone(backend),
                     });
