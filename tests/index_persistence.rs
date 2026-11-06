@@ -202,6 +202,270 @@ async fn a_change_between_starts_is_replayed_rather_than_rebuilt() {
 }
 
 #[tokio::test]
+async fn a_write_onto_a_mapped_index_is_recorded_rather_than_materialised() {
+    // What this rules out is the cost that made the memory ceiling a promise instead of a boundary:
+    // touching one entry used to pull every posting out of the snapshot file into maps, which on a
+    // million entries is 1.14 GB for one modify (ub-log §108). The change is now a record applied
+    // to each answer, so its price follows the number of changes, not the size of the directory.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+
+    // The first start has no snapshot to read and builds the index from the data; it writes one on
+    // the way out. The second start is the one that maps it - and that is the state this test is
+    // about, because a mapped index is where a write used to materialise everything.
+    //
+    // The rewrite threshold is set out of reach on purpose: with it in reach the write converges the
+    // snapshot instead of leaving an overlay, and the test would then be measuring convergence. That
+    // has its own test below.
+    let config = config_with(&path, "  snapshot_delta_bytes: 1073741824\n");
+    drop(
+        Source::load(&config, open(&path))
+            .await
+            .expect("first start"),
+    );
+    let (source, _) = Source::load(&config, open(&path))
+        .await
+        .expect("second start");
+
+    let before = source.directory().await;
+    assert!(
+        before.index().is_mapped(),
+        "the second start must map the snapshot rather than decode it"
+    );
+    assert_eq!(before.index().overlay_len(), 0);
+    drop(before);
+
+    source
+        .apply(&[EntryChange::Upsert {
+            entry: person("carol", "20260101000000.000000Z#000002#001#000000"),
+        }])
+        .await
+        .expect("apply");
+
+    let after = source.directory().await;
+    assert_eq!(
+        after.index().overlay_len(),
+        1,
+        "the change is one record to apply, not a materialised index"
+    );
+    assert!(
+        after.index().is_mapped(),
+        "the write must not pull the postings into memory"
+    );
+    assert_eq!(
+        matches_from_index(&source, "carol").await,
+        Some(1),
+        "an entry written after the snapshot is found through the overlay"
+    );
+    assert_eq!(
+        matches_from_index(&source, "alice").await,
+        Some(1),
+        "and the one that was in the snapshot is still found"
+    );
+}
+
+#[tokio::test]
+async fn the_overlay_stops_growing_at_its_cap_and_the_index_materialises_once() {
+    // The question the design has to answer: does the overlay grow without bound on a server that
+    // is written to forever? It must not - every query pays one comparison per record, and the
+    // memory follows writes rather than the directory. The cap is the answer: past it the index
+    // does what it did before (pulls the postings into maps, once) and stops paying per query.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+
+    // A tiny cap, so the test does not need ten thousand writes to reach it.
+    let config = config_with(
+        &path,
+        "  snapshot_overlay_max: 2\n  snapshot_delta_bytes: 1073741824\n",
+    );
+    drop(
+        Source::load(&config, open(&path))
+            .await
+            .expect("first start"),
+    );
+
+    let (source, _) = Source::load(&config, open(&path))
+        .await
+        .expect("second start");
+    assert!(source.directory().await.index().is_mapped(), "mapped");
+
+    for index in 0..4 {
+        source
+            .apply(&[EntryChange::Upsert {
+                entry: person(
+                    &format!("user{index}"),
+                    "20260101000000.000000Z#000002#001#000000",
+                ),
+            }])
+            .await
+            .expect("apply");
+    }
+
+    let directory = source.directory().await;
+    assert!(
+        directory.index().overlay_len() <= 2,
+        "the overlay must not grow past its cap, found {}",
+        directory.index().overlay_len()
+    );
+    assert!(
+        !directory.index().is_mapped(),
+        "past the cap the postings are in memory, which is the price of a bounded overlay"
+    );
+    // And every write is still findable, which is what the cap must not cost.
+    for index in 0..4 {
+        assert_eq!(
+            matches_from_index(&source, &format!("user{index}")).await,
+            Some(1),
+            "user{index} must be found"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rewrite_converges_the_overlay_instead_of_leaving_it_in_memory() {
+    // The step without which the overlay never empties: a rewrite writes the file, and the live
+    // index keeps mapping the old one, so the recorded changes stay for the life of the process.
+    // Convergence swaps the snapshot for a fresh one built from the file just written - one pointer,
+    // so a reader holding the old view keeps it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+
+    // A threshold of one byte: the first write rewrites the snapshot, which is what a deployment
+    // sees after enough changes rather than after one.
+    let config = config_with(&path, "  snapshot_delta_bytes: 1\n");
+    drop(
+        Source::load(&config, open(&path))
+            .await
+            .expect("first start"),
+    );
+
+    let (source, _) = Source::load(&config, open(&path))
+        .await
+        .expect("second start");
+    assert_eq!(source.directory().await.index().overlay_len(), 0);
+
+    source
+        .apply(&[EntryChange::Upsert {
+            entry: person("carol", "20260101000000.000000Z#000002#001#000000"),
+        }])
+        .await
+        .expect("apply");
+
+    // The rewrite runs in the background; wait for it rather than sleeping a guessed interval.
+    let converged = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let directory = source.directory().await;
+            if directory.snapshot() > 0 && directory.index().overlay_len() == 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the rewrite converges within the timeout");
+
+    assert!(
+        converged,
+        "the overlay must empty once the snapshot covers it"
+    );
+    let directory = source.directory().await;
+    assert!(
+        directory.index().is_mapped(),
+        "and the postings must be in the file again, not in maps"
+    );
+
+    // Convergence must not cost a change: everything written is still findable afterwards.
+    assert_eq!(matches_from_index(&source, "carol").await, Some(1));
+    assert_eq!(matches_from_index(&source, "alice").await, Some(1));
+}
+
+#[tokio::test]
+async fn a_replaced_value_leaves_the_index_it_used_to_be_in() {
+    // The half of the overlay that is easy to get wrong: adding where the new value matches is
+    // obvious, removing where the old one matched is not - the postings are in a read-only file,
+    // and a record that only adds would answer about a value the entry no longer holds.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+
+    let source = load(&path).await;
+    assert_eq!(matches_from_index(&source, "alice").await, Some(1));
+
+    // The same entry, with its uid changed: `person` puts the name in the DN too, so the DN stays
+    // and only the indexed attribute moves - which is exactly the case where the old postings are
+    // wrong and the new ones do not exist yet.
+    let renamed = Entry::new(
+        format!("cn=alice,ou=users,{BASE}"),
+        Attributes::new()
+            .push(Attribute::new(
+                "objectClass",
+                vec!["top".to_string(), "inetOrgPerson".to_string()],
+            ))
+            .push(Attribute::single("cn", "alice"))
+            .push(Attribute::single("sn", "Surname"))
+            .push(Attribute::single("uid", "bob"))
+            .push(
+                Attribute::single("entryCSN", "20260101000000.000000Z#000002#001#000000")
+                    .operational(),
+            ),
+    );
+    source
+        .apply(&[EntryChange::Upsert { entry: renamed }])
+        .await
+        .expect("apply");
+
+    assert_eq!(
+        matches_from_index(&source, "alice").await,
+        Some(0),
+        "the value the entry no longer holds must stop matching"
+    );
+    assert_eq!(
+        matches_from_index(&source, "bob").await,
+        Some(1),
+        "and the value it holds now must match"
+    );
+}
+
+#[tokio::test]
 async fn a_deletion_between_starts_is_replayed_too() {
     // The case a delta gets wrong most easily: a removal has no entry to add, only postings to
     // take away. Left unreplayed, the index would answer about an entry that is gone.

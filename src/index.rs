@@ -137,6 +137,20 @@ pub struct IndexConfig {
     /// than a megabyte: below that a small directory would rewrite on every few writes, which is
     /// dearer than the changes removed.
     pub snapshot_delta_bytes: Option<u64>,
+    /// How many changed entries may be recorded on top of a mapped snapshot before the index gives
+    /// up on the overlay and materialises.
+    ///
+    /// The overlay is what keeps a write from costing a gigabyte (ub-log §109), but it is not
+    /// unbounded: every query pays one comparison per record it holds, and a server written to
+    /// forever would grow it forever. At this many records the index does what it used to do on the
+    /// first write - pulls the postings into maps - and from then on pays nothing per query. So the
+    /// cost is "a gigabyte once, after thousands of changes", not "a gigabyte per change" and not
+    /// "an overlay that never stops growing".
+    ///
+    /// Eight thousand and not a round ten: it is about the point where an overlay of small entries
+    /// is a few megabytes, and where the per-query comparison is still cheaper than reading the
+    /// snapshot back.
+    pub snapshot_overlay_max: Option<usize>,
 }
 
 impl IndexConfig {
@@ -176,6 +190,25 @@ fn parse_kind(name: &str) -> Result<Kind, IndexError> {
     }
 }
 
+/// How many changed entries a mapped index records before it materialises instead.
+///
+/// Eight thousand and not a round ten: that is about where an overlay of small entries is a few
+/// megabytes, and where one comparison per record per query is still cheaper than reading the whole
+/// snapshot back into maps.
+pub const DEFAULT_OVERLAY_MAX: usize = 8192;
+
+/// One entry whose postings were changed while the index was mapped.
+///
+/// `before` and `after` are whole attribute sets rather than deltas of values: an entry is small,
+/// the number of changed entries is bounded by the snapshot threshold, and comparing a query
+/// against a set is one pass over the attributes instead of a merge of two lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Overlay {
+    id: u32,
+    before: Option<crate::model::Attributes>,
+    after: Option<crate::model::Attributes>,
+}
+
 /// Built indexes for one directory snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Index {
@@ -194,6 +227,23 @@ pub struct Index {
     default_kinds: BTreeSet<Kind>,
     /// Kinds actually built, per attribute, for logging and for `--check-index`.
     built: BTreeMap<Arc<str>, BTreeSet<Kind>>,
+    /// Changes made since the file was mapped, applied on top of what it holds.
+    ///
+    /// The file is read-only, and the maps are empty by design while it is mapped, so a write has
+    /// nowhere to go. Materialising the whole index to accept one change is what this replaces:
+    /// on a million entries that cost 1.14 GB per modify (measured, ub-log §108), and on three
+    /// million about three times that. A change is a record of what the entry looked like before
+    /// and after, and the lookup path applies it to the file's answer - tens of bytes per write,
+    /// and the memory grows with the number of *changes*, not with the size of the directory.
+    ///
+    /// Applying it costs one comparison per overlay record per query, which is why this is not a
+    /// general-purpose store: it holds the changes since the snapshot, and the snapshot rewrite
+    /// (threshold `indexes.snapshot_delta_bytes`) is what empties it.
+    overlay: Vec<Overlay>,
+
+    /// The most records the overlay may hold before the index materialises instead.
+    overlay_max: usize,
+
     /// The postings as a file, when this index was not materialised at start.
     ///
     /// Answering through the file is the whole point of the mapped format: a lookup reads a few
@@ -358,6 +408,11 @@ impl Index {
         {
             index.default_kinds = kinds.clone();
         }
+        // The cap travels with the plan, because it is a property of how this deployment is willing
+        // to spend memory rather than of any one write.
+        if let Some(cap) = config.snapshot_overlay_max {
+            index.overlay_max = cap;
+        }
         index
     }
 
@@ -395,6 +450,11 @@ impl Index {
         self.built = pulled.built;
         // `ordered` stays empty: a range lookup falls back to the scan, which is what the search
         // path already does for an attribute without an ordered index.
+
+        // The changes recorded since the file was written are not in it, so they go back on top of
+        // the maps it was just rebuilt from. Without this a rewrite would publish a snapshot that
+        // forgets the writes that triggered it.
+        self.reapply_overlay();
     }
 
     fn substring_map(&mut self, substrings: HashMap<Arc<str>, HashMap<String, RoaringBitmap>>) {
@@ -409,6 +469,16 @@ impl Index {
     /// from it and falls back to a scan for `>=` and `<=`, which is a slower answer and never a wrong
     /// one.
     pub fn records(&self, numbering: Vec<(String, u32)>) -> crate::index_file::Records {
+        // A mapped index holds its postings in a file and its changes in the overlay, so neither is
+        // in the maps below. The rewrite has to write both, and this is the one place that pays to
+        // find out what they are: a copy is materialised, which is a gigabyte on a million entries
+        // - in the background, once per rewrite, instead of once per write.
+        if self.mapped.is_some() {
+            let mut copy = self.clone();
+            copy.materialize();
+            return copy.records(numbering);
+        }
+
         let presence: Vec<(&str, RoaringBitmap)> = self
             .presence
             .iter()
@@ -872,6 +942,8 @@ impl Index {
             default_kinds,
             built: BTreeMap::new(),
             mapped: None,
+            overlay: Vec::new(),
+            overlay_max: 8192,
         };
 
         for (position, entry) in entries.iter().enumerate() {
@@ -1074,6 +1146,8 @@ impl Index {
             default_kinds,
             built,
             mapped: None,
+            overlay: Vec::new(),
+            overlay_max: 8192,
         };
         index.fill_built();
         Some((index, ids, next_id))
@@ -1371,14 +1445,31 @@ impl Index {
         changes: &[IndexChange],
         config: &IndexConfig,
     ) -> Result<(), IndexError> {
-        // A change to an index that started mapped has to pull the postings out of the file first:
-        // the maps are empty by design, and patching an empty map would produce an index that lost
-        // everything the file holds. This is the one moment the mode pays, and it pays once.
+        let per_attribute = plan_of(config)?;
+
+        // A mapped index records the changes instead of pulling every posting out of the file: the
+        // overlay is applied to each answer, so a write costs tens of bytes and the memory follows
+        // the number of changes rather than the size of the directory (ub-log §109).
+        if self.mapped.is_some() && self.overlay.len() + changes.len() <= self.overlay_cap() {
+            for change in changes {
+                match change {
+                    IndexChange::Add { id, entry } => {
+                        self.push_overlay(*id, None, Some(entry.attributes()));
+                    }
+                    IndexChange::Replace { id, before, after } => {
+                        self.push_overlay(*id, Some(before.attributes()), Some(after.attributes()));
+                    }
+                    IndexChange::Remove { id, entry } => {
+                        self.push_overlay(*id, Some(entry.attributes()), None);
+                    }
+                }
+            }
+            return Ok(());
+        }
         if self.mapped.is_some() {
             self.materialize();
         }
 
-        let per_attribute = plan_of(config)?;
         for change in changes {
             match change {
                 IndexChange::Add { id, entry } => {
@@ -1404,14 +1495,19 @@ impl Index {
     /// the directory: the entries already indexed keep their postings, because their ids did not
     /// change when the new entry took a position.
     pub fn add(&mut self, id: u32, entry: &Entry, config: &IndexConfig) -> Result<(), IndexError> {
-        // A change to an index that started mapped has to pull the postings out of the file first:
-        // the maps are empty by design, and patching an empty map would produce an index that lost
-        // everything the file holds. This is the one moment the mode pays, and it pays once.
+        // The plan first, so a configuration that cannot be honoured fails here rather than later.
+        let per_attribute = plan_of(config)?;
+
+        if self.mapped.is_some() && self.overlay.len() < self.overlay_cap() {
+            self.push_overlay(id, None, Some(entry.attributes()));
+            return Ok(());
+        }
+        // The overlay reached its cap, or the index is not mapped: materialise and carry on with the
+        // maps. Bounded on purpose - see `snapshot_overlay_max`.
         if self.mapped.is_some() {
             self.materialize();
         }
 
-        let per_attribute = plan_of(config)?;
         self.touch(id, entry, &per_attribute, Touch::Add);
         Ok(())
     }
@@ -1423,14 +1519,16 @@ impl Index {
         entry: &Entry,
         config: &IndexConfig,
     ) -> Result<(), IndexError> {
-        // A change to an index that started mapped has to pull the postings out of the file first:
-        // the maps are empty by design, and patching an empty map would produce an index that lost
-        // everything the file holds. This is the one moment the mode pays, and it pays once.
+        let per_attribute = plan_of(config)?;
+
+        if self.mapped.is_some() && self.overlay.len() < self.overlay_cap() {
+            self.push_overlay(id, Some(entry.attributes()), None);
+            return Ok(());
+        }
         if self.mapped.is_some() {
             self.materialize();
         }
 
-        let per_attribute = plan_of(config)?;
         self.touch(id, entry, &per_attribute, Touch::Remove);
         self.prune_attributes(entry);
         Ok(())
@@ -1443,14 +1541,15 @@ impl Index {
         new: &Entry,
         config: &IndexConfig,
     ) -> Result<(), IndexError> {
-        // A change to an index that started mapped has to pull the postings out of the file first:
-        // the maps are empty by design, and patching an empty map would produce an index that lost
-        // everything the file holds. This is the one moment the mode pays, and it pays once.
+        let per_attribute = plan_of(config)?;
+
+        if self.mapped.is_some() && self.overlay.len() < self.overlay_cap() {
+            self.push_overlay(id, Some(old.attributes()), Some(new.attributes()));
+            return Ok(());
+        }
         if self.mapped.is_some() {
             self.materialize();
         }
-
-        let per_attribute = plan_of(config)?;
 
         self.touch(id, old, &per_attribute, Touch::Remove);
         self.touch(id, new, &per_attribute, Touch::Add);
@@ -1469,6 +1568,190 @@ impl Index {
         match per_attribute.get(&name.to_lowercase()) {
             Some(kinds) if !kinds.is_empty() => Some(kinds),
             _ => (!self.default_kinds.is_empty()).then_some(&self.default_kinds),
+        }
+    }
+
+    /// Records a change to apply on top of the mapped file.
+    ///
+    /// Merged with an earlier record for the same id rather than appended: two changes to one entry
+    /// in a row must look like one change from the file's point of view, or the second record's
+    /// `before` would describe a state the file never held and the first record's `after` would be
+    /// applied twice.
+    fn push_overlay(
+        &mut self,
+        id: u32,
+        before: Option<&crate::model::Attributes>,
+        after: Option<&crate::model::Attributes>,
+    ) {
+        if let Some(existing) = self.overlay.iter_mut().find(|record| record.id == id) {
+            // The first `before` wins: it is the state the file was written in, which is what the
+            // overlay has to be able to remove from an answer.
+            if existing.before.is_none() {
+                existing.before = before.cloned();
+            }
+            existing.after = after.cloned();
+            return;
+        }
+
+        self.overlay.push(Overlay {
+            id,
+            before: before.cloned(),
+            after: after.cloned(),
+        });
+    }
+
+    /// Whether these attributes would have been posted under `query`.
+    ///
+    /// The same question the index maps answer, asked of values instead of looking a key up, so the
+    /// overlay can say which of its records the file's answer is missing and which it must lose.
+    ///
+    /// Conservative where the index itself stands aside: `Not` and `Unindexed` never narrowed a
+    /// lookup, so they match everything here and change nothing.
+    fn matches(&self, query: &Query, attributes: &crate::model::Attributes) -> bool {
+        match query {
+            Query::Presence(name) => attributes.get(name).is_some(),
+            Query::Equality { attribute, value } => {
+                let case_sensitive = self.case_sensitive.contains(attribute);
+                let wanted = fold(value, case_sensitive);
+                attributes.get(attribute).is_some_and(|held| {
+                    held.values
+                        .iter()
+                        .any(|candidate| fold(candidate, case_sensitive) == wanted)
+                })
+            }
+            Query::Substring {
+                attribute,
+                initial,
+                any,
+                final_part,
+            } => {
+                let case_sensitive = self.case_sensitive.contains(attribute);
+                attributes.get(attribute).is_some_and(|held| {
+                    held.values.iter().any(|candidate| {
+                        let value = fold(candidate, case_sensitive);
+                        let starts = initial
+                            .as_ref()
+                            .is_none_or(|part| value.starts_with(&fold(part, case_sensitive)));
+                        let ends = final_part
+                            .as_ref()
+                            .is_none_or(|part| value.ends_with(&fold(part, case_sensitive)));
+                        let contains = any
+                            .iter()
+                            .all(|part| value.contains(&fold(part, case_sensitive)));
+                        starts && ends && contains
+                    })
+                })
+            }
+            Query::Range {
+                attribute,
+                bound,
+                value,
+            } => attributes.get(attribute).is_some_and(|held| {
+                let case_sensitive = self.case_sensitive.contains(attribute);
+                held.values.iter().any(|candidate| {
+                    // Numbers compare as numbers and everything else as folded text, which is the
+                    // rule the ordered index uses; comparing `10` and `9` as text would put the
+                    // bound on the wrong side.
+                    match (candidate.trim().parse::<i64>(), value.trim().parse::<i64>()) {
+                        (Ok(held_number), Ok(bound_number)) => match bound {
+                            RangeBound::AtLeast => held_number >= bound_number,
+                            RangeBound::AtMost => held_number <= bound_number,
+                        },
+                        _ => {
+                            let held_text = fold(candidate, case_sensitive);
+                            let bound_text = fold(value, case_sensitive);
+                            match bound {
+                                RangeBound::AtLeast => held_text >= bound_text,
+                                RangeBound::AtMost => held_text <= bound_text,
+                            }
+                        }
+                    }
+                })
+            }),
+            Query::And(parts) => parts.iter().all(|part| self.matches(part, attributes)),
+            Query::Or(parts) => parts.iter().any(|part| self.matches(part, attributes)),
+            // Never narrowed a lookup, so it cannot change the file's answer here either.
+            Query::Not(_) | Query::Unindexed => true,
+        }
+    }
+
+    /// The file's answer with the changes since it was written applied.
+    ///
+    /// An entry whose `before` matched and whose `after` does not is removed from the answer; one
+    /// that starts matching is added. Anything else leaves the answer alone, which keeps the common
+    /// case - a change to an attribute the query does not name - free.
+    fn apply_overlay(&self, query: &Query, mut answer: RoaringBitmap) -> RoaringBitmap {
+        for record in &self.overlay {
+            let before = record
+                .before
+                .as_ref()
+                .is_some_and(|attributes| self.matches(query, attributes));
+            let after = record
+                .after
+                .as_ref()
+                .is_some_and(|attributes| self.matches(query, attributes));
+
+            match (before, after) {
+                (true, false) => {
+                    answer.remove(record.id);
+                }
+                (false, true) => {
+                    answer.insert(record.id);
+                }
+                _ => {}
+            }
+        }
+        answer
+    }
+
+    /// Re-applies the overlay to the maps, for the one moment the file stops being the answer.
+    ///
+    /// Called from `materialize`, which is the snapshot rewrite and nothing else: the maps are
+    /// rebuilt from the file, and without this the changes recorded since it was written would be
+    /// silently lost - an index that forgets the last few thousand writes and then writes them out
+    /// as the truth.
+    fn reapply_overlay(&mut self) {
+        if self.overlay.is_empty() {
+            return;
+        }
+
+        // The plan is not passed here because the object does not hold it; `built` is what the file
+        // recorded, and it is the same set of kinds - an attribute the file indexes is an attribute
+        // this index indexes.
+        let per_attribute: BTreeMap<String, BTreeSet<Kind>> = self
+            .built
+            .iter()
+            .map(|(attribute, kinds)| (attribute.to_string(), kinds.clone()))
+            .collect();
+
+        let overlay = std::mem::take(&mut self.overlay);
+        for record in overlay {
+            if let Some(before) = &record.before {
+                let entry = Entry::new("", before.clone());
+                self.touch(record.id, &entry, &per_attribute, Touch::Remove);
+            }
+            if let Some(after) = &record.after {
+                let entry = Entry::new("", after.clone());
+                self.touch(record.id, &entry, &per_attribute, Touch::Add);
+            }
+        }
+    }
+
+    /// How many changes are waiting to be applied on top of the file.
+    pub fn overlay_len(&self) -> usize {
+        self.overlay.len()
+    }
+
+    /// The cap in force, with the documented default for an index built without a configuration.
+    ///
+    /// Zero cannot mean "no overlay": the field is a `usize` that `Default` leaves at zero, and a
+    /// cap of zero would silently turn every write back into a materialisation - which is exactly
+    /// the defect this default rules out. An operator who wants no overlay sets the cap to one.
+    fn overlay_cap(&self) -> usize {
+        if self.overlay_max == 0 {
+            DEFAULT_OVERLAY_MAX
+        } else {
+            self.overlay_max
         }
     }
 
@@ -1534,6 +1817,17 @@ impl Index {
     }
 
     pub fn candidates(&self, query: &Query) -> Option<RoaringBitmap> {
+        // Everything below answers from the file or from the maps; the changes made since the file
+        // was written are applied on top of whichever it was. Done here rather than in each arm, so
+        // a new query kind cannot forget them.
+        let answer = self.candidates_unoverlaid(query)?;
+        if self.overlay.is_empty() {
+            return Some(answer);
+        }
+        Some(self.apply_overlay(query, answer))
+    }
+
+    fn candidates_unoverlaid(&self, query: &Query) -> Option<RoaringBitmap> {
         // The file first, when the postings live there. Only the kinds it holds are asked: a range
         // is not in the format, and answering `None` for it - which the search path reads as
         // "scan" - keeps the answer right.
