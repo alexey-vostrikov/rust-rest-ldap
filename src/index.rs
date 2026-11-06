@@ -17,6 +17,7 @@ use roaring::RoaringBitmap;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::index_file::Tag;
 use crate::model::{Attributes, Entry};
 
 /// What an index can answer.
@@ -193,7 +194,36 @@ pub struct Index {
     default_kinds: BTreeSet<Kind>,
     /// Kinds actually built, per attribute, for logging and for `--check-index`.
     built: BTreeMap<Arc<str>, BTreeSet<Kind>>,
+    /// The postings as a file, when this index was not materialised at start.
+    ///
+    /// Answering through the file is the whole point of the mapped format: a lookup reads a few
+    /// pages, and three million postings never enter memory. The maps above stay empty in that case
+    /// until something has to *change* the index, at which point `materialize` fills them.
+    mapped: Option<MappedSlot>,
 }
+
+/// The mapped file, in a form `Index` can hold and compare.
+///
+/// `IndexFile` owns a mapping, so it is neither `Clone` nor `PartialEq`; `Index` derives all four
+/// of `Debug, Clone, PartialEq, Eq` because tests compare whole indexes. The wrapper answers by
+/// identity: two indexes reading the same file are the same, and the comparison says nothing about
+/// the postings - which is what the maps above are for.
+#[derive(Clone)]
+struct MappedSlot(Arc<crate::index_file::IndexFile>);
+
+impl std::fmt::Debug for MappedSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<mapped index {}>", self.0.len())
+    }
+}
+
+impl PartialEq for MappedSlot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for MappedSlot {}
 
 /// What a stored snapshot holds besides the postings: the numbering that gives them meaning, and
 /// the next id to issue.
@@ -260,6 +290,117 @@ const DELTA_MAGIC: &[u8; 4] = b"RRDL";
 type StoredShape = crate::backend::redb_store::StoredEntry;
 
 impl Index {
+    /// The answer for a query the file can settle, or `None` when it cannot.
+    ///
+    /// Three outcomes, and the difference between them is the whole correctness argument:
+    ///
+    /// - the attribute has the index kind and the key is in the file: those postings;
+    /// - the attribute has the index kind and the key is **not**: an empty answer, because the file
+    ///   holds every posting that exists - this is the case that makes a wrong answer possible if it
+    ///   were confused with the third;
+    /// - the attribute has no such index, or the query is a range: `None`, and the caller scans.
+    fn candidates_from_file(&self, query: &Query) -> Option<RoaringBitmap> {
+        let file = self.mapped.as_ref().map(|slot| &slot.0)?;
+
+        match query {
+            Query::Equality { attribute, value } => {
+                if !self.has(attribute, Kind::Eq) {
+                    return None;
+                }
+                // The file stores the value the way the index compares it - folded for an ordinary
+                // attribute - so the lookup is made with the same folding, or it finds nothing.
+                let folded = fold(value, self.case_sensitive.contains(attribute));
+                Some(
+                    file.lookup(Tag::Equality, attribute, &folded)
+                        .unwrap_or_default(),
+                )
+            }
+            Query::Presence(attribute) => {
+                if !self.has(attribute, Kind::Pres) {
+                    return None;
+                }
+                Some(
+                    file.lookup(Tag::Presence, attribute, "")
+                        .unwrap_or_default(),
+                )
+            }
+            Query::Substring { .. } => None,
+            _ => None,
+        }
+    }
+
+    /// Whether the plan gave this attribute this kind of index.
+    fn has(&self, attribute: &str, kind: Kind) -> bool {
+        self.built
+            .get(attribute)
+            .is_some_and(|kinds| kinds.contains(&kind))
+    }
+
+    /// An index that answers from a file: its plan, and the mapping.
+    ///
+    /// The plan is what makes a lookup able to say "no such index" instead of "no such value" - the
+    /// file records the plan's hash, so the plan this is built from is the one the file was written
+    /// with, or the file would have been refused before reaching here.
+    pub fn from_plan(config: &IndexConfig) -> Self {
+        let mut index = Self::default();
+        if let Ok(plan) = config.resolve() {
+            for (attribute, kinds) in plan {
+                if !kinds.is_empty() {
+                    index.built.insert(Arc::from(attribute.as_str()), kinds);
+                }
+            }
+        }
+        // The default applies to attributes nobody configured, and the file holds their postings
+        // under their own names. Recording it keeps a presence lookup working for an attribute the
+        // configuration never named.
+        if let Ok(plan) = plan_of(config)
+            && let Some(kinds) = plan.get(DEFAULT_KEY)
+        {
+            index.default_kinds = kinds.clone();
+        }
+        index
+    }
+
+    /// The same index, answering from the file instead of from maps.
+    ///
+    /// `built` travels with it: a lookup has to be able to tell "this attribute has no index" from
+    /// "this value matches nothing", and only the plan knows the first. Everything else - the
+    /// postings - stays in the file until a write needs them.
+    #[must_use]
+    pub fn with_mapped(mut self, file: Arc<crate::index_file::IndexFile>) -> Self {
+        self.mapped = Some(MappedSlot(file));
+        self
+    }
+
+    /// Whether the postings are in the file rather than in memory.
+    pub fn is_mapped(&self) -> bool {
+        self.mapped.is_some()
+    }
+
+    /// Pulls the postings out of the file into maps a write can patch.
+    ///
+    /// Called once, before the first change to an index that started mapped: a mapping cannot be
+    /// edited, and the alternative - writing a new file per change - is the cost this format exists
+    /// to avoid.
+    pub fn materialize(&mut self) {
+        let Some(slot) = self.mapped.take() else {
+            return;
+        };
+        let file = slot.0;
+        let records = file.materialize();
+        let pulled = Self::from_records(records);
+        self.presence = pulled.presence;
+        self.equality = pulled.equality;
+        self.substring_map(pulled.substrings);
+        self.built = pulled.built;
+        // `ordered` stays empty: a range lookup falls back to the scan, which is what the search
+        // path already does for an attribute without an ordered index.
+    }
+
+    fn substring_map(&mut self, substrings: HashMap<Arc<str>, HashMap<String, RoaringBitmap>>) {
+        self.substrings = substrings;
+    }
+
     /// Everything the mapped file format needs, flattened.
     ///
     /// The four maps are handed over as they are - presence, equality, substring, and the ordered
@@ -333,6 +474,10 @@ impl Index {
             }
         }
 
+        // Which kinds exist per attribute is derived from the maps just filled - without this the
+        // search path would look at an empty `built` and stand aside, which is a correct answer to
+        // a different question ("this attribute has no index") and a wrong one here.
+        index.fill_built();
         index
     }
 
@@ -369,6 +514,38 @@ impl Index {
             .map(|(dn, _)| (dn.clone(), Attributes::new()))
             .collect()
     }
+}
+
+/// A hash of the *plan* - which attributes are indexed, and how.
+///
+/// Separate from [`data_fingerprint`], which hashes the data: this one answers "was this snapshot
+/// written by a build configured the way I am", and that question has to be answerable without
+/// reading a single entry. It is stored in the snapshot header and compared on open.
+pub fn plan_hash(config: &IndexConfig) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+
+    if let Ok(plan) = config.resolve() {
+        for (attribute, kinds) in plan {
+            eat(attribute.as_bytes());
+            eat(&[0]);
+            for kind in kinds {
+                eat(kind.name().as_bytes());
+                eat(&[0]);
+            }
+        }
+    }
+    for name in &config.default {
+        eat(name.as_bytes());
+        eat(&[0]);
+    }
+
+    hash
 }
 
 /// A fingerprint of everything the index is derived from.
@@ -694,6 +871,7 @@ impl Index {
             case_sensitive: BTreeSet::new(),
             default_kinds,
             built: BTreeMap::new(),
+            mapped: None,
         };
 
         for (position, entry) in entries.iter().enumerate() {
@@ -895,6 +1073,7 @@ impl Index {
             case_sensitive,
             default_kinds,
             built,
+            mapped: None,
         };
         index.fill_built();
         Some((index, ids, next_id))
@@ -1192,6 +1371,13 @@ impl Index {
         changes: &[IndexChange],
         config: &IndexConfig,
     ) -> Result<(), IndexError> {
+        // A change to an index that started mapped has to pull the postings out of the file first:
+        // the maps are empty by design, and patching an empty map would produce an index that lost
+        // everything the file holds. This is the one moment the mode pays, and it pays once.
+        if self.mapped.is_some() {
+            self.materialize();
+        }
+
         let per_attribute = plan_of(config)?;
         for change in changes {
             match change {
@@ -1218,6 +1404,13 @@ impl Index {
     /// the directory: the entries already indexed keep their postings, because their ids did not
     /// change when the new entry took a position.
     pub fn add(&mut self, id: u32, entry: &Entry, config: &IndexConfig) -> Result<(), IndexError> {
+        // A change to an index that started mapped has to pull the postings out of the file first:
+        // the maps are empty by design, and patching an empty map would produce an index that lost
+        // everything the file holds. This is the one moment the mode pays, and it pays once.
+        if self.mapped.is_some() {
+            self.materialize();
+        }
+
         let per_attribute = plan_of(config)?;
         self.touch(id, entry, &per_attribute, Touch::Add);
         Ok(())
@@ -1230,6 +1423,13 @@ impl Index {
         entry: &Entry,
         config: &IndexConfig,
     ) -> Result<(), IndexError> {
+        // A change to an index that started mapped has to pull the postings out of the file first:
+        // the maps are empty by design, and patching an empty map would produce an index that lost
+        // everything the file holds. This is the one moment the mode pays, and it pays once.
+        if self.mapped.is_some() {
+            self.materialize();
+        }
+
         let per_attribute = plan_of(config)?;
         self.touch(id, entry, &per_attribute, Touch::Remove);
         self.prune_attributes(entry);
@@ -1243,6 +1443,13 @@ impl Index {
         new: &Entry,
         config: &IndexConfig,
     ) -> Result<(), IndexError> {
+        // A change to an index that started mapped has to pull the postings out of the file first:
+        // the maps are empty by design, and patching an empty map would produce an index that lost
+        // everything the file holds. This is the one moment the mode pays, and it pays once.
+        if self.mapped.is_some() {
+            self.materialize();
+        }
+
         let per_attribute = plan_of(config)?;
 
         self.touch(id, old, &per_attribute, Touch::Remove);
@@ -1267,6 +1474,13 @@ impl Index {
 
     /// Candidate ids for `query`, or `None` when the index cannot narrow it.
     pub fn candidates(&self, query: &Query) -> Option<RoaringBitmap> {
+        // The file first, when the postings live there. Only the kinds it holds are asked: a range
+        // is not in the format, and answering `None` for it - which the search path reads as
+        // "scan" - keeps the answer right.
+        if let Some(answer) = self.candidates_from_file(query) {
+            return Some(answer);
+        }
+
         match query {
             Query::Presence(name) => lookup(&self.presence, name).cloned(),
             Query::Equality { attribute, value } => {

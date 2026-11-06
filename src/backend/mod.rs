@@ -312,6 +312,27 @@ impl Backend {
         }
     }
 
+    /// Writes the mapped file format and reports how many bytes it took.
+    pub fn save_records(
+        &self,
+        records: &crate::index_file::Records,
+        sequence: u64,
+        plan: u64,
+    ) -> Result<u64, BackendError> {
+        match self {
+            Backend::Redb(backend) => backend.save_records(records, sequence, plan),
+            _ => Ok(0),
+        }
+    }
+
+    /// Opens the mapped file format, or `None` when this backend keeps no file index.
+    pub fn open_index(&self, plan: u64) -> Option<crate::index_file::IndexFile> {
+        match self {
+            Backend::Redb(backend) => backend.open_index(plan),
+            _ => None,
+        }
+    }
+
     pub fn save_index(&self, bytes: &[u8], sequence: u64) -> Result<(), BackendError> {
         match self {
             Backend::Redb(backend) => backend.save_index(bytes, sequence),
