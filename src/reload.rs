@@ -134,15 +134,23 @@ impl Source {
         // entries, takes six minutes - and an operator who waits six minutes turns the index off,
         // so this is what makes the index usable at all.
         //
-        // Two ways to trust what is stored, and the fingerprint is the stricter one: the data has
+        // Two ways to trust what is stored, and the counter chain is the one used: the data has
         // not moved since the snapshot, or the store recorded every change since. Anything else
         // is a rebuild - a snapshot trusted by presence alone would narrow to a value that is no
         // longer in the directory, which reads as a missing entry and cannot be diagnosed from
         // outside.
-        let fingerprint =
-            crate::index::data_fingerprint(directory.entries_in_order(), &config.indexes);
+        // The fingerprint is not computed here any more, and that is a measured decision rather
+        // than a shortcut: hashing every entry cost 45 seconds on three million of them, on every
+        // start, to answer a question the store already answers. The counter moves in the same
+        // transaction as the data, the snapshot records the counter it covers, and the deltas close
+        // the gap - three facts that cannot disagree without a transaction boundary in between.
+        //
+        // What the fingerprint still does, it does where it is cheap and where it is asked for:
+        // `--check-index` recomputes and compares it, and a start reads it out of the snapshot only
+        // to record what the snapshot claims. A store restored from a backup with a snapshot from
+        // another machine is the case this gives up detecting silently; that is what `--check-index`
+        // is for, and it is a check an operator runs once after a restore, not on every start.
         let sequence = backend.sequence()?;
-
         let stored = backend.load_index()?;
         // What the store holds, as the process will remember it. The number is the one the
         // snapshot covers, not the counter's current value: the deltas after it are what a start
@@ -152,31 +160,39 @@ impl Source {
             known.remember(*snapshot_sequence, bytes.len());
         }
         let reused = match stored {
-            Some((bytes, snapshot_sequence)) => {
-                match crate::index::Index::decode_with_ids(&bytes, fingerprint) {
-                    // Unchanged data: the numbering is exactly the one the postings were built
-                    // under.
-                    Some((index, numbering, next_id)) => {
+            // The counter decides, not the decode. A snapshot that decodes cleanly says only that
+            // its bytes are intact - it says nothing about whether the data underneath moved, and
+            // trusting it on that basis alone would answer from a snapshot of an older directory.
+            // Removing the fingerprint check made that mistake visible: two tests that write
+            // between starts caught it at once.
+            Some((bytes, snapshot_sequence)) if snapshot_sequence == sequence => {
+                // Nothing has been written since the snapshot was taken: the numbering is exactly
+                // the one its postings were built under.
+                crate::index::Index::decode_unchecked(&bytes).and_then(
+                    |(index, numbering, next_id)| {
                         let map: std::collections::HashMap<String, u32> =
                             numbering.into_iter().collect();
                         directory
                             .clone()
                             .with_numbered_index(index, &map, next_id)
                             .map(|directory| (directory, false))
-                    }
-                    None if snapshot_sequence < sequence => {
-                        // The data moved. Replay what the store wrote down, in the order it
-                        // happened; a hole in that chain means a crash wrote the data and not its
-                        // delta, and the only honest answer is to build again.
-                        match backend.index_deltas(snapshot_sequence, sequence)? {
-                            Some(deltas) => replay(&directory, &bytes, &deltas, &config.indexes)
-                                .map(|directory| (directory, true)),
-                            None => None,
-                        }
+                    },
+                )
+            }
+            Some((bytes, snapshot_sequence)) if snapshot_sequence < sequence => {
+                // The data moved. Replay what the store wrote down, in the order it happened; a
+                // hole in that chain means a crash wrote the data and not its delta, and the only
+                // honest answer is to build again.
+                match backend.index_deltas(snapshot_sequence, sequence)? {
+                    Some(deltas) => {
+                        replay(&directory, &bytes, &deltas, &config.indexes).map(|d| (d, true))
                     }
                     None => None,
                 }
             }
+            // A counter ahead of the store's means the snapshot and the store are from different
+            // worlds - a store restored from a backup beside a newer snapshot, say. Build again.
+            Some(_) => None,
             None => None,
         };
 
@@ -219,7 +235,10 @@ impl Source {
                         inner: out,
                         written: &produced,
                     };
-                    index.encode_into(&mut counted, fingerprint, &numbering, next_id)
+                    // Zero in the fingerprint field: it is not computed on this path any more,
+                    // and a value nobody verifies would be worse than an honest zero. Validity
+                    // comes from the counter chain (see the comment at the start of this function).
+                    index.encode_into(&mut counted, 0, &numbering, next_id)
                 };
                 match backend.save_index_streaming(sequence, &mut produce) {
                     Ok(()) => known.remember(
@@ -243,6 +262,30 @@ impl Source {
         let directory = Arc::new(directory.with_csn(head).with_floor(floor));
 
         check_schema(&directory, &config.schema, config.schema_mode)?;
+
+        // Said once, at start, against the ceiling the operator set. Not a refusal: see
+        // `crate::memory` for why an unavailable server is the worse failure.
+        if let Some(ceiling) = config.limits.memory_bytes
+            && let Some(usage) = crate::memory::Usage::against(ceiling)
+        {
+            if usage.exceeded() {
+                eprintln!(
+                    "{}",
+                    crate::i18n::t(
+                        "warn.memory_over",
+                        &[
+                            ("usage", &usage.to_string()),
+                            ("excess", &crate::limits::Size(usage.excess()).to_string()),
+                        ]
+                    )
+                );
+            } else {
+                println!(
+                    "{}",
+                    crate::i18n::t("start.memory", &[("usage", &usage.to_string())])
+                );
+            }
+        }
 
         let source = Arc::new(Self {
             backend: Arc::new(backend),
@@ -693,7 +736,6 @@ impl Source {
         }
 
         let backend = Arc::clone(&self.backend);
-        let indexes = self.indexes.clone();
         let flag = Arc::clone(&self.snapshot_rewriting);
         let known = Arc::clone(&self.snapshot_known);
 
@@ -705,8 +747,6 @@ impl Source {
                     // started, from counters in memory.
                     let recorded = backend.index_delta_bytes(known.sequence())?;
 
-                    let fingerprint =
-                        crate::index::data_fingerprint(directory.entries_in_order(), &indexes);
                     // The same streaming as at start, for the same reason: this runs while the
                     // server is serving, and a 2.16 GB allocation here would be felt by every
                     // search in flight.
@@ -721,7 +761,10 @@ impl Source {
                                 inner: out,
                                 written: produced,
                             };
-                            index.encode_into(&mut counted, fingerprint, &numbering, next_id)
+                            // Zero, as at start: nothing verifies this field any more, and a
+                            // rewrite that hashes three million entries would cost 45 seconds on a
+                            // blocking thread while the server is serving.
+                            index.encode_into(&mut counted, 0, &numbering, next_id)
                         };
                         backend.save_index_streaming(sequence, &mut produce)?;
                     }

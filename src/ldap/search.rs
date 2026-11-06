@@ -1683,6 +1683,7 @@ mod tests {
             limits: crate::limits::Limits {
                 size_limit,
                 time_limit,
+                ..Default::default()
             },
             ..Security::default()
         }

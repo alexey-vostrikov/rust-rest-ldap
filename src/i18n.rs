@@ -413,6 +413,11 @@ const ENGLISH: &[(&str, &str)] = &[
         "start.index_reused",
         "index: read from the store, the data has not changed since it was built",
     ),
+    ("start.memory", "memory: {usage}"),
+    (
+        "warn.memory_over",
+        "memory: {usage} - the directory does not fit under the ceiling by {excess}; running anyway, and answers over large scopes will be slower. Raise limits.memory_bytes, or index the attributes you filter on",
+    ),
     (
         "start.index_rewritten",
         "index: snapshot rewritten after the recorded changes grew past the threshold ({recorded} bytes of changes replaced {bytes} bytes of snapshot)",
