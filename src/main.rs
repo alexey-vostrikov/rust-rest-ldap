@@ -608,6 +608,12 @@ async fn serve() {
     // the accept loop and every connection task can share this without contention.
     let metrics = rust_rest_ldap::metrics::Metrics::new();
     metrics.set_entries(directory.entry_count());
+    eprintln!(
+        "PHASE directory rss={}MB entries={} index_bytes={}",
+        rust_rest_ldap::memory::resident_bytes().unwrap_or(0) / (1024 * 1024),
+        directory.entry_count(),
+        directory.index().heap_bytes()
+    );
     // The cache counters are the cache's own; the scrape reads them through here. Whether there is
     // a cache at all is decided by which path the load took, so this asks rather than assumes.
     if let Some(cache) = directory.cache() {

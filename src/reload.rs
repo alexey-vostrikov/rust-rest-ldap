@@ -317,9 +317,10 @@ impl Source {
                 // numbering is the identity map. No decoding, no materialising.
                 std::cmp::Ordering::Equal => file.numbering().map(|numbered| {
                     eprintln!(
-                        "PHASE numbering {}ms ({} dn)",
+                        "PHASE numbering {}ms ({} dn) rss={}MB",
                         t_open.elapsed().as_millis(),
-                        numbered.len()
+                        numbered.len(),
+                        crate::memory::resident_bytes().unwrap_or(0) / (1024 * 1024)
                     );
                     (
                         crate::index::Index::from_plan(&config.indexes)
@@ -367,7 +368,11 @@ impl Source {
                     &numbering,
                     next_id,
                 ) {
-                    eprintln!("PHASE skeletons {}ms", t_build.elapsed().as_millis());
+                    eprintln!(
+                        "PHASE skeletons {}ms rss={}MB",
+                        t_build.elapsed().as_millis(),
+                        crate::memory::resident_bytes().unwrap_or(0) / (1024 * 1024)
+                    );
                     // The records are skeletons either way - the store was not read - so the
                     // source stays. What differs is only where the postings are: the file, or
                     // memory after a replay.
