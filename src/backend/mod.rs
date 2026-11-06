@@ -439,6 +439,22 @@ impl Backend {
         }
     }
 
+    /// One record by DN, from the backends that can read one without walking.
+    ///
+    /// `None` also means "this backend cannot", which the skeleton path treats as a reason not to
+    /// use it: a skeleton whose records cannot be fetched is a directory of empty entries.
+    pub fn entry(&self, dn: &str) -> Option<Entry> {
+        match self {
+            Backend::Redb(backend) => backend.entry(dn).ok().flatten(),
+            _ => None,
+        }
+    }
+
+    /// Whether a record can be read without walking the store.
+    pub fn reads_by_key(&self) -> bool {
+        matches!(self, Backend::Redb(_))
+    }
+
     pub async fn update(&self, change: &EntryChange) -> Result<(), BackendError> {
         match self {
             Backend::File(backend) => backend.update(change),

@@ -250,12 +250,21 @@ pub fn handle_search(
     // matching one entry cost 39 ms, because the index spared the filter but not the walk.
     let size_limit = security.limits.effective_size_limit(request.size_limit);
 
-    let in_scope = match &candidates {
-        Some(candidates) => directory.entries_at(candidates),
-        None => directory.entries_with_ids(&base_object, scope),
+    // With candidates the walk covers only those; without them it covers the scope, which is the
+    // whole directory for a filter nothing can narrow. In a snapshot that holds only skeletons the
+    // records are read here - one keyed read per candidate - and that is the price of the mode, paid
+    // where it is asked for rather than at start for everybody.
+    let in_scope: Vec<(usize, std::borrow::Cow<'_, crate::model::Entry>)> = match &candidates {
+        Some(candidates) => directory.resolved_at(candidates),
+        None => directory
+            .entries_with_ids(&base_object, scope)
+            .into_iter()
+            .map(|(position, entry)| (position, std::borrow::Cow::Borrowed(entry)))
+            .collect(),
     };
 
-    for (_, entry) in in_scope {
+    for (_, entry) in &in_scope {
+        let entry: &crate::model::Entry = entry;
         // Every 256 entries, not every one: the clock read is cheap but not free, and a search that
         // spends its budget on `Instant::now` is a search that did not need the limit.
         visited += 1;
