@@ -16,7 +16,9 @@
 
 use std::path::Path;
 
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{BackendError, DirectoryData, EntryChange};
@@ -427,6 +429,33 @@ impl RedbBackend {
     }
 
     /// Reads every stored entry.
+    /// How many records the store holds, without reading one of them.
+    ///
+    /// `Table::len` reads the B-tree's own count; walking the table to find the same number is what
+    /// cost nine seconds of every start on a million entries - spent only to answer "is this store
+    /// empty", which the bootstrap asks before it decides to create an administrator.
+    pub fn entry_count(&self) -> Result<u64, BackendError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+
+        match transaction.open_table(ENTRIES) {
+            Ok(table) => table.len().map_err(|source| BackendError::Redb {
+                path: "<entries>".to_string(),
+                reason: source.to_string(),
+            }),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(source) => Err(BackendError::Redb {
+                path: "<entries>".to_string(),
+                reason: source.to_string(),
+            }),
+        }
+    }
+
     /// One record, by DN: the read a skeleton snapshot makes per matched entry.
     ///
     /// A keyed lookup in the same table `load` walks, which is why it costs microseconds where the

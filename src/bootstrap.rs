@@ -223,8 +223,16 @@ pub async fn seed_with(
         });
     }
 
-    let existing = backend.load().await?;
-    let entries = existing.entries.len() + existing.users.len();
+    // The count first: this runs on every start that has a `bootstrap:` section, and it exists to
+    // answer one question - "is there already an administrator". Reading the whole store to answer
+    // it cost nine seconds of a million-entry start, measured; the store's own count costs nothing.
+    let entries = match backend.entry_count() {
+        Some(count) => count as usize,
+        None => {
+            let existing = backend.load().await?;
+            existing.entries.len() + existing.users.len()
+        }
+    };
 
     // Not `is_empty` on one of the three lists: a backend that reports users and groups
     // separately is still a directory with data in it.

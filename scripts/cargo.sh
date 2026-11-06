@@ -13,6 +13,9 @@ target_cache="${RR_LDAP_TARGET_CACHE:-$HOME/.cache/rrl/target}"
 
 mkdir -p "$cargo_cache" "$rustup_cache" "$target_cache"
 
+# MIRIFLAGS is passed through because otherwise `-Zmiri-disable-isolation` is dropped silently, and
+# a test that needs the filesystem fails with "mkdir not available when isolation is enabled" - which
+# reads as a defect in the code under test rather than in the harness.
 exec docker run --rm \
   -v "$repo:/w" \
   -v "$cargo_cache:/cargo" \
@@ -25,4 +28,5 @@ exec docker run --rm \
   -e RUSTUP_HOME=/rustup \
   -e CARGO_TARGET_DIR=/target \
   -e CARGO_TERM_COLOR=never \
+  -e "MIRIFLAGS=${MIRIFLAGS:-}" \
   "$IMAGE" cargo "$@"

@@ -460,6 +460,17 @@ impl Backend {
         }
     }
 
+    /// How many records the store holds, when it can say so without reading them.
+    ///
+    /// `None` for a backend that cannot answer cheaply: the caller falls back to reading, which is
+    /// correct and slower, rather than to a guess.
+    pub fn entry_count(&self) -> Option<u64> {
+        match self {
+            Backend::Redb(backend) => backend.entry_count().ok(),
+            _ => None,
+        }
+    }
+
     /// One record by DN, from the backends that can read one without walking.
     ///
     /// `None` also means "this backend cannot", which the skeleton path treats as a reason not to
