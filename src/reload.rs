@@ -72,7 +72,12 @@ pub struct Source {
     base_dn: String,
     users_ou_name: String,
     groups_ou_name: String,
-    current: RwLock<Arc<Directory>>,
+    /// The snapshot every connection reads from.
+    ///
+    /// Behind an `Arc` so the snapshot-rewrite task can swap it: convergence (ub-log §109) replaces
+    /// the whole snapshot with a fresh one built from the file it just wrote, and a task that could
+    /// not reach this lock would have to leave the overlay in memory for ever.
+    current: Arc<RwLock<Arc<Directory>>>,
     generation: RwLock<u64>,
     /// The published schema, shared with every `Security` the connections hold.
     schema: crate::security::SharedSchema,
@@ -85,6 +90,14 @@ pub struct Source {
     schema_sources: std::sync::RwLock<SchemaSources>,
     schema_mode: SchemaMode,
     indexes: IndexConfig,
+    /// The hash of the index plan, so a fresh snapshot can be opened without the whole `Config`.
+    ///
+    /// Kept beside `indexes` rather than recomputed: convergence runs in a background task that has
+    /// no configuration, and a second place computing the same hash is a second place that can
+    /// disagree with the file's header.
+    plan: u64,
+    /// The record-cache budget, for the same reason.
+    cache_budget: usize,
     /// Set while a snapshot rewrite is running, so two cannot encode the same index at once and
     /// delete each other's deltas.
     snapshot_rewriting: Arc<std::sync::atomic::AtomicBool>,
@@ -280,7 +293,7 @@ impl Source {
     /// One place because there are two ways to arrive here - the mapped file and the replayed dump -
     /// and a cache configured on one path but not the other is a settings that works until a store
     /// is written by a different build.
-    fn skeleton(directory: Directory, backend: &Arc<Backend>, config: &Config) -> Directory {
+    fn skeleton(directory: Directory, backend: &Arc<Backend>, cache_budget: usize) -> Directory {
         let source = Arc::new(BackendEntrySource {
             backend: Arc::clone(backend),
         });
@@ -288,7 +301,7 @@ impl Source {
 
         // Zero means the operator asked for no cache, and the answer is to read every time rather
         // than to invent a budget they did not set.
-        match config.cache.budget() {
+        match cache_budget {
             0 => directory,
             budget => directory.with_cache(Arc::new(crate::record_cache::RecordCache::new(budget))),
         }
@@ -298,8 +311,32 @@ impl Source {
         config: &Config,
         backend: &Arc<Backend>,
     ) -> Result<Option<(Directory, SnapshotKnown)>, BackendError> {
+        Self::from_snapshot_with(
+            crate::index::plan_hash(&config.indexes),
+            config.cache.budget(),
+            &config.indexes,
+            &config.base_dn,
+            &config.users_ou_name,
+            &config.groups_ou_name,
+            backend,
+        )
+    }
+
+    /// The same, from the two things it actually needs.
+    ///
+    /// Split out because convergence runs in a background task that holds no `Config`: it has the
+    /// plan hash and the cache budget, which are the only fields this uses, and passing a whole
+    /// configuration through a task would invite it to read something that can change underneath it.
+    fn from_snapshot_with(
+        plan: u64,
+        cache_budget: usize,
+        indexes: &IndexConfig,
+        base_dn: &str,
+        users_ou_name: &str,
+        groups_ou_name: &str,
+        backend: &Arc<Backend>,
+    ) -> Result<Option<(Directory, SnapshotKnown)>, BackendError> {
         let sequence = backend.sequence()?;
-        let plan = crate::index::plan_hash(&config.indexes);
 
         // The mapped format first: it needs no decoding at all, and its header says which counter it
         // covers. Only if that fails does the older dump format get read, which keeps a store written
@@ -323,8 +360,7 @@ impl Source {
                         crate::memory::resident_bytes().unwrap_or(0) / (1024 * 1024)
                     );
                     (
-                        crate::index::Index::from_plan(&config.indexes)
-                            .with_mapped(Arc::clone(&file)),
+                        crate::index::Index::from_plan(indexes).with_mapped(Arc::clone(&file)),
                         numbered
                             .into_iter()
                             .collect::<std::collections::HashMap<_, _>>(),
@@ -346,7 +382,7 @@ impl Source {
                             numbering,
                             file.next_id(),
                             &deltas,
-                            &config.indexes,
+                            indexes,
                         )
                     }),
                 // A snapshot ahead of the store: different worlds, read the store.
@@ -360,9 +396,9 @@ impl Source {
 
                 let t_build = std::time::Instant::now();
                 if let Some(directory) = Directory::from_skeletons(
-                    &config.base_dn,
-                    &config.users_ou_name,
-                    &config.groups_ou_name,
+                    base_dn,
+                    users_ou_name,
+                    groups_ou_name,
                     index.skeletons(&listed),
                     index,
                     &numbering,
@@ -377,7 +413,7 @@ impl Source {
                     // source stays. What differs is only where the postings are: the file, or
                     // memory after a replay.
                     let _ = mapped;
-                    let directory = Self::skeleton(directory, backend, config);
+                    let directory = Self::skeleton(directory, backend, cache_budget);
                     println!("{}", crate::i18n::t("start.index_skeleton", &[]));
                     // Said once, at start, and only when there is a cache: a budget nobody is told
                     // about is a number the operator cannot check against what the process uses.
@@ -388,7 +424,7 @@ impl Source {
                                 "start.cache",
                                 &[(
                                     "budget",
-                                    &crate::limits::Size(config.cache.budget() as u64).to_string()
+                                    &crate::limits::Size(cache_budget as u64).to_string()
                                 )]
                             )
                         );
@@ -424,7 +460,7 @@ impl Source {
                 let Some(deltas) = backend.index_deltas(snapshot_sequence, sequence)? else {
                     return Ok(None);
                 };
-                match replay_numbering(&bytes, &deltas, &config.indexes) {
+                match replay_numbering(&bytes, &deltas, indexes) {
                     Some(replayed) => replayed,
                     None => return Ok(None),
                 }
@@ -438,9 +474,9 @@ impl Source {
         let skeletons = index.skeletons(&listed);
 
         let Some(directory) = Directory::from_skeletons(
-            &config.base_dn,
-            &config.users_ou_name,
-            &config.groups_ou_name,
+            base_dn,
+            users_ou_name,
+            groups_ou_name,
             skeletons,
             index,
             &numbering,
@@ -449,7 +485,10 @@ impl Source {
             return Ok(None);
         };
 
-        Ok(Some((Self::skeleton(directory, backend, config), known)))
+        Ok(Some((
+            Self::skeleton(directory, backend, cache_budget),
+            known,
+        )))
     }
 
     /// Everything a start does once it knows what the directory holds.
@@ -506,9 +545,11 @@ impl Source {
             base_dn: config.base_dn.clone(),
             users_ou_name: config.users_ou_name.clone(),
             groups_ou_name: config.groups_ou_name.clone(),
-            current: RwLock::new(Arc::clone(&directory)),
+            current: Arc::new(RwLock::new(Arc::clone(&directory))),
             generation: RwLock::new(0),
             indexes: config.indexes.clone(),
+            plan: crate::index::plan_hash(&config.indexes),
+            cache_budget: config.cache.budget(),
             snapshot_rewriting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             snapshot_known: Arc::new(known),
             backend,
@@ -912,6 +953,75 @@ impl Source {
         Ok(Some(entries))
     }
 
+    /// Replaces the live snapshot with a fresh one built from the file just written.
+    ///
+    /// This is the convergence the overlay needs. A rewrite puts the changes into the file, but the
+    /// live index still maps the *old* file and still holds its overlay - so without this step the
+    /// overlay never empties, every query keeps paying a comparison per record, and the memory only
+    /// comes back when the cap forces a materialisation. Measured before this existed: one modify
+    /// left 1.14 GB resident, and it stayed.
+    ///
+    /// Refused when anything was written since `sequence`: those changes live in the overlay and are
+    /// not in the file, so swapping would lose them. The next rewrite covers them, and the cap keeps
+    /// the overlay from growing while that is waited for.
+    ///
+    /// The swap is one pointer: readers holding the old snapshot keep the view they had, which is
+    /// the rule the copy-on-write everywhere else exists for.
+    pub async fn converge(&self, sequence: u64) -> Result<bool, BackendError> {
+        Self::converge_with(
+            Arc::clone(&self.current),
+            self.plan,
+            self.cache_budget,
+            &self.indexes,
+            &self.base_dn,
+            &self.users_ou_name,
+            &self.groups_ou_name,
+            Arc::clone(&self.backend),
+            sequence,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn converge_with(
+        current: Arc<RwLock<Arc<Directory>>>,
+        plan: u64,
+        cache_budget: usize,
+        indexes: &IndexConfig,
+        base_dn: &str,
+        users_ou_name: &str,
+        groups_ou_name: &str,
+        backend: Arc<Backend>,
+        sequence: u64,
+    ) -> Result<bool, BackendError> {
+        if backend.sequence()? != sequence {
+            return Ok(false);
+        }
+
+        let Some((mut fresh, _known)) = Self::from_snapshot_with(
+            plan,
+            cache_budget,
+            indexes,
+            base_dn,
+            users_ou_name,
+            groups_ou_name,
+            &backend,
+        )?
+        else {
+            return Ok(false);
+        };
+
+        // What the snapshot itself does not carry: the journal position and the floor are about the
+        // store, not about the index, and a fresh one starts with none of them.
+        let live = Arc::clone(&*current.read().await);
+        fresh.set_snapshot(sequence);
+        fresh.set_csn(live.csn().map(str::to_string));
+        fresh.set_floor(live.floor().map(str::to_string));
+
+        *current.write().await = Arc::new(fresh);
+        Ok(true)
+    }
+
     /// Whether the recorded changes have grown past the point where replaying them costs more
     /// than the snapshot they save.
     ///
@@ -954,6 +1064,18 @@ impl Source {
         let flag = Arc::clone(&self.snapshot_rewriting);
         let known = Arc::clone(&self.snapshot_known);
         let indexes = self.indexes.clone();
+        // The same two, kept for the convergence that follows: the blocking task takes its own
+        // copies, because it moves them.
+        let convergence_backend = Arc::clone(&self.backend);
+        let convergence_indexes = self.indexes.clone();
+        let current = Arc::clone(&self.current);
+        let plan = self.plan;
+        let cache_budget = self.cache_budget;
+        // The names convergence needs to build a fresh skeleton. Cloned once here, because the task
+        // must not borrow the source: a task that held it alive would keep the store open.
+        let base_dn = self.base_dn.clone();
+        let users_ou_name = self.users_ou_name.clone();
+        let groups_ou_name = self.groups_ou_name.clone();
 
         tokio::spawn(async move {
             let outcome =
@@ -981,16 +1103,45 @@ impl Source {
             flag.store(false, std::sync::atomic::Ordering::Release);
 
             match outcome {
-                Ok(Ok((written, recorded))) => println!(
-                    "{}",
-                    crate::i18n::t(
-                        "start.index_rewritten",
-                        &[
-                            ("bytes", &written.to_string()),
-                            ("recorded", &recorded.to_string())
-                        ]
+                Ok(Ok((written, recorded))) => {
+                    println!(
+                        "{}",
+                        crate::i18n::t(
+                            "start.index_rewritten",
+                            &[
+                                ("bytes", &written.to_string()),
+                                ("recorded", &recorded.to_string())
+                            ]
+                        )
+                    );
+
+                    // The file is written; the live index still maps the old one and holds the
+                    // changes that went into it. Swap it for a fresh snapshot so the overlay
+                    // empties - otherwise it never does, and its cost stays for the life of the
+                    // process. A failure here is not a failed rewrite: the file is on disk and the
+                    // old snapshot still answers correctly, so the overlay waits for the next
+                    // rewrite, and the cap keeps it bounded meanwhile.
+                    match Self::converge_with(
+                        Arc::clone(&current),
+                        plan,
+                        cache_budget,
+                        &convergence_indexes,
+                        &base_dn,
+                        &users_ou_name,
+                        &groups_ou_name,
+                        Arc::clone(&convergence_backend),
+                        sequence,
                     )
-                ),
+                    .await
+                    {
+                        Ok(true) => println!("{}", crate::i18n::t("start.index_converged", &[])),
+                        Ok(false) => {}
+                        Err(err) => eprintln!(
+                            "{}",
+                            crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])
+                        ),
+                    }
+                }
                 Ok(Err(err)) => eprintln!(
                     "{}",
                     crate::i18n::t("error.index_snapshot", &[("detail", &err.to_string())])

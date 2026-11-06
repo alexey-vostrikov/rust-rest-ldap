@@ -419,6 +419,11 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("start.memory", "memory: {usage}"),
     (
+        "start.index_converged",
+        "index: the snapshot was rewritten and the live index now reads it, so its recorded changes \
+         are gone",
+    ),
+    (
         "start.cache",
         "records: up to {budget} kept in memory; what is not there is read from the store",
     ),
