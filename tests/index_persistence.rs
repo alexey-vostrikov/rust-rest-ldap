@@ -227,7 +227,10 @@ async fn a_write_onto_a_mapped_index_is_recorded_rather_than_materialised() {
     // The rewrite threshold is set out of reach on purpose: with it in reach the write converges the
     // snapshot instead of leaving an overlay, and the test would then be measuring convergence. That
     // has its own test below.
-    let config = config_with(&path, "  snapshot_delta_bytes: 1073741824\n");
+    let config = config_with(
+        &path,
+        "  snapshot_delta_bytes: 1073741824\n  snapshot_rewrite_min_seconds: 0\n",
+    );
     drop(
         Source::load(&config, open(&path))
             .await
@@ -296,7 +299,7 @@ async fn the_overlay_stops_growing_at_its_cap_and_the_index_materialises_once() 
     // A tiny cap, so the test does not need ten thousand writes to reach it.
     let config = config_with(
         &path,
-        "  snapshot_overlay_max: 2\n  snapshot_delta_bytes: 1073741824\n",
+        "  snapshot_overlay_max: 2\n  snapshot_delta_bytes: 1073741824\n  snapshot_rewrite_min_seconds: 0\n",
     );
     drop(
         Source::load(&config, open(&path))
@@ -362,7 +365,10 @@ async fn a_rewrite_converges_the_overlay_instead_of_leaving_it_in_memory() {
 
     // A threshold of one byte: the first write rewrites the snapshot, which is what a deployment
     // sees after enough changes rather than after one.
-    let config = config_with(&path, "  snapshot_delta_bytes: 1\n");
+    let config = config_with(
+        &path,
+        "  snapshot_delta_bytes: 1\n  snapshot_rewrite_min_seconds: 0\n",
+    );
     drop(
         Source::load(&config, open(&path))
             .await
@@ -407,6 +413,159 @@ async fn a_rewrite_converges_the_overlay_instead_of_leaving_it_in_memory() {
     // Convergence must not cost a change: everything written is still findable afterwards.
     assert_eq!(matches_from_index(&source, "carol").await, Some(1));
     assert_eq!(matches_from_index(&source, "alice").await, Some(1));
+}
+
+#[tokio::test]
+async fn a_rewrite_waits_for_its_interval_however_much_has_changed() {
+    // The defect this pins: a rewrite costs a pass over the whole index, so a byte threshold alone
+    // lets a busy server spend its time copying. Measured on a growing directory - thirty-one
+    // thousand adds caused fifty-eight rewrites and the write rate halved. The floor is what turns
+    // "much has changed" into "much has changed and we can afford a copy".
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+
+    // Threshold of one byte, floor of an hour: everything says "rewrite", the floor says "not yet".
+    let config = config_with(
+        &path,
+        "  snapshot_delta_bytes: 1\n  snapshot_rewrite_min_seconds: 3600\n",
+    );
+    drop(
+        Source::load(&config, open(&path))
+            .await
+            .expect("first start"),
+    );
+    let (source, _) = Source::load(&config, open(&path))
+        .await
+        .expect("second start");
+
+    let before = std::fs::metadata(format!("{}.index", path.display()))
+        .expect("the snapshot file")
+        .modified()
+        .expect("a modification time");
+
+    source
+        .apply(&[EntryChange::Upsert {
+            entry: person("carol", "20260101000000.000000Z#000002#001#000000"),
+        }])
+        .await
+        .expect("apply");
+
+    // Long enough for the background task to have run if it were going to.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let after = std::fs::metadata(format!("{}.index", path.display()))
+        .expect("the snapshot file")
+        .modified()
+        .expect("a modification time");
+    assert_eq!(before, after, "the floor must hold the rewrite back");
+
+    // And the change is not lost while it waits: it is an overlay record and the index answers.
+    assert_eq!(matches_from_index(&source, "carol").await, Some(1));
+    let directory = source.directory().await;
+    assert_eq!(directory.index().overlay_len(), 1);
+    assert!(directory.index().is_mapped());
+}
+
+#[tokio::test]
+async fn convergence_covers_writes_that_happened_during_the_rewrite() {
+    // The defect this pins: convergence refused whenever the store had moved, and on a server taking
+    // writes the store always has. Measured over thirty-one thousand adds: fifty-eight rewrites,
+    // zero convergences, so the overlay path never engaged and every write went into the maps.
+    //
+    // Here the rewrite and a write race on purpose: the write lands after the file was written and
+    // before convergence runs, which is the ordinary case on a busy server.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("d.redb");
+
+    {
+        let backend = open(&path);
+        backend
+            .apply(&[EntryChange::Upsert {
+                entry: person("alice", "20260101000000.000000Z#000001#001#000000"),
+            }])
+            .await
+            .expect("seed");
+    }
+
+    let config = config_with(
+        &path,
+        "  snapshot_delta_bytes: 1\n  snapshot_rewrite_min_seconds: 0\n",
+    );
+    drop(
+        Source::load(&config, open(&path))
+            .await
+            .expect("first start"),
+    );
+    let (source, _) = Source::load(&config, open(&path))
+        .await
+        .expect("second start");
+
+    // One write triggers the rewrite; the ones after it land while the snapshot is being written.
+    source
+        .apply(&[EntryChange::Upsert {
+            entry: person("bob", "20260101000000.000000Z#000002#001#000000"),
+        }])
+        .await
+        .expect("trigger");
+    for index in 0..20 {
+        source
+            .apply(&[EntryChange::Upsert {
+                entry: person(
+                    &format!("race{index}"),
+                    &format!("20260101000000.00000{index}#000003#001#000000"),
+                ),
+            }])
+            .await
+            .expect("race");
+    }
+
+    // Convergence has to produce a snapshot that covers the racing writes. The overlay is *not*
+    // expected to be empty afterwards - the racing writes are not in the file, so they stay as
+    // overlay records; what must hold is that the live index moved to the new file and lost nothing.
+    let before = source.directory().await.snapshot();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    loop {
+        if source.directory().await.snapshot() > before {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "convergence never advanced the live snapshot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let directory = source.directory().await;
+    assert!(
+        directory.index().is_mapped(),
+        "convergence must leave the index reading the file, not materialised"
+    );
+    drop(directory);
+
+    // Nothing may be lost on the way: every add, before and during the rewrite, is still found.
+    for name in ["alice", "bob"] {
+        assert_eq!(
+            matches_from_index(&source, name).await,
+            Some(1),
+            "{name} is lost"
+        );
+    }
+    for index in 0..20 {
+        assert_eq!(
+            matches_from_index(&source, &format!("race{index}")).await,
+            Some(1),
+            "race{index} is lost by convergence"
+        );
+    }
 }
 
 #[tokio::test]
@@ -534,7 +693,10 @@ async fn the_snapshot_is_rewritten_once_the_recorded_changes_outgrow_it() {
     // A first start writes the snapshot the rewrite is measured against.
     drop(load(&path).await);
 
-    let config = config_with(&path, "  snapshot_delta_bytes: 1\n");
+    let config = config_with(
+        &path,
+        "  snapshot_delta_bytes: 1\n  snapshot_rewrite_min_seconds: 0\n",
+    );
 
     // Read before a source exists: the source holds the store open, and a second opener is
     // refused rather than served.

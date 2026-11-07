@@ -103,7 +103,13 @@ pub struct Directory {
     /// Canonical-order ranges, so `users()` and `groups()` are slices, not filters.
     users: Range<usize>,
     groups: Range<usize>,
-    by_dn: HashMap<String, usize>,
+    /// Where each DN's entry's **id** sits, not where the entry does.
+    ///
+    /// An id does not move when an entry is inserted before it, so this map survives a write
+    /// untouched. Storing positions here is what made every insert rebuild the whole map - a string
+    /// clone per entry, per write - and the add rate fell with the size of the directory (measured:
+    /// 796 adds/s at a thousand entries, 294 at thirty-one thousand).
+    by_dn: HashMap<String, u32>,
     /// The stable id of each entry, indexed by position.
     ///
     /// Two different numbers, and the difference is the point. A position moves whenever an entry
@@ -117,7 +123,13 @@ pub struct Directory {
     ids: Vec<u32>,
     /// Where an id sits now. Rebuilt whenever the vector moves, which is what keeps add and
     /// delete from invalidating the index.
-    by_id: HashMap<u32, usize>,
+    /// Where each id sits now, built on demand.
+    ///
+    /// `OnceLock` because the positions move on every insert and delete, and rebuilding eagerly is
+    /// the cost this exists to remove. A write drops it; the next read that needs a position builds
+    /// it once. A burst of writes therefore pays nothing at all, and a burst of reads pays once -
+    /// which is the right way round for a server that is either importing or serving.
+    by_id: std::sync::OnceLock<HashMap<u32, usize>>,
     /// The next id to hand out. Never goes back: a reused id would make an old posting, or a
     /// record in a peer's journal, point at a different entry.
     next_id: u32,
@@ -341,19 +353,23 @@ impl Directory {
         users: Range<usize>,
         groups: Range<usize>,
     ) -> Self {
-        let mut by_dn = HashMap::with_capacity(entries.len());
-        for (position, entry) in entries.iter().enumerate() {
-            by_dn.insert(entry.dn().to_string(), position);
-        }
-
         // Ids assigned in canonical order: the same entries assembled the same way get the same
         // ids, which is what lets a snapshot taken by one start be read by the next.
         let ids: Vec<u32> = (0..entries.len() as u32).collect();
+
+        let mut by_dn = HashMap::with_capacity(entries.len());
+        for (position, entry) in entries.iter().enumerate() {
+            by_dn.insert(entry.dn().to_string(), ids[position]);
+        }
+
+        // Built once here rather than lazily: a directory assembled by a start is about to be read,
+        // and paying for the map during the assemble is one pass over data that is already in cache.
         let by_id: HashMap<u32, usize> = ids
             .iter()
             .enumerate()
             .map(|(position, id)| (*id, position))
             .collect();
+        let by_id = std::sync::OnceLock::from(by_id);
         let next_id = entries.len() as u32;
         let in_scope = entries
             .iter()
@@ -505,17 +521,26 @@ impl Directory {
 
         // The three ranges are one contiguous layout, so an insertion inside one of them moves
         // the end of every range that starts at or after it.
+        // `<=` and not `<`: a range that is empty sits at a single position, and inserting at that
+        // position is an insert *into* it. With `<`, the first user added to a directory that had
+        // none landed outside the users range - so `all()` held it and `users()` did not.
         if position < self.users.start {
             self.users = (self.users.start + 1)..(self.users.end + 1);
             self.groups = (self.groups.start + 1)..(self.groups.end + 1);
-        } else if position < self.users.end {
+        } else if position <= self.users.end {
             self.users = self.users.start..(self.users.end + 1);
             self.groups = (self.groups.start + 1)..(self.groups.end + 1);
-        } else if position < self.groups.end {
+        } else if position <= self.groups.end {
             self.groups = self.groups.start..(self.groups.end + 1);
         }
 
-        self.reindex_positions();
+        // The DN map is not rebuilt any more - it holds ids, which this insertion did not move - so
+        // the new entry is added to it here. Missing this is not a slow path but a wrong one: the
+        // entry is in `entries` and `ids` and no lookup can find it, so an add whose parent was just
+        // created fails with "the parent entry does not exist".
+        self.by_dn
+            .insert(self.entries[position].dn().to_string(), id);
+        self.shift_positions(position);
 
         // The same copy-on-write as a replace: unique here means patched in place, shared means
         // the reader keeps the view it had.
@@ -545,6 +570,11 @@ impl Directory {
         let removed = self.entries.remove(position);
         self.ids.remove(position);
 
+        // The DN map is not rebuilt any more, so the entry is taken out of it here: a stale key
+        // would answer `find` with a position that now holds a different entry - a wrong answer,
+        // worse than a miss.
+        self.by_dn.remove(&crate::dn::normalize(removed.dn()));
+
         if in_scope(removed.dn(), &self.base_dn, Scope::Subtree) {
             self.in_scope -= 1;
         }
@@ -556,7 +586,7 @@ impl Directory {
             self.groups = self.groups.start..(self.groups.end - 1);
         }
 
-        self.reindex_positions();
+        self.shift_positions(position);
 
         let index = Arc::make_mut(&mut self.index);
         index.remove(id, &removed, config)?;
@@ -588,11 +618,23 @@ impl Directory {
     }
 
     /// The first position in `range` whose DN is greater, which is where an insert keeps order.
+    ///
+    /// A binary search, because the range is in ascending DN order by construction - `from_entries`
+    /// sorts it and this function is the only thing that inserts into it. The linear scan that was
+    /// here compared the new DN against every entry in the range on every add: measured, that is
+    /// what made the add rate fall from 752 to 357 per second between one thousand and thirty-one
+    /// thousand entries, and the whole import quadratic.
     fn sorted_position(&self, range: Range<usize>, entry_dn: &str) -> usize {
-        range
-            .clone()
-            .find(|position| self.entries[*position].dn() > entry_dn)
-            .unwrap_or(range.end)
+        let (mut low, mut high) = (range.start, range.end);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.entries[middle].dn() > entry_dn {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        low
     }
 
     /// Rebuilds the two maps that translate, after the vector moved.
@@ -600,13 +642,38 @@ impl Directory {
     /// Both are derived from the vector and the id list, so they are recomputed rather than
     /// patched: a map patched in one place and not another answers about the wrong entry, and the
     /// defect shows up as a search that returns something it should not.
-    fn reindex_positions(&mut self) {
-        self.by_dn.clear();
-        self.by_id.clear();
-        for (position, (entry, id)) in self.entries.iter().zip(self.ids.iter()).enumerate() {
-            self.by_dn.insert(entry.dn().to_string(), position);
-            self.by_id.insert(*id, position);
+    /// Repairs the position map after the vector moved at `from`.
+    ///
+    /// Only the entries at or after `from` changed position, so only they are touched. The DN map
+    /// needs no repair at all: it holds ids, and an id does not move when an entry is inserted
+    /// before it.
+    ///
+    /// This replaces two earlier shapes, both of which cost more than the write itself: rebuilding
+    /// both maps per write (a string clone per entry - 796 adds/s fell to 294 by thirty-one
+    /// thousand), and dropping the position map per write so that the very next parent check
+    /// rebuilt it (782/s fell to 496 by a hundred thousand). An import in ascending order inserts
+    /// at the end of its range, so the tail is a handful of entries.
+    fn shift_positions(&mut self, from: usize) {
+        if let Some(map) = self.by_id.get_mut() {
+            for position in from..self.ids.len() {
+                map.insert(self.ids[position], position);
+            }
         }
+    }
+
+    /// Where the entries sit, by id.
+    ///
+    /// Built on first use after a structural change. `&self` and a `OnceLock`, because a read must
+    /// be able to build it: making it a `&mut self` method would push the cost back onto the write
+    /// path, which is where it came from.
+    fn positions(&self) -> &HashMap<u32, usize> {
+        self.by_id.get_or_init(|| {
+            self.ids
+                .iter()
+                .enumerate()
+                .map(|(position, id)| (*id, position))
+                .collect()
+        })
     }
 
     /// The stable id of an entry, which is what its postings point at.
@@ -616,7 +683,9 @@ impl Directory {
 
     /// The entry an id names, if it is still here.
     pub fn entry_by_id(&self, id: u32) -> Option<&Entry> {
-        self.by_id.get(&id).map(|position| &self.entries[*position])
+        self.positions()
+            .get(&id)
+            .map(|position| &self.entries[*position])
     }
 
     /// The ids in canonical order: the pairing between the index's ids and the entries.
@@ -668,7 +737,11 @@ impl Directory {
 
         self.ids = ids;
         self.next_id = next_id.max(self.ids.iter().copied().max().unwrap_or(0) + 1);
-        self.by_id = by_id;
+        // The check above needed positions; the field is filled lazily, so the map just built is
+        // dropped rather than stored. One pass over the ids on the next read is cheaper than keeping
+        // a structure that a write would invalidate anyway.
+        let _ = by_id;
+        self.by_id = std::sync::OnceLock::new();
         self.index = Arc::new(index);
         Some(self)
     }
@@ -698,7 +771,9 @@ impl Directory {
 
     /// Position of an entry in the canonical order, which is its id in the indexes.
     pub fn position(&self, entry_dn: &str) -> Option<usize> {
-        self.by_dn.get(&dn::normalize(entry_dn)).copied()
+        // Through the id: the DN map is stable, the position is what moved.
+        let id = *self.by_dn.get(&dn::normalize(entry_dn))?;
+        self.positions().get(&id).copied()
     }
 
     /// Entries matching `base_object` and `scope` together with their ids.
@@ -725,7 +800,7 @@ impl Directory {
         // reported as stored. The translation is the whole reason `by_id` exists.
         ids.iter()
             .filter_map(|id| {
-                let position = *self.by_id.get(&id)?;
+                let position = *self.positions().get(&id)?;
                 Some((position, &self.entries[position]))
             })
             .collect()
@@ -798,7 +873,7 @@ impl Directory {
 
         let mut resolved = Vec::with_capacity(ids.len() as usize);
         for id in ids {
-            let Some(position) = self.by_id.get(&id) else {
+            let Some(position) = self.positions().get(&id) else {
                 continue;
             };
             let skeleton = &self.entries[*position];
@@ -943,7 +1018,9 @@ impl Directory {
     pub fn find(&self, entry: &str) -> Option<&Entry> {
         let entry = dn::normalize(entry);
 
-        if let Some(position) = self.by_dn.get(&entry) {
+        if let Some(id) = self.by_dn.get(&entry)
+            && let Some(position) = self.positions().get(id)
+        {
             return self.entries.get(*position);
         }
 
@@ -1163,6 +1240,57 @@ mod tests {
             .replace(crate::model::Attribute::single("cn", dn))
             .replace(crate::model::Attribute::single("userPassword", password));
         Entry::new(dn, attributes)
+    }
+
+    #[test]
+    fn inserting_out_of_order_keeps_the_canonical_order_the_search_relies_on() {
+        // `sorted_position` binary-searches the range, which is only correct while the range is in
+        // ascending DN order. Entries arrive in whatever order a client sends them, so the inserting
+        // path is what has to keep the invariant - and if it stops, the binary search returns a
+        // position that is not where the entry belongs, silently.
+        let mut directory = Directory::new(BASE, "users", "groups", Vec::new(), Vec::new());
+        let names = ["mira", "alice", "zoe", "bob", "yuri"];
+
+        for name in names {
+            let entry = Entry::new(
+                format!("cn={name},ou=users,{BASE}"),
+                crate::model::Attributes::new()
+                    .replace(crate::model::Attribute::single("cn", name)),
+            );
+            assert!(
+                directory
+                    .insert_entry_in_place(entry, &crate::index::IndexConfig::default())
+                    .expect("the insert is indexed"),
+                "{name} was not inserted"
+            );
+        }
+
+        let found: Vec<String> = directory
+            .users()
+            .iter()
+            .map(|entry| crate::dn::first_value(entry.dn()).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                "alice".to_string(),
+                "bob".to_string(),
+                "mira".to_string(),
+                "yuri".to_string(),
+                "zoe".to_string()
+            ],
+            "the users range must stay sorted whatever order they arrived in"
+        );
+
+        // And every one of them is findable, which is what the position map is for.
+        for name in names {
+            assert!(
+                directory
+                    .find(&format!("cn={name},ou=users,{BASE}"))
+                    .is_some(),
+                "{name} cannot be found after the insert"
+            );
+        }
     }
 
     #[test]

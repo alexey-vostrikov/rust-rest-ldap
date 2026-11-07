@@ -46,6 +46,18 @@ impl crate::directory::EntrySource for BackendEntrySource {
 pub struct SnapshotKnown {
     sequence: std::sync::atomic::AtomicU64,
     bytes: std::sync::atomic::AtomicU64,
+    /// How many bytes of recorded changes the store holds since the snapshot.
+    ///
+    /// Counted as they are written, because measuring it means a range scan over the whole delta
+    /// table - and `snapshot_rewrite_due` runs on **every** write. With thirty thousand deltas that
+    /// scan is the difference between an add costing one millisecond and three.
+    recorded: std::sync::atomic::AtomicU64,
+
+    /// When the snapshot was last written, as seconds since the process started.
+    ///
+    /// A monotonic reading and not a wall clock: what this answers is "how long has it been", and a
+    /// clock that jumps would either allow a burst of rewrites or block them for hours.
+    written_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl SnapshotKnown {
@@ -55,6 +67,13 @@ impl SnapshotKnown {
             .store(sequence, std::sync::atomic::Ordering::Release);
         self.bytes
             .store(bytes as u64, std::sync::atomic::Ordering::Release);
+        // A snapshot at this counter covers everything recorded up to it, so the total starts again.
+        self.recorded.store(0, std::sync::atomic::Ordering::Relaxed);
+        // The age starts here: a snapshot read at start counts as written now, so the floor applies
+        // from the moment the server came up rather than only after its first rewrite. Without this
+        // a start would always be allowed one rewrite, however recently the file was written - and
+        // the measured failure was a rewrite on every few hundred writes.
+        self.written_now();
     }
 
     fn sequence(&self) -> u64 {
@@ -64,7 +83,40 @@ impl SnapshotKnown {
     fn bytes(&self) -> u64 {
         self.bytes.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// Adds to the recorded-change total, as a write records one more change set.
+    fn recorded(&self, bytes: usize) {
+        self.recorded
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The recorded total as counted so far.
+    fn recorded_bytes(&self) -> u64 {
+        self.recorded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Notes that a snapshot was just written.
+    fn written_now(&self) {
+        if let Ok(mut slot) = self.written_at.lock() {
+            *slot = Some(std::time::Instant::now());
+        }
+    }
+
+    /// How long ago the snapshot was written, or `None` when this process has not written one.
+    fn age(&self) -> Option<std::time::Duration> {
+        self.written_at
+            .lock()
+            .ok()
+            .and_then(|slot| slot.map(|instant| instant.elapsed()))
+    }
 }
+
+/// The default floor between two snapshot rewrites, in seconds.
+///
+/// Sixty rather than ten: a rewrite copies the whole index, so at nine million entries it is about
+/// 1.8 GB of work, and a server doing that every ten seconds would spend a fifth of its capacity
+/// on snapshots.
+pub const DEFAULT_REWRITE_MIN_SECONDS: u64 = 60;
 
 /// Holds the current directory snapshot and knows how to rebuild it.
 pub struct Source {
@@ -336,6 +388,36 @@ impl Source {
         groups_ou_name: &str,
         backend: &Arc<Backend>,
     ) -> Result<Option<(Directory, SnapshotKnown)>, BackendError> {
+        Self::from_snapshot_catching_up(
+            plan,
+            cache_budget,
+            indexes,
+            base_dn,
+            users_ou_name,
+            groups_ou_name,
+            backend,
+            None,
+        )
+    }
+
+    /// The same, with an optional counter to catch up to.
+    ///
+    /// Convergence needs this: the file it just wrote covers `sequence`, and the writes that
+    /// happened while it was being written are in the store as deltas. Catching up *while building*
+    /// is what keeps the two consistent - the numbering is merged before the skeletons are made, so
+    /// an entry added during the rewrite is in the snapshot that goes live, and the index carries
+    /// its postings as overlay records rather than materialising.
+    #[allow(clippy::too_many_arguments)]
+    fn from_snapshot_catching_up(
+        plan: u64,
+        cache_budget: usize,
+        indexes: &IndexConfig,
+        base_dn: &str,
+        users_ou_name: &str,
+        groups_ou_name: &str,
+        backend: &Arc<Backend>,
+        catch_up: Option<u64>,
+    ) -> Result<Option<(Directory, SnapshotKnown)>, BackendError> {
         let sequence = backend.sequence()?;
 
         // The mapped format first: it needs no decoding at all, and its header says which counter it
@@ -348,6 +430,11 @@ impl Source {
 
             let known = SnapshotKnown::default();
             known.remember(snapshot_sequence, file.length() as usize);
+            // One scan here, for the total the write path then keeps up to date: a start has time
+            // for it, and every write after it reads a counter.
+            if let Ok(recorded) = backend.index_delta_bytes(snapshot_sequence) {
+                known.recorded(recorded as usize);
+            }
 
             let state = match snapshot_sequence.cmp(&sequence) {
                 // Nothing has been written since the snapshot: the postings are the index, and the
@@ -367,9 +454,23 @@ impl Source {
                         file.next_id(),
                     )
                 }),
-                // The store moved: the deltas say how. They were written by the write path, so the
-                // index is materialised from the file and the changes replayed onto it - the price
-                // of a start after writes, and of nothing else.
+                // The store moved past the file. At start that means the deltas have to be
+                // replayed into a materialised index - a start pays once for the writes it missed.
+                // When converging, it means writes arrived while the snapshot was being written:
+                // those are cheap to keep as overlay records, and materialising there would undo
+                // the whole point of the rewrite, so the mapped path is taken and the catch-up
+                // block below records them.
+                std::cmp::Ordering::Less if catch_up.is_some() => {
+                    file.numbering().map(|numbered| {
+                        (
+                            crate::index::Index::from_plan(indexes).with_mapped(Arc::clone(&file)),
+                            numbered
+                                .into_iter()
+                                .collect::<std::collections::HashMap<_, _>>(),
+                            file.next_id(),
+                        )
+                    })
+                }
                 std::cmp::Ordering::Less => backend
                     .index_deltas(snapshot_sequence, sequence)?
                     .and_then(|deltas| {
@@ -389,7 +490,43 @@ impl Source {
                 std::cmp::Ordering::Greater => None,
             };
 
-            if let Some((index, numbering, next_id)) = state {
+            if let Some((mut index, mut numbering, mut next_id)) = state {
+                // The writes that happened after the file was written: merged into the numbering
+                // here, so the skeletons built below include them, and recorded on the index as
+                // overlay records rather than materialising its postings.
+                if let Some(now) = catch_up
+                    && now > snapshot_sequence
+                    && index.is_mapped()
+                {
+                    let Some(deltas) = backend.index_deltas(snapshot_sequence, now)? else {
+                        // A hole in the chain: the fresh snapshot would lose the writes between
+                        // the file and now. Refused rather than published.
+                        return Ok(None);
+                    };
+                    let mut changes: Vec<crate::index::IndexChange> = Vec::new();
+                    for delta in &deltas {
+                        let Some(decoded) = crate::index::Index::decode_delta(delta) else {
+                            return Ok(None);
+                        };
+                        changes.extend(decoded);
+                    }
+                    if !changes.is_empty() && !index.record_deltas(&changes) {
+                        return Ok(None);
+                    }
+                    for change in &changes {
+                        match change {
+                            crate::index::IndexChange::Add { id, entry } => {
+                                numbering.insert(crate::dn::normalize(entry.dn()), *id);
+                                next_id = next_id.max(id + 1);
+                            }
+                            crate::index::IndexChange::Remove { entry, .. } => {
+                                numbering.remove(&crate::dn::normalize(entry.dn()));
+                            }
+                            crate::index::IndexChange::Replace { .. } => {}
+                        }
+                    }
+                }
+
                 let listed: Vec<(String, u32)> =
                     numbering.iter().map(|(dn, id)| (dn.clone(), *id)).collect();
                 let mapped = index.is_mapped();
@@ -919,6 +1056,10 @@ impl Source {
         // next start simply builds it again.
         if !applied.is_empty() {
             let bytes = crate::index::Index::encode_delta(&applied);
+            // Counted before the append, and counted even if it fails: the counter decides an
+            // optimisation, so being wrong towards "rewrite sooner" costs one snapshot rather than
+            // a table nobody reads. The error itself is still reported.
+            self.snapshot_known.recorded(bytes.len());
             if let Err(err) = self.backend.append_index_delta(sequence, &bytes) {
                 eprintln!(
                     "{}",
@@ -967,7 +1108,7 @@ impl Source {
     ///
     /// The swap is one pointer: readers holding the old snapshot keep the view they had, which is
     /// the rule the copy-on-write everywhere else exists for.
-    pub async fn converge(&self, sequence: u64) -> Result<bool, BackendError> {
+    pub async fn converge(&self) -> Result<bool, BackendError> {
         Self::converge_with(
             Arc::clone(&self.current),
             self.plan,
@@ -977,11 +1118,32 @@ impl Source {
             &self.users_ou_name,
             &self.groups_ou_name,
             Arc::clone(&self.backend),
-            sequence,
         )
         .await
     }
 
+    /// Replaces the live snapshot with a fresh one built from the file just written, plus the
+    /// writes that happened while it was being written.
+    ///
+    /// This is the convergence the overlay needs. A rewrite puts the changes into the file, but the
+    /// live index still maps the *old* file and still holds its overlay - so without this step the
+    /// overlay never empties, every query keeps paying a comparison per record, and the memory only
+    /// comes back when the cap forces a materialisation.
+    ///
+    /// **Writes during the rewrite are not lost and do not cancel it.** The first version refused to
+    /// converge whenever the store had moved, and on a server taking hundreds of writes a second the
+    /// store always has - measured over thirty-one thousand adds: fifty-eight rewrites, zero
+    /// convergences, so the whole overlay path never engaged and every write went into the maps.
+    /// The file covers `sequence`; everything after it is in the store as deltas, and those are
+    /// replayed onto the fresh index as overlay records. Convergence then covers *now*, not
+    /// `sequence`, and the entries added in between are merged into the numbering - a skeleton
+    /// carries only a DN, so nothing else has to be carried across.
+    ///
+    /// Refused when the pending changes do not fit under the overlay cap: a fresh snapshot holding
+    /// half the changes is worse than the old one holding all of them.
+    ///
+    /// The swap is one pointer: readers holding the old snapshot keep the view they had, which is
+    /// the rule the copy-on-write everywhere else exists for.
     #[allow(clippy::too_many_arguments)]
     async fn converge_with(
         current: Arc<RwLock<Arc<Directory>>>,
@@ -992,13 +1154,15 @@ impl Source {
         users_ou_name: &str,
         groups_ou_name: &str,
         backend: Arc<Backend>,
-        sequence: u64,
     ) -> Result<bool, BackendError> {
-        if backend.sequence()? != sequence {
-            return Ok(false);
-        }
+        let now = backend.sequence()?;
 
-        let Some((mut fresh, _known)) = Self::from_snapshot_with(
+        // Built from the file the rewrite just wrote, catching up to `now` on the way: the writes
+        // that happened during the rewrite are in the store as deltas and are merged into the
+        // numbering and the overlay before the skeletons exist. `None` means the chain had a hole
+        // or the batch did not fit under the cap - in both cases the old snapshot is the correct
+        // one to keep, and the next rewrite tries again.
+        let Some((mut fresh, _known)) = Self::from_snapshot_catching_up(
             plan,
             cache_budget,
             indexes,
@@ -1006,6 +1170,7 @@ impl Source {
             users_ou_name,
             groups_ou_name,
             &backend,
+            Some(now),
         )?
         else {
             return Ok(false);
@@ -1014,7 +1179,7 @@ impl Source {
         // What the snapshot itself does not carry: the journal position and the floor are about the
         // store, not about the index, and a fresh one starts with none of them.
         let live = Arc::clone(&*current.read().await);
-        fresh.set_snapshot(sequence);
+        fresh.set_snapshot(now);
         fresh.set_csn(live.csn().map(str::to_string));
         fresh.set_floor(live.floor().map(str::to_string));
 
@@ -1034,11 +1199,39 @@ impl Source {
         if sequence <= snapshot_sequence {
             return false;
         }
-        let Ok(recorded) = self.backend.index_delta_bytes(snapshot_sequence) else {
-            return false;
-        };
+        // From the counter kept by the write path, not from a scan of the delta table: this runs on
+        // every write, and a scan over thirty thousand deltas made an add cost three milliseconds
+        // instead of one. `index_delta_bytes` is still what a start uses, once.
+        let recorded = self.snapshot_known.recorded_bytes();
 
-        recorded >= delta_budget(snapshot_bytes, self.indexes.snapshot_delta_bytes)
+        if recorded < delta_budget(snapshot_bytes, self.indexes.snapshot_delta_bytes) {
+            return false;
+        }
+
+        // Enough has changed; the question is whether this server can afford another copy yet. The
+        // rewrite costs a pass over the whole index, so a busy directory would spend its time
+        // copying rather than writing - measured: fifty-eight rewrites over thirty-one thousand
+        // adds, and the write rate dropped by more than half. The deltas are cheap to replay, so
+        // waiting costs a little restart time and buys a stable write path.
+        // Unset means the default sixty seconds, not "no floor": a floor is what keeps a busy
+        // server from spending its life copying the index, so leaving it out of a configuration must
+        // not leave it out of the behaviour. Zero is how a test, or an operator who really wants a
+        // rewrite at every threshold crossing, says "no floor".
+        let minimum = self
+            .indexes
+            .snapshot_rewrite_min_seconds
+            .unwrap_or(DEFAULT_REWRITE_MIN_SECONDS);
+        if minimum == 0 {
+            return true;
+        }
+
+        // The age is set when the snapshot is read at start as well as when it is written, so this
+        // answers "how long since this server last had a snapshot at this counter", which is the
+        // question the floor is about. `None` cannot happen outside a source built without a load.
+        match self.snapshot_known.age() {
+            Some(age) => age >= std::time::Duration::from_secs(minimum),
+            None => true,
+        }
     }
 
     /// Rewrites the stored snapshot once the deltas have grown past what keeping them is worth.
@@ -1130,7 +1323,6 @@ impl Source {
                         &users_ou_name,
                         &groups_ou_name,
                         Arc::clone(&convergence_backend),
-                        sequence,
                     )
                     .await
                     {
