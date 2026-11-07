@@ -419,6 +419,11 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     ("start.memory", "memory: {usage}"),
     (
+        "start.memory_compacted",
+        "memory: {usage} - over the ceiling, so the record bodies were released ({released}) and are \
+         now read from the store on demand; answers over large scopes will be slower",
+    ),
+    (
         "start.index_converged",
         "index: the snapshot was rewritten and the live index now reads it, so its recorded changes \
          are gone",
