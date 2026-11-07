@@ -38,7 +38,7 @@ use redb::{ReadableTable, TableDefinition, WriteTransaction};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::index::{IndexConfig, IndexError, Kind};
+use crate::index::{IndexConfig, IndexError, Kind, RangeBound};
 use crate::model::Entry;
 use crate::prepare::{self, Position, Rule};
 
@@ -57,6 +57,13 @@ pub const IDX_EQ: TableDefinition<(&str, &str, u32), &[u8]> = TableDefinition::n
 pub const IDX_PRES: TableDefinition<(&str, u32), &[u8]> = TableDefinition::new("idx_pres");
 /// Trigram postings: attribute, trigram, page.
 pub const IDX_SUB: TableDefinition<(&str, &str, u32), &[u8]> = TableDefinition::new("idx_sub");
+/// Ordered postings: attribute, order key as bytes, page.
+///
+/// The key is bytes rather than a value because the order is the whole point: two keys compare the
+/// way the filter compares the values they stand for, and a range scan is then a byte range. Numbers
+/// are stored sign-flipped big-endian and text as prepared UTF-8, so `redb`'s byte order is the
+/// filter's order.
+pub const IDX_ORD: TableDefinition<(&str, &[u8], u32), &[u8]> = TableDefinition::new("idx_ord");
 
 /// The page an id falls on.
 pub fn page_of(id: u64) -> u32 {
@@ -205,6 +212,7 @@ pub(crate) struct Postings<'db> {
     eq: redb::Table<'db, (&'static str, &'static str, u32), &'static [u8]>,
     pres: redb::Table<'db, (&'static str, u32), &'static [u8]>,
     sub: redb::Table<'db, (&'static str, &'static str, u32), &'static [u8]>,
+    ord: redb::Table<'db, (&'static str, &'static [u8], u32), &'static [u8]>,
 }
 
 fn database(source: impl ToString) -> StoreError {
@@ -218,6 +226,7 @@ impl<'db> Postings<'db> {
             eq: write.open_table(IDX_EQ).map_err(database)?,
             pres: write.open_table(IDX_PRES).map_err(database)?,
             sub: write.open_table(IDX_SUB).map_err(database)?,
+            ord: write.open_table(IDX_ORD).map_err(database)?,
         })
     }
 
@@ -281,6 +290,19 @@ impl<'db> Postings<'db> {
                 }
             }
 
+            if kinds.contains(&Kind::Ord) {
+                for value in attribute.values.iter() {
+                    let numeric = value.trim().parse::<i64>().ok();
+                    // One kind per attribute: mixing numbers and text in one key space would order
+                    // `10` before `9`, which is a false negative for `(n>=9)` - the one answer an
+                    // index must never give. A mixed attribute is marked and its queries scan.
+                    let Some(key) = order_key(meta, &name, numeric, value, case_sensitive)? else {
+                        continue;
+                    };
+                    Self::touch_bytes(&mut self.ord, &name, &key, page, bit, present)?;
+                }
+            }
+
             if kinds.contains(&Kind::Sub) {
                 for value in attribute.values.iter() {
                     let prepared = prepare::prepare(value, rule_of(case_sensitive))
@@ -328,6 +350,38 @@ impl<'db> Postings<'db> {
         Ok(())
     }
 
+    /// The same page arithmetic for the ordered table, whose key carries bytes rather than text.
+    fn touch_bytes(
+        table: &mut redb::Table<'_, (&'static str, &'static [u8], u32), &'static [u8]>,
+        attribute: &str,
+        value: &[u8],
+        page: u32,
+        bit: u32,
+        present: bool,
+    ) -> Result<(), StoreError> {
+        let key = (attribute, value, page);
+        let mut bitmap = match table.get(key).map_err(database)? {
+            Some(found) => decode(found.value())?,
+            None => RoaringBitmap::new(),
+        };
+        if present {
+            bitmap.insert(bit);
+        } else if !bitmap.remove(bit) {
+            return Err(StoreError::Record(format!(
+                "the ordered index of {attribute} has no page {page} bit {bit} to remove"
+            )));
+        }
+
+        if bitmap.is_empty() {
+            table.remove(key).map_err(database)?;
+        } else {
+            table
+                .insert(key, encode(&bitmap).as_slice())
+                .map_err(database)?;
+        }
+        Ok(())
+    }
+
     fn touch(
         table: &mut redb::Table<'_, (&'static str, &'static str, u32), &'static [u8]>,
         attribute: &str,
@@ -358,6 +412,87 @@ impl<'db> Postings<'db> {
         }
         Ok(())
     }
+}
+
+/// How an attribute's values are ordered, once decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderKind {
+    Numeric,
+    Text,
+}
+
+const ORDER_KIND_NUMERIC: u64 = 1;
+const ORDER_KIND_TEXT: u64 = 2;
+const ORDER_MIXED: u64 = 1;
+
+/// Decides - and remembers - how an attribute's values are ordered, and encodes this one.
+///
+/// The kind is learned from the first value written and stored in `meta`, not held in memory: a
+/// restart that forgot it would key a text value into the numeric space and answer a range with
+/// entries the filter would have excluded.
+///
+/// A value of the other kind makes the attribute *mixed* and its range queries scan. The postings
+/// already written stay where they are: the flag is what the reader obeys, and deleting them would
+/// cost a walk for an answer that is already correct without them.
+fn order_key(
+    meta: &mut redb::Table<'_, &'static str, u64>,
+    attribute: &str,
+    numeric: Option<i64>,
+    value: &str,
+    case_sensitive: bool,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    if meta
+        .get(format!("ordm:{attribute}").as_str())
+        .map_err(database)?
+        .is_some()
+    {
+        return Ok(None);
+    }
+
+    let kind_key = format!("ordk:{attribute}");
+    let stored = meta
+        .get(kind_key.as_str())
+        .map_err(database)?
+        .map(|found| found.value());
+
+    let numeric_kind = match (stored, numeric) {
+        (None, Some(_)) => ORDER_KIND_NUMERIC,
+        (None, None) => ORDER_KIND_TEXT,
+        (Some(kind), Some(_)) if kind == ORDER_KIND_NUMERIC => kind,
+        (Some(kind), None) if kind == ORDER_KIND_TEXT => kind,
+        (Some(_), _) => {
+            // Numbers and text in one attribute: neither ordering describes the comparison.
+            meta.insert(format!("ordm:{attribute}").as_str(), ORDER_MIXED)
+                .map_err(database)?;
+            return Ok(None);
+        }
+    };
+
+    if stored.is_none() {
+        meta.insert(kind_key.as_str(), numeric_kind)
+            .map_err(database)?;
+    }
+
+    Ok(Some(if numeric_kind == ORDER_KIND_NUMERIC {
+        numeric_key(numeric.expect("a numeric kind has a number"))
+    } else {
+        text_key(value, case_sensitive)?
+    }))
+}
+
+/// The bytes of a number, ordered as the number: signed, big-endian, sign bit flipped.
+///
+/// Flipping the sign bit is what makes a negative number sort before zero in an unsigned byte
+/// comparison; big-endian is what makes the comparison lexicographic in the right direction.
+pub fn numeric_key(number: i64) -> Vec<u8> {
+    ((number as u64) ^ (1u64 << 63)).to_be_bytes().to_vec()
+}
+
+/// The bytes of a text value, prepared so that equal values have equal keys.
+fn text_key(value: &str, case_sensitive: bool) -> Result<Vec<u8>, StoreError> {
+    Ok(prepare::prepare(value, rule_of(case_sensitive))
+        .map_err(|refused| StoreError::Record(refused.to_string()))?
+        .into_bytes())
 }
 
 /// Records that an attribute's values must be matched exactly.
@@ -500,6 +635,81 @@ pub fn read_sub(
     }
 
     Ok(found.unwrap_or_default())
+}
+
+/// Reads an ordered range, or says it cannot be answered from the index.
+///
+/// `None` is not "nothing matches" but "the index does not describe this comparison, scan instead".
+/// The two are told apart because a range index that answered `None` as an empty set would silently
+/// drop entries - a false negative, and the one answer an index must never give.
+///
+/// The cases that give `None`: the attribute is unconfigured, mixed, or was never written with an
+/// ordered index; and a numeric bound on a numeric attribute that is not a number.
+pub fn read_ord(
+    read: &redb::ReadTransaction,
+    attribute: &str,
+    bound: RangeBound,
+    value: &str,
+    case_sensitive: bool,
+) -> Result<Option<RoaringTreemap>, StoreError> {
+    let folded_name = attribute.to_lowercase();
+    let attribute: &str = folded_name.as_str();
+
+    let Ok(table) = read.open_table(IDX_ORD) else {
+        return Ok(None);
+    };
+    let Ok(meta) = read.open_table(super::store::META) else {
+        return Ok(None);
+    };
+
+    if meta
+        .get(format!("ordm:{attribute}").as_str())
+        .map_err(database)?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let Some(kind) = meta
+        .get(format!("ordk:{attribute}").as_str())
+        .map_err(database)?
+        .map(|found| found.value())
+    else {
+        return Ok(None);
+    };
+
+    let key = if kind == ORDER_KIND_NUMERIC {
+        match value.trim().parse::<i64>() {
+            Ok(number) => numeric_key(number),
+            // A text bound on a numeric attribute: the comparison is not one this index describes.
+            Err(_) => return Ok(None),
+        }
+    } else {
+        text_key(value, case_sensitive)?
+    };
+
+    // `AtLeast` starts at the bound; `AtMost` has to start at the lowest key of the attribute and
+    // stop once the keys pass it. Starting at the bound is impossible in the second case - the keys
+    // below it are exactly the answer - and the stop is what keeps the scan proportional to the
+    // result rather than to the attribute.
+    let mut found = RoaringTreemap::new();
+    let from: (&str, &[u8], u32) = match bound {
+        RangeBound::AtLeast => (attribute, key.as_slice(), 0),
+        RangeBound::AtMost => (attribute, &[], 0),
+    };
+
+    for item in table.range(from..).map_err(database)? {
+        let (stored_key, bitmap) = item.map_err(database)?;
+        let (name, at, page) = stored_key.value();
+        if name != attribute {
+            break;
+        }
+        if bound == RangeBound::AtMost && at > key.as_slice() {
+            break;
+        }
+        collect_into(&mut found, &decode(bitmap.value())?, page);
+    }
+
+    Ok(Some(found))
 }
 
 #[cfg(test)]

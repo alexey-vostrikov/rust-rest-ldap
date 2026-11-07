@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 pub mod index;
+pub mod search;
 pub mod store;
 
 use crate::catalog::store::{Change, Store, StoreError};
