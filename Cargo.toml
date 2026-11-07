@@ -53,6 +53,10 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "net", "time", "sync", "rt-multi-thread", "signal"] }
 # default features pull aws-lc-rs and ring, which are C: keep only the wrapper
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["logging", "tls12"] }
+# String preparation for matching (RFC 4518). Both are pure Rust with no C: the alternative was
+# `value.to_lowercase()`, which agrees with the RFC on ASCII and differs on everything else.
+caseless = "0.2.2"
+unicode-normalization = "0.1.26"
 uuid = { version = "1.29.0", features = ["v5"] }
 # The public certificate authorities, compiled in: a client that trusts whatever the
 # filesystem happens to hold is a client that works on one machine only.
