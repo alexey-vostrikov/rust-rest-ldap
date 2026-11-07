@@ -904,6 +904,36 @@ impl Directory {
         self.source.is_some()
     }
 
+    /// Throws away the record bodies, keeping the identities.
+    ///
+    /// The snapshot becomes a skeleton: DN, id, canonical position, and the index - everything a
+    /// search needs to decide *which* entries, and nothing it needs to answer *with*. Records are
+    /// read from the store when an answer needs them, which is what `with_source` provides.
+    ///
+    /// This is what turns `limits.memory_bytes` from a warning into a mechanism. Until it existed,
+    /// a server that grew its directory by `add` never entered the skeleton mode at all: the mode
+    /// was reachable only from `from_skeletons`, on the start path. So a directory built through
+    /// ordinary writes held every record for ever, and the ceiling could only say "does not fit".
+    ///
+    /// Returns how many bytes of attribute storage it released, as a number an operator can see.
+    /// The heap does not necessarily go back to the operating system - allocators keep their arenas
+    /// - so this is what was *freed*, not what RSS will drop by.
+    pub fn release_records(&mut self) -> u64 {
+        let mut released = 0u64;
+
+        for entry in &mut self.entries {
+            for attribute in entry.attributes().values() {
+                released += attribute.name.len() as u64;
+                for value in attribute.values.iter() {
+                    released += value.len() as u64;
+                }
+            }
+            *entry = Entry::new(entry.dn(), crate::model::Attributes::new());
+        }
+
+        released
+    }
+
     /// The same directory, fetching full records from `source`.
     ///
     /// Takes the entries it already holds as skeletons: their DN and their indexed attributes are
@@ -914,6 +944,14 @@ impl Directory {
         self
     }
 
+    /// Attaches a record source to a directory that is already in use.
+    ///
+    /// `with_source` consumes the directory, which is right for a builder and wrong for a snapshot
+    /// that has just released its records and now has to be told where they went.
+    pub fn attach_source(&mut self, source: Arc<dyn EntrySource>) {
+        self.source = Some(SourceSlot(source));
+    }
+
     /// The same directory, keeping recently read records of up to `budget` bytes.
     ///
     /// Set beside the source and only meaningful with one: without it, every record is already in
@@ -922,6 +960,11 @@ impl Directory {
     pub fn with_cache(mut self, cache: Arc<crate::record_cache::RecordCache>) -> Self {
         self.cache = Some(CacheSlot(cache));
         self
+    }
+
+    /// Attaches a record cache to a directory that is already in use.
+    pub fn attach_cache(&mut self, cache: Arc<crate::record_cache::RecordCache>) {
+        self.cache = Some(CacheSlot(cache));
     }
 
     /// The cache this snapshot reads through, when it has one.
@@ -1240,6 +1283,61 @@ mod tests {
             .replace(crate::model::Attribute::single("cn", dn))
             .replace(crate::model::Attribute::single("userPassword", password));
         Entry::new(dn, attributes)
+    }
+
+    #[test]
+    fn releasing_the_records_keeps_the_identities_and_returns_what_it_freed() {
+        // What the ceiling does when a directory grown by `add` passes it: the bodies go, the
+        // identities stay - a DN, an id, a position - and every record is read from the store when
+        // an answer needs it. What must not happen is an entry losing its place: a search that
+        // walks the users range must still find the account, even though its attributes are gone.
+        let mut directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![person("alice"), person("bob")],
+        );
+
+        let alice_id = directory
+            .id_of(&format!("uid=alice,ou=users,{BASE}"))
+            .expect("alice is here before the release");
+
+        let released = directory.release_records();
+
+        assert!(released > 0, "there were attributes to release");
+        for entry in directory.all() {
+            assert!(
+                entry.attributes().values().is_empty(),
+                "{} still holds attributes",
+                entry.dn()
+            );
+        }
+        // The identities are untouched: same DNs, same order, still findable, still in the range.
+        // `all()` holds the naming context and the two organizational units as well, so the count
+        // that matters here is the users range.
+        assert_eq!(directory.users().len(), 2);
+        assert!(
+            directory
+                .find(&format!("uid=alice,ou=users,{BASE}"))
+                .is_some(),
+            "alice cannot be found"
+        );
+        assert_eq!(
+            directory
+                .users()
+                .iter()
+                .map(|entry| crate::dn::first_value(entry.dn()).unwrap_or_default())
+                .collect::<Vec<String>>(),
+            vec!["alice".to_string(), "bob".to_string()],
+            "the users range must keep both entries and their order"
+        );
+        // And the ids did not move, which is what the index postings mean. The number itself is a
+        // position in canonical order and says nothing here; what matters is that releasing the
+        // bodies did not change it - a moved id would point the index at another entry.
+        assert_eq!(
+            directory.id_of(&format!("uid=alice,ou=users,{BASE}")),
+            Some(alice_id)
+        );
     }
 
     #[test]

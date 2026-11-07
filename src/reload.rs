@@ -150,6 +150,12 @@ pub struct Source {
     plan: u64,
     /// The record-cache budget, for the same reason.
     cache_budget: usize,
+    /// The ceiling on resident memory, when the operator set one.
+    ///
+    /// Kept here because the write path is where it is enforced: a directory that grows past it is
+    /// compacted to skeletons on the spot, so `limits.memory_bytes` stops a server rather than
+    /// warning about one.
+    memory_ceiling: Option<u64>,
     /// Set while a snapshot rewrite is running, so two cannot encode the same index at once and
     /// delete each other's deltas.
     snapshot_rewriting: Arc<std::sync::atomic::AtomicBool>,
@@ -687,6 +693,7 @@ impl Source {
             indexes: config.indexes.clone(),
             plan: crate::index::plan_hash(&config.indexes),
             cache_budget: config.cache.budget(),
+            memory_ceiling: config.limits.memory_bytes,
             snapshot_rewriting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             snapshot_known: Arc::new(known),
             backend,
@@ -1068,6 +1075,12 @@ impl Source {
             }
         }
 
+        // The ceiling, enforced rather than reported. A directory grown by `add` holds every record
+        // for ever - the skeleton mode was reachable only from the start path - so a server built
+        // through ordinary writes could only be told it did not fit. Past the ceiling the records
+        // are dropped here and read back from the store on demand, which is what the mode was for.
+        self.compact_if_over_ceiling(directory);
+
         directory.set_snapshot(snapshot);
         directory.set_csn(self.backend.journal_head()?);
         directory.set_floor(self.backend.journal_floor()?);
@@ -1185,6 +1198,53 @@ impl Source {
 
         *current.write().await = Arc::new(fresh);
         Ok(true)
+    }
+
+    /// Drops record bodies when the process is over its memory ceiling.
+    ///
+    /// Once, not repeatedly: after this the snapshot is a skeleton, and a skeleton does not grow
+    /// back - `insert_entry_in_place` and `replace_entry_in_place` operate on identities, and the
+    /// records a search answers with are read from the store. So the check costs one `statm` read
+    /// per write until it fires, and nothing after it.
+    ///
+    /// The store is the source of truth here only because the write path has just stored the entry
+    /// it changed: `apply_{insert,replace,remove}_in_place` writes to the backend before patching
+    /// the snapshot, so every record a skeleton no longer holds is on disk.
+    fn compact_if_over_ceiling(&self, directory: &mut Directory) {
+        let Some(ceiling) = self.memory_ceiling else {
+            return;
+        };
+        // Already a skeleton: the records are not here to give back.
+        if directory.is_skeleton() {
+            return;
+        }
+        let Some(usage) = crate::memory::Usage::against(ceiling) else {
+            return;
+        };
+        if !usage.exceeded() {
+            return;
+        }
+
+        let released = directory.release_records();
+        directory.attach_source(Arc::new(BackendEntrySource {
+            backend: Arc::clone(&self.backend),
+        }));
+        if self.cache_budget > 0 {
+            directory.attach_cache(Arc::new(crate::record_cache::RecordCache::new(
+                self.cache_budget,
+            )));
+        }
+
+        println!(
+            "{}",
+            crate::i18n::t(
+                "start.memory_compacted",
+                &[
+                    ("usage", &usage.to_string()),
+                    ("released", &crate::limits::Size(released).to_string()),
+                ]
+            )
+        );
     }
 
     /// Whether the recorded changes have grown past the point where replaying them costs more
