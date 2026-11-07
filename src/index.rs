@@ -151,6 +151,17 @@ pub struct IndexConfig {
     /// is a few megabytes, and where the per-query comparison is still cheaper than reading the
     /// snapshot back.
     pub snapshot_overlay_max: Option<usize>,
+    /// The shortest time between two snapshot rewrites, in seconds.
+    ///
+    /// A rewrite costs a copy of the whole index — 1.8 GB on nine million entries — so "how much has
+    /// changed" is not enough of a reason: a busy server outgrows any byte threshold faster than it
+    /// can afford to pay for the copy. Measured on a growing directory: thirty-one thousand adds
+    /// caused **fifty-eight rewrites**, each copying the index, and the write rate fell from 796 to
+    /// 294 adds per second. The deltas waited anyway — replaying them is cheap — so the interval
+    /// bounds the cost per second instead of the cost per change.
+    ///
+    /// Zero means no floor, which is what the tests that pin the rewrite threshold need.
+    pub snapshot_rewrite_min_seconds: Option<u64>,
 }
 
 impl IndexConfig {
@@ -240,6 +251,14 @@ pub struct Index {
     /// general-purpose store: it holds the changes since the snapshot, and the snapshot rewrite
     /// (threshold `indexes.snapshot_delta_bytes`) is what empties it.
     overlay: Vec<Overlay>,
+
+    /// Where each overlay record sits, by entry id.
+    ///
+    /// Without it `push_overlay` scans the whole list to find the entry it is changing, which is
+    /// O(overlay) per write - measured: with a cap of 8192 the write rate fell from 294 to 209 adds
+    /// per second, and the cost grows with the square of the number of changes. A map lookup makes
+    /// a write cost the same whether the overlay holds one record or eight thousand.
+    overlay_ids: HashMap<u32, usize>,
 
     /// The most records the overlay may hold before the index materialises instead.
     overlay_max: usize,
@@ -943,6 +962,7 @@ impl Index {
             built: BTreeMap::new(),
             mapped: None,
             overlay: Vec::new(),
+            overlay_ids: HashMap::new(),
             overlay_max: 8192,
         };
 
@@ -1147,6 +1167,7 @@ impl Index {
             built,
             mapped: None,
             overlay: Vec::new(),
+            overlay_ids: HashMap::new(),
             overlay_max: 8192,
         };
         index.fill_built();
@@ -1583,7 +1604,9 @@ impl Index {
         before: Option<&crate::model::Attributes>,
         after: Option<&crate::model::Attributes>,
     ) {
-        if let Some(existing) = self.overlay.iter_mut().find(|record| record.id == id) {
+        if let Some(&at) = self.overlay_ids.get(&id)
+            && let Some(existing) = self.overlay.get_mut(at)
+        {
             // The first `before` wins: it is the state the file was written in, which is what the
             // overlay has to be able to remove from an answer.
             if existing.before.is_none() {
@@ -1593,6 +1616,7 @@ impl Index {
             return;
         }
 
+        self.overlay_ids.insert(id, self.overlay.len());
         self.overlay.push(Overlay {
             id,
             before: before.cloned(),
@@ -1704,6 +1728,40 @@ impl Index {
         answer
     }
 
+    /// Records a batch of stored changes as overlay records, without materialising.
+    ///
+    /// Used by convergence: after a snapshot rewrite the file covers everything up to some counter,
+    /// and the writes that happened during the rewrite are in the store as deltas. Replaying them
+    /// through this keeps the fresh index mapped - the alternative, `apply_delta`, would materialise
+    /// and we would be back where this whole line started.
+    ///
+    /// `false` when the batch does not fit under the overlay cap, in which case the caller should
+    /// not converge at all: a fresh snapshot with half the changes applied is worse than the old one
+    /// with all of them.
+    pub fn record_deltas(&mut self, changes: &[crate::index::IndexChange]) -> bool {
+        if self.mapped.is_none() {
+            return false;
+        }
+        if self.overlay.len() + changes.len() > self.overlay_cap() {
+            return false;
+        }
+
+        for change in changes {
+            match change {
+                IndexChange::Add { id, entry } => {
+                    self.push_overlay(*id, None, Some(entry.attributes()));
+                }
+                IndexChange::Replace { id, before, after } => {
+                    self.push_overlay(*id, Some(before.attributes()), Some(after.attributes()));
+                }
+                IndexChange::Remove { id, entry } => {
+                    self.push_overlay(*id, Some(entry.attributes()), None);
+                }
+            }
+        }
+        true
+    }
+
     /// Re-applies the overlay to the maps, for the one moment the file stops being the answer.
     ///
     /// Called from `materialize`, which is the snapshot rewrite and nothing else: the maps are
@@ -1725,6 +1783,7 @@ impl Index {
             .collect();
 
         let overlay = std::mem::take(&mut self.overlay);
+        self.overlay_ids.clear();
         for record in overlay {
             if let Some(before) = &record.before {
                 let entry = Entry::new("", before.clone());
