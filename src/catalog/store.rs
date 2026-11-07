@@ -38,6 +38,7 @@ use redb::{
 };
 use std::path::Path;
 
+use super::index::{Plan, Postings};
 use crate::model::{Attribute, Attributes, Entry};
 
 /// Reversed DN to record.
@@ -47,7 +48,7 @@ const DN_ID: TableDefinition<&str, u64> = TableDefinition::new("dn_id");
 /// Id to DN.
 const ID_DN: TableDefinition<u64, &str> = TableDefinition::new("id_dn");
 /// `next_id` and the format version.
-const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 /// The format this build writes. A store written by another version is refused rather than read:
 /// a misread record is a wrong answer, and there is no way to tell it from a right one afterwards.
@@ -125,6 +126,9 @@ fn depth_of(key: &str) -> usize {
 /// The store itself.
 pub struct Store {
     database: Database,
+    /// Which kinds of index to maintain. Empty means no postings are written and every query has
+    /// to scan, which is what an unconfigured directory does.
+    plan: Plan,
 }
 
 impl Store {
@@ -136,7 +140,10 @@ impl Store {
     /// this default is the one every benchmark in `docs/ub-log.md` was taken with.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let database = Database::create(path).map_err(database)?;
-        let store = Self { database };
+        let store = Self {
+            database,
+            plan: Plan::empty(),
+        };
         store.check_format()?;
         Ok(store)
     }
@@ -146,9 +153,28 @@ impl Store {
         let database = Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .map_err(database)?;
-        let store = Self { database };
+        let store = Self {
+            database,
+            plan: Plan::empty(),
+        };
         store.check_format()?;
         Ok(store)
+    }
+
+    /// The same store, maintaining the postings this plan names.
+    ///
+    /// Set once, before anything is written: a plan changed halfway through a run would leave
+    /// postings for the attributes it used to name and none for the ones it now names, and the index
+    /// would answer half its questions from a state nobody can reconstruct.
+    #[must_use]
+    pub fn with_plan(mut self, plan: Plan) -> Self {
+        self.plan = plan;
+        self
+    }
+
+    /// The plan this store maintains.
+    pub fn plan(&self) -> &Plan {
+        &self.plan
     }
 
     /// Refuses a store written by another format, and stamps an empty one.
@@ -182,6 +208,15 @@ impl Store {
                 Ok(())
             }
         }
+    }
+
+    /// A read transaction, for the postings and for anything that has to see one consistent state.
+    ///
+    /// Handed out rather than wrapped because reading the index is a dozen small queries and each
+    /// one wants the same snapshot: a page read twice inside one transaction cannot change under the
+    /// reader, and redb is what owns that guarantee.
+    pub fn read(&self) -> Result<redb::ReadTransaction, StoreError> {
+        self.database.begin_read().map_err(database)
     }
 
     /// The record for a DN, with its id.
@@ -273,18 +308,21 @@ impl Store {
         let mut write = self.database.begin_write().map_err(database)?;
         write.set_durability(Durability::None).map_err(database)?;
 
-        let mut next_id = {
-            let meta = write.open_table(META).map_err(database)?;
-            meta.get(NEXT_ID)
-                .map_err(database)?
-                .map(|value| value.value())
-                .unwrap_or(1)
-        };
+        // `meta` is opened once for the whole transaction and threaded through: redb refuses a
+        // second open of the same table inside one write, and the counter, the format stamp and the
+        // learned case-sensitivity all live there.
+        let mut meta = write.open_table(META).map_err(database)?;
+        let mut next_id = meta
+            .get(NEXT_ID)
+            .map_err(database)?
+            .map(|value| value.value())
+            .unwrap_or(1);
 
         {
             let mut entries = write.open_table(ENTRIES).map_err(database)?;
             let mut dn_id = write.open_table(DN_ID).map_err(database)?;
             let mut id_dn = write.open_table(ID_DN).map_err(database)?;
+            let mut postings = Postings::open(&write)?;
 
             for change in changes {
                 match change {
@@ -302,21 +340,43 @@ impl Store {
                             .map_err(database)?;
                         dn_id.insert(dn, id).map_err(database)?;
                         id_dn.insert(id, dn).map_err(database)?;
+                        postings.add(&self.plan, entry, id, &mut meta)?;
                     }
                     Change::Replace { entry } => {
                         let dn = entry.dn();
-                        if dn_id.get(dn).map_err(database)?.is_none() {
+                        let Some(id) = dn_id.get(dn).map_err(database)?.map(|value| value.value())
+                        else {
                             continue;
+                        };
+                        // The old record is read before it is overwritten: the postings to remove
+                        // are the ones that were actually written, not the ones the new record says
+                        // should exist.
+                        let before = entries
+                            .get(key_of(dn).as_str())
+                            .map_err(database)?
+                            .and_then(|value| decode(value.value()));
+                        if let Some(before) = before {
+                            postings.remove(&self.plan, &before, id, &mut meta)?;
                         }
+
                         entries
                             .insert(key_of(dn).as_str(), encode(entry).as_slice())
                             .map_err(database)?;
+                        postings.add(&self.plan, entry, id, &mut meta)?;
                     }
                     Change::Remove { dn } => {
                         let Some(id) = dn_id.get(dn.as_str()).map_err(database)?.map(|v| v.value())
                         else {
                             continue;
                         };
+                        let before = entries
+                            .get(key_of(dn).as_str())
+                            .map_err(database)?
+                            .and_then(|value| decode(value.value()));
+                        if let Some(before) = before {
+                            postings.remove(&self.plan, &before, id, &mut meta)?;
+                        }
+
                         entries.remove(key_of(dn).as_str()).map_err(database)?;
                         dn_id.remove(dn.as_str()).map_err(database)?;
                         id_dn.remove(id).map_err(database)?;
@@ -326,9 +386,10 @@ impl Store {
                 }
             }
 
-            let mut meta = write.open_table(META).map_err(database)?;
             meta.insert(NEXT_ID, next_id).map_err(database)?;
+            drop(postings);
         }
+        drop(meta);
 
         write.commit().map_err(database)?;
         Ok(next_id)

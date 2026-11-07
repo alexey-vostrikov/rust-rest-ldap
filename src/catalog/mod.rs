@@ -23,6 +23,7 @@
 //! is the same on every read, which is what paging needs.
 use std::sync::Arc;
 
+pub mod index;
 pub mod store;
 
 use crate::catalog::store::{Change, Store, StoreError};
