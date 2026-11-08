@@ -64,5 +64,8 @@ pub mod sasl;
 pub mod schema;
 pub mod security;
 pub mod server;
+/// Security identifiers: the binary form AD stores, the text form Windows prints, and the rule that
+/// a RID is handed out once.
+pub mod sid;
 pub mod tls;
 pub mod yaml_export;
