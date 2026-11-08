@@ -31,8 +31,9 @@ fn realm() -> Arc<dyn rust_heimdal_kdc::hdb::Hdb> {
     }
     db.insert(krbtgt).expect("the krbtgt entry");
 
-    let mut alice =
-        HdbEntry::user(Principal::parse(&format!("alice@{REALM}")).expect("a well-formed principal"));
+    let mut alice = HdbEntry::user(
+        Principal::parse(&format!("alice@{REALM}")).expect("a well-formed principal"),
+    );
     for enctype in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
         alice
             .add_password_key(&cipher, enctype, PASSWORD.as_bytes(), 1)

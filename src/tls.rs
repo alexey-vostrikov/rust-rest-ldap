@@ -42,6 +42,24 @@ pub fn acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor, TlsErr
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// The RFC 5929 `tls-server-end-point` channel binding for the configured certificate.
+///
+/// This is what ties a Kerberos ticket to *this* TLS session: a ticket captured from one session
+/// cannot be replayed into another, because the binding the client computed is over the certificate
+/// of the session it was captured on. It is computed here rather than per bind because it is a
+/// property of the certificate, which changes only when the server restarts with a new one.
+///
+/// `None` means "no binding is defined for this certificate": RFC 5929 §4 names the hash of the
+/// certificate's signature algorithm, and there is none for Ed25519. Reporting `None` is honest -
+/// a binding invented for such a certificate would be one no client computes.
+pub fn channel_binding(cert_path: &Path) -> Result<Option<krb5::ChannelBindings>, TlsError> {
+    let certs = load_certs(cert_path)?;
+    let Some(leaf) = certs.first() else {
+        return Ok(None);
+    };
+    Ok(krb5::ChannelBindings::tls_server_end_point(leaf.as_ref()))
+}
+
 fn server_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig, TlsError> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
@@ -137,6 +155,38 @@ mod tests {
             err.to_string(),
             format!("no certificate found in '{}'", cert.display())
         );
+    }
+
+    #[test]
+    fn the_channel_binding_is_computed_from_the_certificate_that_is_presented() {
+        // RFC 5929 §4: `tls-server-end-point:` and the hash of the certificate's DER, with the hash
+        // taken from its signature algorithm. The test pins both halves: the label, and that the
+        // hash is over the same bytes the client sees on the wire - so it compares against
+        // `rustls_pemfile`'s own DER rather than against a hash this code computed twice.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate");
+        let cert = write_pem(dir.path(), "cert.pem", &generated.cert.pem());
+
+        let binding = channel_binding(&cert)
+            .expect("readable")
+            .expect("a binding for this certificate");
+
+        use sha2::Digest as _;
+        let der = generated.cert.der();
+        let expected = sha2::Sha256::digest(der.as_ref()).to_vec();
+        let mut want = b"tls-server-end-point:".to_vec();
+        want.extend_from_slice(&expected);
+        assert_eq!(binding.application_data, want[..]);
+    }
+
+    #[test]
+    fn a_certificate_that_cannot_be_read_has_no_binding() {
+        // Not an error that stops a bind: the acceptor fails on the same file with a better message,
+        // and a binding computed from half a file is worse than none.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.pem");
+        assert!(channel_binding(&missing).is_err());
     }
 
     #[test]

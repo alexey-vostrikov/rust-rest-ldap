@@ -199,6 +199,13 @@ pub struct Security {
     pub ldaps: bool,
     /// A certificate and key are configured, so StartTLS can be offered.
     pub starttls: bool,
+    /// The RFC 5929 `tls-server-end-point` binding for that certificate, when one is defined.
+    ///
+    /// Handed to the Kerberos acceptor, which then refuses a ticket whose client bound it to a
+    /// different TLS session. `None` is "no binding": either no certificate, or one whose signature
+    /// algorithm names no hash. That is not a weakened check - it is the same check a client that
+    /// sent no binding gets, and sending no binding was always allowed.
+    pub channel_binding: Option<krb5::ChannelBindings>,
     /// Uniqueness and referential integrity of account attributes.
     pub integrity: IntegrityConfig,
     /// The published schema: writes are checked against it in `strict` mode.
@@ -255,6 +262,7 @@ impl Default for Security {
             allow_unencrypted_bind: false,
             ldaps: false,
             starttls: false,
+            channel_binding: None,
             integrity: IntegrityConfig::default(),
             schema: shared_schema(Schema::core()),
             schema_mode: SchemaMode::Strict,
@@ -302,6 +310,13 @@ impl Security {
             // Both, because the same certificate serves LDAPS and StartTLS and
             // config load already refuses use_tls without material.
             starttls: config.server_cert.is_some() && config.server_key.is_some(),
+            // Computed once, from the certificate that will be presented. A read error here is not
+            // fatal: `tls::acceptor` fails on it a moment later with the better message, and a
+            // binding computed from half a file would be worse than none.
+            channel_binding: config
+                .server_cert
+                .as_deref()
+                .and_then(|path| crate::tls::channel_binding(path).ok().flatten()),
             integrity: config.integrity.clone(),
             schema: shared_schema(config.schema.clone()),
             schema_mode: config.schema_mode,

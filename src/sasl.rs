@@ -17,9 +17,7 @@
 //!
 //! The usual way to accept a Kerberos ticket is to link `libgssapi`. That would end the rule this
 //! server is built on, so the accept path uses [`krb5`] instead: pure Rust, ticket decryption,
-//! authenticator checks, the PAC and replay detection included. The one thing this module does not
-//! do is channel binding (`tls-server-end-point`), which is a recorded limitation and the reason a
-//! ticket is only accepted on a TLS connection.
+//! authenticator checks, the PAC, channel bindings and replay detection included.
 //!
 //! # The mapping, and why it refuses
 //!
@@ -329,11 +327,7 @@ impl Gssapi {
     /// `None` when the realm is not configured - and that is a refusal, not a fallback: a ticket
     /// from a realm nobody mapped has no honest subtree, and inventing one would put a stranger's
     /// principal into somebody's directory.
-    pub fn identity(
-        &self,
-        principal: &krb5::Principal,
-        base_dn: &str,
-    ) -> Option<Identity> {
+    pub fn identity(&self, principal: &krb5::Principal, base_dn: &str) -> Option<Identity> {
         let realm = self.realms.get(&principal.realm.to_ascii_uppercase())?;
 
         let user = principal.components.first()?.clone();

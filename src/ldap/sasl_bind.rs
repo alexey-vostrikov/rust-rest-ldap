@@ -22,9 +22,12 @@
 //!   underneath it would be a second encryption whose failures nobody tests. The login is
 //!   therefore only accepted on an encrypted connection, where the ticket cannot be captured in
 //!   the first place.
-//! - **No channel binding.** `tls-server-end-point` would tie the ticket to the TLS session and
-//!   `krb5` supports it, but this module does not pass an acceptor binding yet. This is a recorded
-//!   limitation, and the reason a plaintext GSSAPI bind is refused.
+//! - **Channel binding is offered, not required.** The acceptor is given the RFC 5929
+//!   `tls-server-end-point` binding computed from the certificate this server presents, so a client
+//!   that bound its ticket is refused when the binding does not match. A client that sends none is
+//!   accepted, which is MIT's rule and the reason this cannot break a working client - and it is
+//!   also why a plaintext GSSAPI bind is still refused: nothing binds a captured ticket to a session
+//!   that has no certificate.
 //! - **No proxy authorization** from the SASL authzid. The token carries an optional requested
 //!   identity, and honouring it without an ACL check named for that operation would be a way to
 //!   become somebody else.
@@ -293,6 +296,13 @@ fn begin(
     // this call.
     let mut options = krb5::acceptor::AcceptOptions::default();
     options.replay_cache = Some(gssapi.replay());
+    // RFC 5929 `tls-server-end-point`, when this server has a certificate to compute it from.
+    //
+    // What it buys, in krb5's own terms: a client that bound its ticket to a TLS session must have
+    // bound it to *this* one, or the ticket is refused. A client that sent no binding is accepted
+    // as before - which is why turning this on cannot break a client that was working, and why a
+    // ticket captured off a plaintext connection is still only stopped by the TLS rule above.
+    options.channel_bindings = security.channel_binding.clone();
     let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(gssapi.keytab(), options);
 
     let reply = acceptor
@@ -300,9 +310,9 @@ fn begin(
         .map_err(|err| SaslError::Ticket(err.to_string()))?
         .ok_or_else(|| SaslError::Ticket("the acceptor produced no reply".to_string()))?;
 
-    let context = acceptor
-        .into_context()
-        .ok_or_else(|| SaslError::Ticket("the ticket was accepted without a context".to_string()))?;
+    let context = acceptor.into_context().ok_or_else(|| {
+        SaslError::Ticket("the ticket was accepted without a context".to_string())
+    })?;
 
     // The policy, applied to what the ticket claims. A refusal here is a failed bind with the
     // reason attached: the client's Kerberos credentials are genuine and the ticket is still
@@ -785,10 +795,11 @@ mod tests {
     /// Not `wrap_signed`, which produces an acceptor token - that is what the server sends, and its
     /// flag is what tells a reader which side made it. A test that used the server's wrapper to
     /// stand in for a client would be testing the wrong direction and would never notice.
-    fn client_choice(payload: &[u8], tokens: &krb5::token::PerMessageTokens<krb5::token::ContextKey>) -> Vec<u8> {
-        tokens
-            .emit_wrap(0, payload)
-            .expect("an initiator wrap")
+    fn client_choice(
+        payload: &[u8],
+        tokens: &krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+    ) -> Vec<u8> {
+        tokens.emit_wrap(0, payload).expect("an initiator wrap")
     }
 
     /// A session holding an exchange at a given stage with a known key.
