@@ -3,7 +3,7 @@
 //! A client that holds a copy of the directory asks "what does it hold now, and what changed
 //! since this cookie", and this module is the vocabulary for both answers.
 //!
-//! ```
+//! ```text
 //! syncRequestValue ::= SEQUENCE {
 //!      mode       ENUMERATED { refreshOnly (1), refreshAndPersist (3) },
 //!      cookie     syncCookie OPTIONAL,
