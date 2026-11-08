@@ -242,6 +242,33 @@ struct Round {
     diagnostic: String,
 }
 
+/// The acceptor's options, as one function rather than three statements in `begin`.
+///
+/// Split out for one reason: what the server *passes* to the acceptor cannot be observed from a test
+/// that drives the acceptor directly, and a mutation that replaced the channel binding with `None`
+/// left every test green while quietly removing the protection. A function with a return value is
+/// something a test can read.
+///
+/// `AcceptOptions` is `#[non_exhaustive]`, so it is built from `default()` and then adjusted - which
+/// is how the crate documents it, so a field added in a later version does not break this call.
+fn accept_options(
+    security: &Security,
+    gssapi: &crate::sasl::Gssapi,
+) -> krb5::acceptor::AcceptOptions {
+    let mut options = krb5::acceptor::AcceptOptions::default();
+    // One cache for the whole process: a captured AP-REQ replayed on a *new* connection has to be
+    // refused, and a per-connection cache would refuse nothing.
+    options.replay_cache = Some(gssapi.replay());
+    // RFC 5929 `tls-server-end-point`, when this server has a certificate to compute it from.
+    //
+    // What it buys, in krb5's own terms: a client that bound its ticket to a TLS session must have
+    // bound it to *this* one, or the ticket is refused. A client that sent no binding is accepted
+    // as before - which is why turning this on cannot break a client that was working, and why a
+    // ticket captured off a plaintext connection is still only stopped by the TLS rule above.
+    options.channel_bindings = security.channel_binding.clone();
+    options
+}
+
 /// The first round: accept the ticket, answer with the server's half.
 fn begin(
     session: &mut Session,
@@ -291,18 +318,7 @@ fn begin(
 
     // One cache for the whole process: a captured AP-REQ replayed on a *new* connection has to be
     // refused, and a per-connection cache would refuse nothing.
-    // `AcceptOptions` is `#[non_exhaustive]`, so it is built from `default()` and then adjusted -
-    // which is also how the crate documents it, so a field added in a later version does not break
-    // this call.
-    let mut options = krb5::acceptor::AcceptOptions::default();
-    options.replay_cache = Some(gssapi.replay());
-    // RFC 5929 `tls-server-end-point`, when this server has a certificate to compute it from.
-    //
-    // What it buys, in krb5's own terms: a client that bound its ticket to a TLS session must have
-    // bound it to *this* one, or the ticket is refused. A client that sent no binding is accepted
-    // as before - which is why turning this on cannot break a client that was working, and why a
-    // ticket captured off a plaintext connection is still only stopped by the TLS rule above.
-    options.channel_bindings = security.channel_binding.clone();
+    let options = accept_options(security, gssapi);
     let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(gssapi.keytab(), options);
 
     let reply = acceptor
@@ -632,6 +648,47 @@ mod tests {
     /// that expires.
     fn ap_req_bytes() -> Vec<u8> {
         vec![0x6e, 0x02, 0xaa, 0xbb]
+    }
+
+    /// What the server hands the acceptor, read back.
+    ///
+    /// The mutation this holds against: replacing `options.channel_bindings = ...` with `None` used
+    /// to leave every test green, because `tests/channel_binding.rs` drives the acceptor directly
+    /// and proves the RFC 5929 arithmetic without ever asking whether the server passes a binding
+    /// at all. The arithmetic was right and the wiring could have been absent - the protection lives
+    /// in the second, and it is the second this reads.
+    #[test]
+    fn the_acceptor_is_given_the_servers_channel_binding() {
+        let (security, _dir) = security_with_keytab();
+        let gssapi = security
+            .gssapi
+            .clone()
+            .expect("the fixture has an acceptor");
+
+        // A server with no certificate has no binding to give, and `None` is the honest answer: an
+        // invented one is a binding no client computes.
+        let bare = accept_options(&security, &gssapi);
+        assert!(bare.channel_bindings.is_none());
+
+        // With one, it is the same binding - not a copy that could drift, and not dropped on the way.
+        let binding = krb5::ChannelBindings::new(b"tls-server-end-point:the-certificate".to_vec());
+        let mut security = security;
+        security.channel_binding = Some(binding.clone());
+        let options = accept_options(&security, &gssapi);
+
+        assert_eq!(
+            options
+                .channel_bindings
+                .as_ref()
+                .map(|b| b.application_data.clone()),
+            Some(binding.application_data),
+        );
+        // The cache as well: a per-connection one would refuse no replay at all, and its absence is
+        // as silent as a missing binding.
+        assert!(
+            options.replay_cache.is_some(),
+            "the replay cache is process-wide"
+        );
     }
 
     /// A security policy that has an acceptor, so the SASL path is reachable in a test.
