@@ -552,14 +552,30 @@ fn resolve_identity(
 
 /// Verifies and returns the payload of the client's security-layer token.
 ///
-/// RFC 4752 §3.1: the client's choice comes back sealed, and `unwrap` hands back the payload only
-/// after the MIC over it has been checked - there is no path here that yields bytes it has not
-/// verified.
+/// RFC 4752 §3.1: the client's choice comes back protected by the negotiated layer, and
+/// `unwrap` hands back the payload only after the MIC over it has been checked - there is no path
+/// here that yields bytes it has not verified.
+///
+/// Both protections are accepted, and that is the whole point of this function. A client that
+/// negotiates "no layer" still protects its choice **with integrity**: cyrus-sasl, and therefore
+/// every OpenLDAP and Samba client, sends a Wrap token with `Sealed` clear. Reading it with the
+/// sealed reader fails with "Wrap token has Sealed=false, but the privacy service was requested",
+/// which reads like a defect in the token and was a defect in the reading - it cost a live
+/// debugging session against a real `ldapsearch`, and the unit tests missed it because they built
+/// the choice with `emit_wrap`, the sealed spelling, and so only ever exercised half the wire.
 fn unwrap_signed(
     token: &[u8],
     tokens: &krb5::token::PerMessageTokens<krb5::token::ContextKey>,
 ) -> Result<Vec<u8>, SaslError> {
-    tokens.unwrap(token).map(|verified| verified.message).map_err(|err| {
+    // RFC 4121 §4.2.2: bit 1 of the Flags octet, the third octet of the token header.
+    const SEALED: u8 = 0x02;
+    let sealed = token.get(2).is_some_and(|flags| flags & SEALED != 0);
+    let verified = if sealed {
+        tokens.unwrap(token)
+    } else {
+        tokens.verify_wrap_unsealed(token)
+    };
+    verified.map(|verified| verified.message).map_err(|err| {
         SaslError::Layer(format!(
             "the client's security-layer choice could not be unwrapped: {err}"
         ))
@@ -915,6 +931,83 @@ mod tests {
             body.diagnostic_message.0
         );
         assert_eq!(session.sasl_stage(), None, "and the exchange is dropped");
+    }
+
+    #[test]
+    fn a_choice_protected_with_integrity_only_is_accepted() {
+        // What every cyrus-sasl client actually sends: RFC 4752 §3.1 says the choice is protected
+        // "in the negotiated layer", and with no confidentiality that is a Wrap token whose
+        // `Sealed` bit is clear. Reading it with the sealed reader produced "Wrap token has
+        // Sealed=false, but the privacy service was requested" against a live `ldapsearch` — a
+        // defect in the reading, not in the token, and invisible to every other test here because
+        // they all built the choice with `emit_wrap`.
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::ChoiceExpected);
+        let choice = initiator_tokens()
+            .emit_wrap_unsealed(0, &[0x01, 0x00, 0x00, 0x00], 0)
+            .expect("an integrity-only wrap");
+
+        let directory = crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        );
+
+        let response = handle_gssapi(
+            &mut session,
+            &directory,
+            1,
+            &gssapi_request(Some(choice)),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(
+            body.result_code,
+            ResultCode::Success,
+            "an integrity-only choice must be read: {}",
+            body.diagnostic_message.0
+        );
+        assert_eq!(session.sasl_stage(), None);
+    }
+
+    #[test]
+    fn a_choice_with_no_protection_at_all_is_refused() {
+        // The other half of the same decision: accepting integrity-only must not become accepting
+        // anything. A token whose MIC does not verify is a client that cannot process what the
+        // server sent, which is exactly what round three exists to prove.
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::ChoiceExpected);
+        let mut choice = initiator_tokens()
+            .emit_wrap_unsealed(0, &[0x01, 0x00, 0x00, 0x00], 0)
+            .expect("an integrity-only wrap");
+        // Flip a bit in the checksum, which is the last octets of the token.
+        let last = choice.len() - 1;
+        choice[last] ^= 0x01;
+
+        let directory = crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        );
+
+        let response = handle_gssapi(
+            &mut session,
+            &directory,
+            1,
+            &gssapi_request(Some(choice)),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::InvalidCredentials);
+        assert!(
+            body.diagnostic_message.0.contains("could not be unwrapped"),
+            "{}",
+            body.diagnostic_message.0
+        );
     }
 
     #[test]
