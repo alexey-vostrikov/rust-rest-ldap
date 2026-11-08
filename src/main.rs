@@ -702,6 +702,49 @@ async fn serve() {
         None
     };
 
+    // The KDC, when asked for. It reads the realm out of the same directory this process serves, so
+    // a password changed over LDAP is the key checked on the very next request; the one thing the
+    // directory cannot give it is the realm's master password, and that is read once, on the first
+    // start that has no `krbtgt` yet.
+    #[cfg(feature = "kdc")]
+    let _kdc = if config.kerberos.enabled {
+        let ip = match listener.local_addr().map(|addr| addr.ip()) {
+            Ok(ip) => ip,
+            Err(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        };
+        let settings = match rust_rest_ldap::kerberos::Settings::resolve(
+            &config.kerberos,
+            &config.base_dn,
+            ip,
+        ) {
+            Ok(settings) => settings,
+            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+        };
+        match rust_rest_ldap::kerberos::serve::start(
+            &settings,
+            Arc::clone(&source),
+            config.base_dn.clone(),
+            config.kerberos.master_key_file.as_deref(),
+            shutdown_rx.clone(),
+        )
+        .await
+        {
+            Ok(running) => {
+                // Said out loud because it is what a client is told to trust: the realm name is
+                // what a machine is joined to, and a typo here costs an afternoon of "cannot
+                // contact any KDC" before anybody reads this line.
+                println!(
+                    "kerberos: issuing tickets for {} on {} (tcp and udp)",
+                    running.realm, running.bind
+                );
+                Some(running)
+            }
+            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+        }
+    } else {
+        None
+    };
+
     let reloading = tokio::spawn(rust_rest_ldap::reload::reload_on_interval_with(
         Arc::clone(&source),
         config.update_interval,

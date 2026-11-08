@@ -53,6 +53,8 @@ fn raw_person(cn: &str) -> Entry {
 
 async fn serve(entries: Vec<Entry>) -> String {
     let config = Config {
+        #[cfg(feature = "kdc")]
+        kerberos: Default::default(),
         cldap: Default::default(),
         cache: Default::default(),
         backend: "redb".to_string(),

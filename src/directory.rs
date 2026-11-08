@@ -359,7 +359,11 @@ impl Directory {
 
         let mut by_dn = HashMap::with_capacity(entries.len());
         for (position, entry) in entries.iter().enumerate() {
-            by_dn.insert(entry.dn().to_string(), ids[position]);
+            // Normalized, because `find` normalizes what it is given: a map keyed on the raw DN
+            // answers only for entries that happen to be written in lower case, and a principal
+            // `alice@EXAMPLE.COM` - or any entry an import wrote with capitals - is then in the
+            // directory and unfindable.
+            by_dn.insert(crate::dn::normalize(entry.dn()), ids[position]);
         }
 
         // Built once here rather than lazily: a directory assembled by a start is about to be read,
@@ -502,7 +506,7 @@ impl Directory {
         config: &IndexConfig,
     ) -> Result<bool, crate::index::IndexError> {
         let entry_dn = entry.dn().to_string();
-        if self.by_dn.contains_key(&entry_dn) {
+        if self.by_dn.contains_key(&crate::dn::normalize(&entry_dn)) {
             return Ok(false);
         }
 
@@ -539,7 +543,7 @@ impl Directory {
         // entry is in `entries` and `ids` and no lookup can find it, so an add whose parent was just
         // created fails with "the parent entry does not exist".
         self.by_dn
-            .insert(self.entries[position].dn().to_string(), id);
+            .insert(crate::dn::normalize(self.entries[position].dn()), id);
         self.shift_positions(position);
 
         // The same copy-on-write as a replace: unique here means patched in place, shared means
@@ -1830,6 +1834,37 @@ mod tests {
                 "expected to find {expected}"
             );
         }
+    }
+
+    #[test]
+    fn an_entry_whose_dn_has_capitals_is_found() {
+        // The realm's entries are named `krb5PrincipalName=krbtgt/EXAMPLE.COM@EXAMPLE.COM,...`, and
+        // a DN map keyed on the raw string answered for lower-case DNs only: the entry sat in
+        // `all()` and `find` returned nothing, which is how a KDC provisioned its `krbtgt` and then
+        // could not read it back. Any imported entry with a capital - a `CN=Alice`, a realm - was in
+        // the same state.
+        let dn = "krb5PrincipalName=alice@EXAMPLE.COM,krb5RealmName=EXAMPLE.COM,dc=example,dc=com";
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![Entry::new(
+                dn,
+                Attributes::new().push(Attribute::single("objectClass", "krb5Principal")),
+            )],
+        );
+
+        assert_eq!(
+            directory.find(dn).map(|entry| entry.dn()),
+            Some(dn),
+            "an entry is found by the DN it was stored under"
+        );
+        // LDAP compares DNs case-insensitively, so the lower-case spelling has to answer too - and
+        // answer with the entry as it was written, not with a lower-cased copy of it.
+        assert_eq!(
+            directory.find(&dn.to_lowercase()).map(|entry| entry.dn()),
+            Some(dn)
+        );
     }
 
     #[test]

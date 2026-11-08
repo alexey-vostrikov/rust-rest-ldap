@@ -185,6 +185,8 @@ mod tests {
         std::fs::write(&groups_path, "[]").expect("groups");
 
         let config = crate::config::Config {
+            #[cfg(feature = "kdc")]
+            kerberos: crate::kerberos::KerberosConfig::default(),
             cldap: Default::default(),
             cache: crate::record_cache::CacheConfig::default(),
             backend: "file".to_string(),

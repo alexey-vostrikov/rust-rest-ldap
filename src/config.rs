@@ -313,6 +313,13 @@ pub struct Config {
     /// Off unless an operator turns it on: a reply to a ping says "this address is a domain
     /// controller", and this server runs no KDC, so a machine sent here would fail one step later.
     pub cldap: crate::cldap::CldapConfig,
+    /// Whether to run a KDC on port 88, and for which realm.
+    ///
+    /// Off unless an operator turns it on, for the reason `cldap` is off: answering on 88 promises
+    /// tickets, and a promise this server does not keep is a client timeout that reads like a
+    /// network fault.
+    #[cfg(feature = "kdc")]
+    pub kerberos: crate::kerberos::KerberosConfig,
     /// Where the change journal goes, if anywhere.
     pub observability: ObservabilityConfig,
     /// The first administrator of an empty store, if the operator configured one.
@@ -480,6 +487,10 @@ struct FileConfig {
     /// CLDAP ping, off unless asked for.
     #[serde(default)]
     cldap: crate::cldap::CldapConfig,
+    /// The KDC, off unless asked for.
+    #[cfg(feature = "kdc")]
+    #[serde(default)]
+    kerberos: crate::kerberos::KerberosConfig,
     /// Subtrees held elsewhere: `- dn: dc=remote,dc=com` with the URL a client should ask.
     #[serde(default)]
     referrals: Vec<ReferralConfig>,
@@ -851,6 +862,8 @@ pub fn resolve(
         limits: crate::limits::Limits::from_config(&file.limits),
         cache: file.cache,
         cldap: file.cldap,
+        #[cfg(feature = "kdc")]
+        kerberos: file.kerberos.clone(),
         observability: file.observability,
         locale: {
             // The configuration wins over the host: an operator who wrote `locale: ru`
@@ -923,8 +936,22 @@ pub fn resolve(
             // claiming to stand in for a domain controller, and a client from that world asks for
             // `userPrincipalName` and `userAccountControl` by name. A server without a keytab
             // publishes neither, so nothing invites a client to rely on flags it does not maintain.
-            if file.sasl.keytab.is_some() {
+            //
+            // A KDC is the other way into that world, and it needs both vocabularies: the
+            // Microsoft one for the clients, and the realm's own (`krb5Principal`, `krb5Key`) for
+            // the entries it provisions. Without the second, strict validation refuses the
+            // `krbtgt` the server writes for itself and the realm never starts.
+            #[cfg(feature = "kdc")]
+            let runs_a_kdc = file.kerberos.enabled;
+            #[cfg(not(feature = "kdc"))]
+            let runs_a_kdc = false;
+
+            if file.sasl.keytab.is_some() || runs_a_kdc {
                 crate::ad_schema::extend(&mut schema).map_err(ConfigError::AdSchema)?;
+            }
+            #[cfg(feature = "kdc")]
+            if runs_a_kdc {
+                crate::kerberos::schema::extend(&mut schema).map_err(ConfigError::AdSchema)?;
             }
 
             schema

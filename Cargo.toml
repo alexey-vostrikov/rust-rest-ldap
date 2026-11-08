@@ -63,8 +63,19 @@ uuid = { version = "1.29.0", features = ["v5"] }
 webpki-roots = "1.0.4"
 yescrypt = "0.1.0"
 
-# The KDC is a library, and this crate uses it the way a directory server would: an in-process
-# realm to run a bind against, instead of requiring a daemon and a keytab on the test host.
+# The KDC engine, for the two ways this crate uses it. In the daemon it answers port 88 in this
+# process, reading the realm out of this server's own directory - which is the whole point of a
+# self-contained domain: one process, one store, no second daemon to keep in step. In the tests it
+# is an in-process realm to run a bind against, instead of a keytab on the test host.
+#
+# Optional because a directory server that does not issue tickets should not carry a KDC, and
+# `RUST_HEIMDAL_KDC`-free builds stay what they were.
+rust-heimdal-kdc = { path = "../rust-heimdal-kdc", optional = true, features = ["hdb-ldap"] }
+
+[features]
+# Port 88: AS-REQ, TGS-REQ, and `krbtgt/<REALM>` provisioned on first start.
+kdc = ["dep:rust-heimdal-kdc"]
+
 [dev-dependencies]
 rust-heimdal-kdc = { path = "../rust-heimdal-kdc" }
 futures = "0.3.34"

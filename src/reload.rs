@@ -1738,6 +1738,8 @@ mod tests {
 
     fn config(users: &str, groups: &str) -> Config {
         let mut config = Config {
+            #[cfg(feature = "kdc")]
+            kerberos: crate::kerberos::KerberosConfig::default(),
             cache: crate::record_cache::CacheConfig::default(),
             cldap: Default::default(),
             backend: "file".to_string(),

@@ -34,6 +34,13 @@ pub mod index;
 pub mod index_check;
 pub mod index_file;
 pub mod integrity;
+/// The KDC in this process: port 88, and the realm read out of this server's own directory.
+///
+/// Behind a feature rather than always built, because a directory that does not issue tickets should
+/// not carry the code that can: the KDC engine is a dependency with its own crypto, and an operator
+/// who has not asked for a realm should not be running one.
+#[cfg(feature = "kdc")]
+pub mod kerberos;
 pub mod ldap;
 pub mod ldif;
 pub mod ldif_read;
