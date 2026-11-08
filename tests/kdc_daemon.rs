@@ -130,6 +130,112 @@ async fn a_client_logs_in_against_the_daemon() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_framed_request_over_tcp_gets_a_framed_reply() {
+    // The TCP path is not an alternative for a client that prefers it: it carries every reply too
+    // large for a datagram, and MIT pipelines several requests down one connection. So what is
+    // checked here is the framing itself (RFC 4120 §7.2.2: four octets of length, big endian, then
+    // the message) and that the connection stays open for the next request - a server that closed
+    // after one would work in a test and break the first client that asked twice.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = source_with_account(dir.path(), "alice").await;
+    let master = master_file(dir.path());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let running = serve::start(
+        &settings(REALM),
+        Arc::clone(&source),
+        BASE_DN.to_string(),
+        Some(&master),
+        shutdown_rx,
+    )
+    .await
+    .expect("the KDC starts");
+
+    let mut stream = tokio::net::TcpStream::connect(running.bind)
+        .await
+        .expect("connected");
+
+    // Deliberately not a valid request: the engine answers a decode failure with a KRB-ERROR, which
+    // is a message like any other. What is being tested is the transport, and a real ticket here
+    // would only add a fixture that expires.
+    for attempt in 0..3 {
+        let request = [0x6e, 0x02, 0xaa, 0xbb];
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(request.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&request);
+        stream.write_all(&framed).await.expect("written");
+
+        let mut length = [0u8; 4];
+        stream
+            .read_exact(&mut length)
+            .await
+            .unwrap_or_else(|err| panic!("reply {attempt} was not framed: {err}"));
+        let length = u32::from_be_bytes(length) as usize;
+        assert!(length > 0, "the KDC answers every request, even a bad one");
+
+        let mut reply = vec![0u8; length];
+        stream.read_exact(&mut reply).await.expect("the reply body");
+        // A KRB-ERROR is `[APPLICATION 30]`; an AS-REP would be 11. Either way the first octet is
+        // an application tag, which is what says a message came back rather than a fragment of one.
+        assert_eq!(reply[0] & 0xE0, 0x60, "the reply is a BER application tag");
+    }
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_length_no_message_could_have_closes_the_connection() {
+    // Four octets are taken on trust by a length-prefixed protocol, and a server that allocated what
+    // they asked for would serve a memory exhaustion to anyone who could open a socket. Zero is
+    // refused for the other reason: it is a subtraction that would underflow.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = source_with_account(dir.path(), "alice").await;
+    let master = master_file(dir.path());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let running = serve::start(
+        &settings(REALM),
+        Arc::clone(&source),
+        BASE_DN.to_string(),
+        Some(&master),
+        shutdown_rx,
+    )
+    .await
+    .expect("the KDC starts");
+
+    for length in [0u32, 65_536] {
+        let mut stream = tokio::net::TcpStream::connect(running.bind)
+            .await
+            .expect("connected");
+        stream
+            .write_all(&length.to_be_bytes())
+            .await
+            .expect("written");
+
+        // Read to the end: the server closes the connection rather than answering. What matters is
+        // that it is the connection that ends and not the process - the next iteration proves it.
+        let mut buffer = Vec::new();
+        let _ = stream.read_to_end(&mut buffer).await;
+        assert!(
+            buffer.is_empty(),
+            "a frame of {length} is refused without a reply, got {} octets",
+            buffer.len()
+        );
+    }
+
+    // Still serving after two impossible frames: a bad header is a bad client, not an outage.
+    let client = krb5::KdcClient::new(REALM, [running.bind.to_string().as_str()]);
+    let alice = krb5::Principal::parse(&format!("alice@{REALM}")).expect("a principal");
+    client
+        .login_with_password(&alice, PASSWORD)
+        .expect("the realm still answers after refusing two frames");
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wrong_password_gets_no_ticket() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = source_with_account(dir.path(), "alice").await;

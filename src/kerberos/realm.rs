@@ -212,6 +212,202 @@ fn is_binary(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    use rust_heimdal_kdc::crypto::{Enctype, OwnCipher};
+    use rust_heimdal_kdc::hdb::Hdb as _;
+    use rust_heimdal_kdc::hdb::HdbEntry;
+    use rust_heimdal_kdc::hdb::ldap::LdapHdb;
+
+    use crate::model::{Attribute, Attributes, Entry};
+
+    const BASE: &str = "dc=example,dc=com";
+    const REALM: &str = "EXAMPLE.COM";
+
+    /// A realm view over a directory holding the entries given.
+    fn realm(entries: Vec<Entry>) -> RealmView {
+        RealmView::new(
+            REALM,
+            BASE,
+            Arc::new(Directory::from_entries(BASE, "users", "groups", entries)),
+        )
+    }
+
+    /// An account as the KDC would write it: the principal's attributes in this store's spelling.
+    fn principal_entry(name: &str, dn: Option<&str>) -> Entry {
+        let principal = Principal::parse(&format!("{name}@{REALM}")).expect("a principal");
+        let mut entry = HdbEntry::user(principal.clone());
+        entry
+            .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"pw", 1)
+            .expect("a key");
+        let dn = match dn {
+            Some(dn) => dn.to_string(),
+            None => dn_for(&principal, BASE),
+        };
+        Entry::new(dn, crate::kerberos::bootstrap::attributes_of(&entry))
+    }
+
+    #[test]
+    fn a_principal_is_read_by_the_dn_the_kdc_would_have_written() {
+        let view = realm(vec![principal_entry("alice", None)]);
+        let alice = Principal::parse(&format!("alice@{REALM}")).expect("a principal");
+
+        let attributes = view
+            .get(&alice)
+            .expect("the read succeeds")
+            .expect("the principal is there");
+
+        assert_eq!(
+            attributes.first(attrs::PRINCIPAL_NAME),
+            Some(format!("alice@{REALM}").as_bytes())
+        );
+        // The keys come back as the octets that went in, which is the round trip base64 exists for.
+        assert!(!attributes.get(attrs::KEY).is_empty(), "the keys survived");
+    }
+
+    #[test]
+    fn an_account_is_found_where_a_person_put_it() {
+        // A directory is mostly entries nobody created for the realm's sake: an account lives at
+        // `cn=...` under the users OU, not at `krb5PrincipalName=...`. Asking an operator to keep a
+        // second copy under another DN is asking the two to drift, so the realm finds it by the name
+        // it carries - `userPrincipalName`, the Microsoft spelling a Windows client writes.
+        let entry = Entry::new(
+            format!("cn=bob,ou=users,{BASE}"),
+            Attributes::new()
+                .push(Attribute::single("objectClass", "user"))
+                .push(Attribute::single("cn", "bob"))
+                .push(Attribute::single(
+                    "userPrincipalName",
+                    &format!("bob@{REALM}"),
+                ))
+                .push(Attribute::single(
+                    "krb5PrincipalName",
+                    &format!("bob@{REALM}"),
+                ))
+                .push(Attribute::single("krb5PrincipalRealm", REALM))
+                .push(Attribute::single("krb5KeyVersionNumber", "1")),
+        );
+        let view = realm(vec![entry]);
+        let bob = Principal::parse(&format!("bob@{REALM}")).expect("a principal");
+
+        let attributes = view.get(&bob).expect("the read succeeds");
+        assert!(
+            attributes.is_some(),
+            "an account is found by its principal name, not only at the realm's own DN"
+        );
+    }
+
+    #[test]
+    fn a_principal_nobody_has_is_absent_rather_than_an_error() {
+        // The difference matters to the KDC: an absent principal is an unknown-user answer to the
+        // client, and an error is a server fault. Answering one with the other turns a typo in a
+        // login into an alarm.
+        let view = realm(vec![principal_entry("alice", None)]);
+        let nobody = Principal::parse(&format!("nobody@{REALM}")).expect("a principal");
+        assert!(view.get(&nobody).expect("the read succeeds").is_none());
+    }
+
+    #[test]
+    fn listing_names_the_principals_of_this_realm_and_no_others() {
+        // `list` is what `kadmin` would use, and what a replication or an audit tool would ask. Two
+        // things it must not do: invent a principal out of a value that is not one, and answer for
+        // another realm - this process is one realm's KDC, and a ticket for a second would be a
+        // ticket it cannot key.
+        let foreign = Entry::new(
+            format!("cn=carol,ou=users,{BASE}"),
+            Attributes::new()
+                .push(Attribute::single(
+                    "krb5PrincipalName",
+                    "carol@OTHER.EXAMPLE",
+                ))
+                .push(Attribute::single("krb5PrincipalRealm", "OTHER.EXAMPLE")),
+        );
+        let garbage = Entry::new(
+            format!("cn=dave,ou=users,{BASE}"),
+            Attributes::new().push(Attribute::single("krb5PrincipalName", "not a principal")),
+        );
+        let view = realm(vec![
+            principal_entry("alice", None),
+            principal_entry("bob", None),
+            foreign,
+            garbage,
+        ]);
+
+        let principals = view.list().expect("the listing succeeds");
+        let names: Vec<String> = principals.iter().map(|p| p.to_string()).collect();
+
+        assert!(names.contains(&format!("alice@{REALM}")), "{names:?}");
+        assert!(names.contains(&format!("bob@{REALM}")), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name.contains("carol")),
+            "another realm's principal is not ours to issue: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("dave")),
+            "a value that is not a principal is skipped rather than guessed at: {names:?}"
+        );
+    }
+
+    #[test]
+    fn writing_through_the_realm_is_refused_and_says_where_to_go() {
+        // Not a missing feature: an account has a password policy, an access check and a replication
+        // history, and all three live on the LDAP path. A KDC-side write would create the one entry
+        // in the directory that skipped them, and nothing downstream could tell it apart.
+        let view = realm(vec![principal_entry("alice", None)]);
+        let alice = Principal::parse(&format!("alice@{REALM}")).expect("a principal");
+
+        let put = view.put(&alice, &rust_heimdal_kdc::hdb::ldap::Attributes::new());
+        let delete = view.delete(&alice);
+
+        for error in [
+            put.expect_err("a write is refused"),
+            delete.expect_err("a delete is refused"),
+        ] {
+            let text = error.to_string();
+            assert!(
+                text.contains("through LDAP"),
+                "the refusal must name the path that is allowed: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_view_serves_the_snapshot_it_was_last_given() {
+        // A realm that held its own copy of the entries would be a second thing to keep in step with
+        // the directory; `refresh` is how the writer hands it the new one, and this is the read that
+        // proves the hand-over happens.
+        let view = realm(vec![principal_entry("alice", None)]);
+        let bob = Principal::parse(&format!("bob@{REALM}")).expect("a principal");
+        assert!(view.get(&bob).expect("read").is_none());
+
+        view.refresh(Arc::new(Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![principal_entry("bob", None)],
+        )));
+
+        assert!(
+            view.get(&bob).expect("read").is_some(),
+            "after a refresh the new snapshot is what is served"
+        );
+    }
+
+    #[test]
+    fn the_realm_reaches_the_kdc_through_the_adapter() {
+        // The seam itself: `LdapHdb` over this `Directory` is what the KDC is given, and a principal
+        // fetched through it has to arrive with its keys - not merely be present.
+        let view = realm(vec![principal_entry("alice", None)]);
+        let hdb = LdapHdb::new(Arc::new(view) as Arc<dyn Realm>);
+        let alice = Principal::parse(&format!("alice@{REALM}")).expect("a principal");
+
+        let entry = hdb
+            .fetch(&alice)
+            .expect("the fetch succeeds")
+            .expect("the principal is there");
+
+        assert_eq!(entry.principal, alice);
+        assert!(!entry.keys.is_empty(), "the keys crossed the adapter");
+    }
+
     #[test]
     fn a_key_attribute_is_read_as_octets() {
         use base64::Engine as _;
