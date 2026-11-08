@@ -16,10 +16,10 @@
 //! # No C
 //!
 //! The usual way to accept a Kerberos ticket is to link `libgssapi`. That would end the rule this
-//! server is built on, so the accept path uses [`rskrb5`] instead: pure Rust, ticket decryption,
-//! authenticator checks and replay detection included. The one thing it does not do is channel
-//! binding (`tls-server-end-point`), which is a recorded limitation and the reason a ticket is
-//! only accepted on a TLS connection.
+//! server is built on, so the accept path uses [`krb5`] instead: pure Rust, ticket decryption,
+//! authenticator checks, the PAC and replay detection included. The one thing this module does not
+//! do is channel binding (`tls-server-end-point`), which is a recorded limitation and the reason a
+//! ticket is only accepted on a TLS connection.
 //!
 //! # The mapping, and why it refuses
 //!
@@ -141,7 +141,7 @@ pub struct Identity {
 
 /// The accept side: a keytab, the realms it serves, and one replay cache for the process.
 pub struct Gssapi {
-    keytab: rskrb5::keytab::Keytab,
+    keytab: krb5::Keytab,
     service_principal: Option<Vec<String>>,
     realms: BTreeMap<String, Realm>,
     /// What this server trusts a PAC for.
@@ -149,8 +149,9 @@ pub struct Gssapi {
     /// One cache for every connection.
     ///
     /// Per connection would be no cache at all: a captured AP-REQ replayed on a *new* connection
-    /// would be accepted, which is precisely the attack the cache exists to stop.
-    replay: rskrb5::service::SharedReplayCache,
+    /// would be accepted, which is precisely the attack the cache exists to stop. `krb5` takes the
+    /// store as an `AcceptOptions` field, so the same cache is handed to every acceptor.
+    replay: std::sync::Arc<krb5::rcache::ReplayCache>,
 }
 
 /// Prints what was configured, never the keys.
@@ -166,7 +167,7 @@ impl std::fmt::Debug for Gssapi {
                 &self.service_principal.as_ref().map(|parts| parts.join("/")),
             )
             .field("realms", &self.realms.keys().collect::<Vec<_>>())
-            .field("keytab_entries", &self.keytab.entries().len())
+            .field("keytab_entries", &self.keytab.keys().len())
             .finish_non_exhaustive()
     }
 }
@@ -212,12 +213,12 @@ impl Gssapi {
             return Ok(None);
         };
 
-        let keytab = rskrb5::keytab::Keytab::load(path).map_err(|err| SaslError::Keytab {
+        let keytab = krb5::Keytab::load(path).map_err(|err| SaslError::Keytab {
             path: path.clone(),
             detail: err.to_string(),
         })?;
 
-        if keytab.entries().is_empty() {
+        if keytab.keys().is_empty() {
             return Err(SaslError::Keytab {
                 path: path.clone(),
                 detail: "the keytab holds no keys".to_string(),
@@ -258,7 +259,7 @@ impl Gssapi {
             service_principal,
             realms,
             pac: config.pac,
-            replay: rskrb5::service::SharedReplayCache::new(),
+            replay: std::sync::Arc::new(krb5::rcache::ReplayCache::new()),
         }))
     }
 
@@ -309,7 +310,7 @@ impl Gssapi {
     }
 
     /// The keys this service holds.
-    pub fn keytab(&self) -> &rskrb5::keytab::Keytab {
+    pub fn keytab(&self) -> &krb5::Keytab {
         &self.keytab
     }
 
@@ -319,7 +320,7 @@ impl Gssapi {
     }
 
     /// The replay cache shared by every connection.
-    pub fn replay(&self) -> rskrb5::service::SharedReplayCache {
+    pub fn replay(&self) -> std::sync::Arc<krb5::rcache::ReplayCache> {
         self.replay.clone()
     }
 
@@ -330,7 +331,7 @@ impl Gssapi {
     /// principal into somebody's directory.
     pub fn identity(
         &self,
-        principal: &rskrb5::service::Principal,
+        principal: &krb5::Principal,
         base_dn: &str,
     ) -> Option<Identity> {
         let realm = self.realms.get(&principal.realm.to_ascii_uppercase())?;
@@ -383,13 +384,8 @@ mod tests {
         }
     }
 
-    fn principal(text: &str) -> rskrb5::service::Principal {
-        let (name, realm) = text.split_once('@').expect("realm");
-        rskrb5::service::Principal {
-            realm: realm.to_string(),
-            name_type: 1,
-            components: name.split('/').map(str::to_string).collect(),
-        }
+    fn principal(text: &str) -> krb5::Principal {
+        krb5::Principal::parse(text).expect("a well-formed principal")
     }
 
     #[test]
@@ -404,10 +400,10 @@ mod tests {
 
         let gssapi = Gssapi {
             pac: crate::pac_policy::PacConfig::default(),
-            keytab: rskrb5::keytab::Keytab::new(),
+            keytab: krb5::Keytab::new(),
             service_principal: None,
             realms,
-            replay: rskrb5::service::SharedReplayCache::new(),
+            replay: std::sync::Arc::new(krb5::rcache::ReplayCache::new()),
         };
 
         let identity = gssapi
@@ -432,10 +428,10 @@ mod tests {
 
         let gssapi = Gssapi {
             pac: crate::pac_policy::PacConfig::default(),
-            keytab: rskrb5::keytab::Keytab::new(),
+            keytab: krb5::Keytab::new(),
             service_principal: None,
             realms,
-            replay: rskrb5::service::SharedReplayCache::new(),
+            replay: std::sync::Arc::new(krb5::rcache::ReplayCache::new()),
         };
 
         assert!(
@@ -457,10 +453,10 @@ mod tests {
 
         let gssapi = Gssapi {
             pac: crate::pac_policy::PacConfig::default(),
-            keytab: rskrb5::keytab::Keytab::new(),
+            keytab: krb5::Keytab::new(),
             service_principal: None,
             realms,
-            replay: rskrb5::service::SharedReplayCache::new(),
+            replay: std::sync::Arc::new(krb5::rcache::ReplayCache::new()),
         };
 
         assert_eq!(gssapi.identity(&principal("alice@EVIL.ORG"), BASE), None);
@@ -555,17 +551,17 @@ mod tests {
     /// A keytab on disk holding one key, as `kadmin ktadd` would have written it.
     fn keytab_at(dir: &std::path::Path) -> (PathBuf, Vec<u8>) {
         let path = dir.join("test.keytab");
-        let mut keytab = rskrb5::keytab::Keytab::new();
-        // AES256-CTS-HMAC-SHA1-96, the etype every modern KDC issues by default.
-        keytab
-            .add_entry_from_password(
-                rskrb5::keytab::Principal::new("EXAMPLE.COM", 1, ["ldap", "host.example.com"]),
-                b"secret",
-                std::time::SystemTime::now(),
-                1,
-                18,
-            )
-            .expect("an entry");
+        let mut keytab = krb5::Keytab::new();
+        // AES256-CTS-HMAC-SHA1-96, the etype every modern KDC issues by default. The key material
+        // is arbitrary: nothing in these tests decrypts with it, they check that a keytab with a key
+        // is loaded and that its realm survives the round trip to disk.
+        keytab.add(krb5::ServiceKey::new(
+            "ldap/host.example.com",
+            "EXAMPLE.COM",
+            1,
+            krb5::EncType::AES256CtsHmacSha196,
+            vec![0x5a; 32],
+        ));
         keytab.save(&path).expect("saved");
 
         let bytes = std::fs::read(&path).expect("read back");
@@ -589,7 +585,7 @@ mod tests {
         .expect("loaded")
         .expect("some sasl");
 
-        assert_eq!(gssapi.keytab().entries().len(), 1);
+        assert_eq!(gssapi.keytab().keys().len(), 1);
         assert_eq!(
             gssapi.service_principal().map(|parts| parts.join("/")),
             Some("ldap/host.example.com".to_string()),
@@ -624,7 +620,7 @@ mod tests {
         // bind fails at run time instead of the server failing at startup.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("empty.keytab");
-        rskrb5::keytab::Keytab::new().save(&path).expect("saved");
+        krb5::Keytab::new().save(&path).expect("saved");
 
         let error = Gssapi::load(
             &SaslConfig {

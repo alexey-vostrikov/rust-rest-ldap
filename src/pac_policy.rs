@@ -132,13 +132,30 @@ impl Claim {
     /// `None` when the PAC carries no `KERB_VALIDATION_INFO`: a PAC without credentials says
     /// nothing about a logon, and inventing a login name from it would be worse than reading
     /// nothing.
-    pub fn of(pac: &rskrb5::pac::Pac) -> Option<Self> {
-        let credentials = pac.ad_credentials()?;
+    pub fn of(pac: &krb5::pac::Pac) -> Option<Self> {
+        let credentials = pac.logon_info().ok()??;
+
+        // "Never" is a sentinel rather than a date (`FileTime::unix_secs` says which values), and a
+        // logon that never expires is a logon this server must treat as not expired - not as one
+        // that expired at the epoch.
+        let logoff = match credentials.logoff_time.unix_secs() {
+            Some(seconds) if seconds >= 0 => {
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds as u64)
+            }
+            Some(seconds) => {
+                SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(seconds.unsigned_abs())
+            }
+            None => SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(u64::MAX / 2),
+        };
 
         Some(Self {
             login: credentials.effective_name.clone(),
-            group_sids: credentials.group_membership_sids.clone(),
-            logoff: credentials.logoff_time,
+            group_sids: credentials
+                .group_sids()
+                .iter()
+                .map(|sid| sid.to_string())
+                .collect(),
+            logoff,
         })
     }
 

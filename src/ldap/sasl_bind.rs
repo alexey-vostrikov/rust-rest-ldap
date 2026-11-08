@@ -22,9 +22,9 @@
 //!   underneath it would be a second encryption whose failures nobody tests. The login is
 //!   therefore only accepted on an encrypted connection, where the ticket cannot be captured in
 //!   the first place.
-//! - **No channel binding.** `tls-server-end-point` would tie the ticket to the TLS session, and
-//!   the library does not do it. This is a recorded limitation, and the reason a plaintext GSSAPI
-//!   bind is refused.
+//! - **No channel binding.** `tls-server-end-point` would tie the ticket to the TLS session and
+//!   `krb5` supports it, but this module does not pass an acceptor binding yet. This is a recorded
+//!   limitation, and the reason a plaintext GSSAPI bind is refused.
 //! - **No proxy authorization** from the SASL authzid. The token carries an optional requested
 //!   identity, and honouring it without an ACL check named for that operation would be a way to
 //!   become somebody else.
@@ -34,24 +34,6 @@ use super::responses::bind_response;
 use super::session::{Identity, Session};
 use crate::directory::Directory;
 use crate::security::Security;
-
-/// How the client wrapped its token.
-///
-/// The reply has to be wrapped the same way, or a conforming client will not parse it: a
-/// SPNEGO client expects `NegTokenResp`, a GSS-API client expects the AP-REP inside an
-/// `[APPLICATION 0]` context token, and a client speaking RFC 4121 framing expects the reply at
-/// the top level. Remembering which one arrived is cheaper than guessing on the way back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Framing {
-    /// A bare AP-REQ: DER `[APPLICATION 14]`.
-    Bare,
-    /// A GSS-API initial context token: `[APPLICATION 0] { oid, inner }`.
-    Gss,
-    /// SPNEGO: `NegTokenInit`, possibly inside the same context token.
-    Spnego,
-    /// RFC 4121 mechanism token: `01 00` and then the AP-REQ.
-    MechToken,
-}
 
 /// Where a GSSAPI exchange stands.
 ///
@@ -80,17 +62,20 @@ pub enum Stage {
 /// below. Without the key the client's next token cannot be unwrapped, and without that token
 /// there is nothing proving the client received the AP-REP.
 pub struct Exchange {
-    session_key: rskrb5::keytab::EncryptionKey,
+    /// The RFC 4121 per-message layer, keyed on the context key.
+    ///
+    /// Carries the key rather than exposing it: the rounds that follow the ticket are wrap tokens,
+    /// and the only thing anybody needs from that key is to seal and open them.
+    tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>,
     principal: String,
     identity: Identity,
-    framing: Framing,
     stage: Stage,
 }
 
 impl Exchange {
-    /// The ticket's session key, for the tokens that follow.
-    pub fn session_key(&self) -> &rskrb5::keytab::EncryptionKey {
-        &self.session_key
+    /// The per-message layer for the tokens that follow.
+    pub fn tokens(&self) -> &krb5::token::PerMessageTokens<krb5::token::ContextKey> {
+        &self.tokens
     }
 
     /// The entry this principal maps to, once the exchange completes.
@@ -115,7 +100,6 @@ impl std::fmt::Debug for Exchange {
             .debug_struct("Exchange")
             .field("principal", &self.principal)
             .field("dn", &self.identity.dn)
-            .field("framing", &self.framing)
             .field("stage", &self.stage)
             .finish_non_exhaustive()
     }
@@ -281,41 +265,56 @@ fn begin(
         ));
     }
 
-    let (ap_req, framing) = unwrap(token)?;
-
-    let mut validator = rskrb5::service::ServiceValidator::new(gssapi.keytab())
-        .with_shared_replay_cache(gssapi.replay());
+    // The whole token goes to the acceptor, which tells GSS-framed from bare by what it finds and
+    // answers in the same framing. This crate no longer decodes SPNEGO, the GSS-API context token or
+    // the RFC 4121 token id itself: `krb5` does, and its SPNEGO acceptor is tested against MIT's own
+    // initiator, which is the only thing that makes a framing claim worth anything.
+    //
+    // A token that opens with neither framing is refused before the acceptor parses it: its own
+    // complaint would be about DER, while the client's mistake is about what it sent.
+    if !matches!(token.first(), Some(0x60) | Some(0x6e)) {
+        return Err(SaslError::Undecodable(format!(
+            "the token starts with {:02x?}, which is not a Kerberos ticket in any framing this \
+             server knows",
+            token.first()
+        )));
+    }
 
     // Whether the PAC's signature is checked at all is the operator's setting, and the default is
-    // "not at all" - see `pac_policy`. Kept off unless asked for, because a KDC that issues a PAC
-    // this library cannot parse refuses every otherwise valid ticket; a live run against MIT's KDC
-    // showed exactly that. Turning it on is a statement that every ticket in the realm comes from
-    // an Active Directory.
+    // "not at all" - see `pac_policy`. `krb5` verifies whatever PAC it finds and keeps it only if it
+    // verifies, so a realm that issues none is not an error there; the setting decides what this
+    // module then *requires*, which is a different question and the operator's.
     let pac = gssapi.pac();
-    if !pac.validates() {
-        validator = validator.without_pac_validation();
-    }
 
-    if let Some(parts) = gssapi.service_principal() {
-        let components: Vec<&str> = parts.iter().map(String::as_str).collect();
-        validator = validator.with_keytab_principal(components);
-    }
+    // One cache for the whole process: a captured AP-REQ replayed on a *new* connection has to be
+    // refused, and a per-connection cache would refuse nothing.
+    // `AcceptOptions` is `#[non_exhaustive]`, so it is built from `default()` and then adjusted -
+    // which is also how the crate documents it, so a field added in a later version does not break
+    // this call.
+    let mut options = krb5::acceptor::AcceptOptions::default();
+    options.replay_cache = Some(gssapi.replay());
+    let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(gssapi.keytab(), options);
 
-    let validated = validator
-        .validate_ap_req(&ap_req)
-        .map_err(|err| SaslError::Ticket(err.to_string()))?;
+    let reply = acceptor
+        .step(&token)
+        .map_err(|err| SaslError::Ticket(err.to_string()))?
+        .ok_or_else(|| SaslError::Ticket("the acceptor produced no reply".to_string()))?;
+
+    let context = acceptor
+        .into_context()
+        .ok_or_else(|| SaslError::Ticket("the ticket was accepted without a context".to_string()))?;
 
     // The policy, applied to what the ticket claims. A refusal here is a failed bind with the
     // reason attached: the client's Kerberos credentials are genuine and the ticket is still
     // unusable, which is a different answer from "wrong password" and has to read as one.
-    let claim = validated
-        .pac
-        .as_ref()
-        .and_then(crate::pac_policy::Claim::of);
+    let claim = context.pac.as_ref().and_then(crate::pac_policy::Claim::of);
     let admitted = crate::pac_policy::admit(claim, pac, std::time::SystemTime::now())
         .map_err(|refusal| SaslError::Ticket(refusal.to_string()))?;
 
-    let mut identity = resolve_identity(gssapi, directory, &validated.client)?;
+    let client = krb5::Principal::parse(&context.client_principal).map_err(|err| {
+        SaslError::Ticket(format!("the client principal could not be read: {err}"))
+    })?;
+    let mut identity = resolve_identity(gssapi, directory, &client)?;
 
     // The groups the ticket granted, resolved to entries of this directory. Off unless the operator
     // asked for it: it changes what `memberOf` and a `group=` access rule answer for a session, and
@@ -344,44 +343,24 @@ fn begin(
         identity = identity.with_groups(found.into_iter().map(|(dn, _)| dn).collect());
     }
 
-    // The AP-REP is what proves the server holds the service key. Built with an explicit
-    // confounder because the library asks for one rather than drawing its own.
-    let mut confounder = vec![0u8; 16];
-    getrandom::fill(&mut confounder)
-        .map_err(|err| SaslError::Ticket(format!("no randomness for the AP-REP: {err}")))?;
-
-    let ap_rep = validated
-        .build_ap_rep_with_confounder(
-            &confounder,
-            rskrb5::service::ApRepOptions {
-                subkey: None,
-                sequence_number: None,
-                kvno: None,
-            },
-        )
+    // The context key, from the crate's own RFC 4121 §2 order: the acceptor subkey if one was
+    // asserted, else the initiator's subkey, else the ticket's session key. Taking the ticket key
+    // where a subkey was offered produces tokens the client cannot verify - "a token had an invalid
+    // MIC" - which looks like a broken checksum and is a wrong key.
+    let tokens = context
+        .per_message_tokens()
         .map_err(|err| SaslError::Ticket(err.to_string()))?;
 
-    // The key the rest of the exchange is protected with. RFC 4121 §3.3.1: when the initiator puts
-    // a subkey in its authenticator, **that** is the context key and the ticket's session key is
-    // not used again. A server that keeps using the session key produces tokens the client cannot
-    // verify - "a token had an invalid MIC" - which looks like a broken checksum and is a wrong
-    // key.
-    let context_key = validated
-        .subkey
-        .clone()
-        .unwrap_or_else(|| validated.session_key.clone());
-
     session.set_sasl(Exchange {
-        session_key: context_key,
-        principal: format!("{}@{}", validated.client.name(), validated.client.realm),
+        tokens,
+        principal: context.client_principal.clone(),
         identity,
-        framing,
         stage: Stage::OfferSent,
     });
 
     Ok(Round {
         code: ResultCode::SaslBindInProgress,
-        credentials: Some(wrap_reply(&ap_rep, framing, true)?),
+        credentials: Some(reply),
         identity: None,
         diagnostic: String::new(),
     })
@@ -402,21 +381,23 @@ fn offer_layer(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslError
         )));
     }
 
-    let session_key = session
-        .sasl_exchange()
-        .ok_or_else(|| SaslError::Sequence("no GSSAPI exchange in progress".to_string()))?
-        .session_key()
-        .clone();
+    // The borrow ends with the block: `set_sasl_stage` needs the session mutably, and the token
+    // layer holds the key rather than being cloneable out of it.
+    let wrapped = {
+        let exchange = session
+            .sasl_exchange()
+            .ok_or_else(|| SaslError::Sequence("no GSSAPI exchange in progress".to_string()))?;
 
-    // RFC 4752 §3.1: the four octets are **one** mask byte followed by a **three**-octet maximum
-    // buffer size - not a 32-bit number. Sending `00 00 00 01` advertises a mask of zero, i.e. no
-    // layers at all, and a client answers "mechanism too weak" because there is nothing it may
-    // select. libsasl builds the same four octets as `sasldata[0] |= LAYER_NONE` plus
-    // `sasldata[1..3] = maxbufsize`.
-    const NO_LAYER: u8 = 1;
-    let mask = vec![NO_LAYER, 0, 0, 0];
+        // RFC 4752 §3.1: the four octets are **one** mask byte followed by a **three**-octet
+        // maximum buffer size - not a 32-bit number. Sending `00 00 00 01` advertises a mask of
+        // zero, i.e. no layers at all, and a client answers "mechanism too weak" because there is
+        // nothing it may select. libsasl builds the same four octets as `sasldata[0] |=
+        // LAYER_NONE` plus `sasldata[1..3] = maxbufsize`.
+        const NO_LAYER: u8 = 1;
+        let mask = vec![NO_LAYER, 0, 0, 0];
 
-    let wrapped = wrap_signed(&mask, &session_key)?;
+        wrap_signed(&mask, exchange.tokens())?
+    };
     session.set_sasl_stage(Stage::ChoiceExpected);
 
     Ok(Round {
@@ -436,10 +417,8 @@ fn accept_choice(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslErr
     let exchange = session
         .sasl_exchange()
         .ok_or_else(|| SaslError::Sequence("no GSSAPI exchange in progress".to_string()))?;
-    let session_key = exchange.session_key().clone();
     let identity = exchange.identity().clone();
-
-    let chosen = unwrap_signed(&token, &session_key)?;
+    let chosen = unwrap_signed(&token, exchange.tokens())?;
 
     if chosen.len() < 4 {
         return Err(SaslError::Layer(format!(
@@ -499,7 +478,7 @@ fn accept_choice(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslErr
 fn resolve_identity(
     gssapi: &crate::sasl::Gssapi,
     directory: &Directory,
-    principal: &rskrb5::service::Principal,
+    principal: &krb5::Principal,
 ) -> Result<Identity, SaslError> {
     // The realm filter applies to both namings. A realm nobody mapped has no subtree, and a UPN
     // that happens to match is not permission to ignore the realm it came with.
@@ -571,260 +550,33 @@ fn resolve_identity(
     Ok(Identity::new(&dn, admin))
 }
 
-/// Strips the framing and returns the AP-REQ and how it arrived.
-pub fn unwrap(token: Vec<u8>) -> Result<(Vec<u8>, Framing), SaslError> {
-    let bad = |detail: String| SaslError::Undecodable(detail);
-
-    // SPNEGO first: its decoder also accepts the GSS-API context wrapper, and rejects a bare
-    // AP-REQ - which is exactly the discrimination needed here.
-    if let Ok(spnego) = rskrb5::spnego::SpnegoToken::decode(&token)
-        && let Ok(ap_req) = spnego.krb5_ap_req()
-    {
-        return Ok((ap_req, Framing::Spnego));
-    }
-
-    // RFC 4121 mechanism token: two octets of TOK_ID, then the message.
-    if token.len() > 2 && token[0] == 0x01 && token[1] == 0x00 {
-        return Ok((token[2..].to_vec(), Framing::MechToken));
-    }
-
-    // A GSS-API initial context token that is not SPNEGO: [APPLICATION 0] { oid, inner }.
-    if token.first() == Some(&0x60) {
-        let inner = context_token_inner(&token).map_err(bad)?;
-        return match inner.first() {
-            // Older GSS-API framing puts the bare AP-REQ inside.
-            Some(0x6e) => Ok((inner, Framing::Gss)),
-            // RFC 4121 framing puts a mechanism token inside.
-            Some(0x01) if inner.get(1) == Some(&0x00) => Ok((inner[2..].to_vec(), Framing::Gss)),
-            other => Err(bad(format!(
-                "the GSS-API context token carries {other:02x?} where a ticket was expected"
-            ))),
-        };
-    }
-
-    // A bare AP-REQ: DER [APPLICATION 14].
-    if token.first() == Some(&0x6e) {
-        return Ok((token, Framing::Bare));
-    }
-
-    Err(bad(format!(
-        "the token starts with {:02x?}, which is not a Kerberos ticket in any framing this \
-         server knows",
-        token.first()
-    )))
-}
-
-/// The contents of a GSS-API `[APPLICATION 0]` context token, past the mechanism OID.
-fn context_token_inner(token: &[u8]) -> Result<Vec<u8>, String> {
-    let mut reader = Der::new(token);
-    let outer = reader.next().map_err(|err| err.to_string())?;
-    if outer.tag != 0x60 {
-        return Err(format!("expected [APPLICATION 0], found {:02x}", outer.tag));
-    }
-
-    let mut inner = Der::new(outer.value);
-    let oid = inner.next().map_err(|err| err.to_string())?;
-    if oid.tag != 0x06 {
-        return Err(format!("expected an OID, found {:02x}", oid.tag));
-    }
-
-    Ok(inner.remaining().to_vec())
-}
-
-/// Wraps the server's reply the way the client's token arrived.
-fn wrap_reply(payload: &[u8], framing: Framing, initial: bool) -> Result<Vec<u8>, SaslError> {
-    let bad = |err: rskrb5::spnego::Error| SaslError::Undecodable(err.to_string());
-
-    match framing {
-        Framing::Bare => Ok(payload.to_vec()),
-        Framing::MechToken => {
-            let mut out = vec![0x02, 0x00];
-            out.extend_from_slice(payload);
-            Ok(out)
-        }
-        // `Krb5MechToken::encode` already produces the whole `[APPLICATION 0] { OID, TOK_ID,
-        // message }` context token. Wrapping it again - which is what this code did until a live
-        // client said "Invalid token was supplied" - puts a second OID inside the first, and a
-        // double-wrapped token is exactly as unparseable as it sounds.
-        Framing::Gss => rskrb5::spnego::Krb5MechToken::ap_rep(payload.to_vec())
-            .encode()
-            .map_err(bad),
-        Framing::Spnego => {
-            let krb5 = rskrb5::spnego::Krb5MechToken::ap_rep(payload.to_vec());
-            let resp = if initial {
-                rskrb5::spnego::NegTokenResp::accept_completed()
-                    .with_response_token(krb5.encode().map_err(bad)?)
-            } else {
-                rskrb5::spnego::NegTokenResp::accept_completed()
-            };
-            resp.encode().map_err(bad)
-        }
-    }
-}
-
-/// Wraps bytes in a GSS-API `[APPLICATION 0] { Kerberos OID, inner }` context token.
+/// Verifies and returns the payload of the client's security-layer token.
 ///
-/// Used by the tests to build the shapes a client sends, and by nothing else: the server's own
-/// replies come from `Krb5MechToken::encode`, which does this itself.
-#[cfg(test)]
-fn context_token_wrap(inner: &[u8]) -> Vec<u8> {
-    // 1.2.840.113554.1.2.2, the Kerberos V5 mechanism, DER-encoded.
-    const KRB5_OID: [u8; 11] = [
-        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
-    ];
-
-    let mut content = Vec::with_capacity(KRB5_OID.len() + inner.len());
-    content.extend_from_slice(&KRB5_OID);
-    content.extend_from_slice(inner);
-
-    let mut out = vec![0x60];
-    out.extend(der_length(content.len()));
-    out.extend_from_slice(&content);
-    out
+/// RFC 4752 §3.1: the client's choice comes back sealed, and `unwrap` hands back the payload only
+/// after the MIC over it has been checked - there is no path here that yields bytes it has not
+/// verified.
+fn unwrap_signed(
+    token: &[u8],
+    tokens: &krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+) -> Result<Vec<u8>, SaslError> {
+    tokens.unwrap(token).map(|verified| verified.message).map_err(|err| {
+        SaslError::Layer(format!(
+            "the client's security-layer choice could not be unwrapped: {err}"
+        ))
+    })
 }
 
-/// A DER length, in the short form when it fits.
-#[cfg(test)]
-fn der_length(length: usize) -> Vec<u8> {
-    if length < 0x80 {
-        return vec![length as u8];
-    }
-
-    let bytes = length.to_be_bytes();
-    let start = bytes
-        .iter()
-        .position(|byte| *byte != 0)
-        .unwrap_or(bytes.len() - 1);
-    let significant = &bytes[start..];
-
-    let mut out = vec![0x80 | significant.len() as u8];
-    out.extend_from_slice(significant);
-    out
-}
-
-/// The minimum DER reader this module needs: one TLV at a time.
-struct Der<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-struct Tlv<'a> {
-    tag: u8,
-    value: &'a [u8],
-}
-
-impl<'a> Der<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn remaining(&self) -> &'a [u8] {
-        &self.bytes[self.offset..]
-    }
-
-    fn next(&mut self) -> Result<Tlv<'a>, &'static str> {
-        if self.offset + 2 > self.bytes.len() {
-            return Err("truncated DER header");
-        }
-
-        let tag = self.bytes[self.offset];
-        let first = self.bytes[self.offset + 1];
-        let mut cursor = self.offset + 2;
-
-        let length = if first & 0x80 == 0 {
-            first as usize
-        } else {
-            let count = (first & 0x7f) as usize;
-            if count == 0 || count > 4 || cursor + count > self.bytes.len() {
-                return Err("unsupported DER length");
-            }
-            let mut value = 0usize;
-            for byte in &self.bytes[cursor..cursor + count] {
-                value = (value << 8) | *byte as usize;
-            }
-            cursor += count;
-            value
-        };
-
-        if cursor + length > self.bytes.len() {
-            return Err("truncated DER value");
-        }
-
-        let value = &self.bytes[cursor..cursor + length];
-        self.offset = cursor + length;
-
-        Ok(Tlv { tag, value })
-    }
-}
-
-/// Verifies and returns the payload of a sign-only GSS token from the client.
-///
-/// RFC 4121 §7.2: an initiator signing with an acceptor's key uses 25, sealing uses 24. The
-/// library hands back the payload after the checksum is verified, so a token that was tampered
-/// with fails here rather than at the layer check.
-fn unwrap_signed(token: &[u8], key: &rskrb5::keytab::EncryptionKey) -> Result<Vec<u8>, SaslError> {
-    let bad = |err: rskrb5::spnego::Error| SaslError::Layer(err.to_string());
-
-    // A client may seal the negotiation token as well as sign it; both are legal, so both are
-    // tried, and the sealed path is the one that has to decrypt before it can verify.
-    if let Ok(wrap) = rskrb5::spnego::WrapToken::decode(token, false) {
-        if wrap.is_sealed() {
-            return wrap
-                .decrypt_payload(key, rskrb5::spnego::GSSAPI_INITIATOR_SEAL_USAGE)
-                .map_err(bad);
-        }
-
-        if let Some(payload) = wrap.payload.clone() {
-            let intact = wrap
-                .verify(key, rskrb5::spnego::GSSAPI_INITIATOR_SEAL_USAGE)
-                .map_err(bad)?;
-            if !intact {
-                return Err(SaslError::Layer(
-                    "the security layer token did not verify against the session key".to_string(),
-                ));
-            }
-            return Ok(payload);
-        }
-    }
-
-    if let Ok(mic) = rskrb5::spnego::MicToken::decode(token, false)
-        && let Some(payload) = mic.payload.clone()
-    {
-        let intact = mic
-            .verify(key, rskrb5::spnego::GSSAPI_INITIATOR_SIGN_USAGE)
-            .map_err(bad)?;
-        if !intact {
-            return Err(SaslError::Layer(
-                "the security layer token did not verify against the session key".to_string(),
-            ));
-        }
-        return Ok(payload);
-    }
-
-    Err(SaslError::Layer(
-        "the security layer token is neither a signed nor a sealed GSS token".to_string(),
-    ))
-}
-
-/// Signs a payload as the acceptor, the mirror of [`unwrap_signed`].
-fn wrap_signed(payload: &[u8], key: &rskrb5::keytab::EncryptionKey) -> Result<Vec<u8>, SaslError> {
-    let mut token =
-        rskrb5::spnego::WrapToken::new(rskrb5::spnego::GSS_TOKEN_FLAG_SENT_BY_ACCEPTOR, 0);
-    token.payload = Some(payload.to_vec());
-    // RFC 4121 §7.2: a **Wrap** token is protected with 22 (acceptor) / 24 (initiator); 23 and 25
-    // are for **MIC** tokens. Using 23 here produced a token the client could parse and could not
-    // verify - "a token had an invalid MIC" - which is the least helpful way for a key usage to be
-    // wrong. The crate's own test vectors verify WrapTokens with the SEAL usage, which is the same
-    // fact stated in code.
-    token
-        .set_checksum(key, rskrb5::spnego::GSSAPI_ACCEPTOR_SEAL_USAGE)
-        .map_err(|err| SaslError::Layer(err.to_string()))?;
-    token
-        .encode()
+/// Seals a payload for the client, which unwraps it with the context key.
+fn wrap_signed(
+    payload: &[u8],
+    tokens: &krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+) -> Result<Vec<u8>, SaslError> {
+    // Sequence 0: this is the first and only message this side sends on the context.
+    tokens
+        .emit_wrap(0, payload)
         .map_err(|err| SaslError::Layer(err.to_string()))
 }
 
-/// A bind response that carries server credentials.
 fn sasl_response(
     message_id: MessageId,
     code: ResultCode,
@@ -847,109 +599,13 @@ fn sasl_response(
 mod tests {
     use super::*;
 
-    /// A minimal DER AP-REQ: `[APPLICATION 14]` with a two-octet body. Enough to prove the
-    /// framing is stripped correctly, and deliberately not a ticket.
+    /// A minimal DER AP-REQ: `[APPLICATION 14]` with a two-octet body.
+    ///
+    /// Deliberately not a ticket. The tests that use it stop before the ticket would be decrypted -
+    /// at the TLS check, or at the framing check - and a real ticket here would only be a fixture
+    /// that expires.
     fn ap_req_bytes() -> Vec<u8> {
         vec![0x6e, 0x02, 0xaa, 0xbb]
-    }
-
-    fn gss_wrap(inner: &[u8]) -> Vec<u8> {
-        context_token_wrap(inner)
-    }
-
-    #[test]
-    fn a_bare_ap_req_is_recognised() {
-        let (ap_req, framing) = unwrap(ap_req_bytes()).expect("a ticket");
-        assert_eq!(ap_req, ap_req_bytes());
-        assert_eq!(framing, Framing::Bare);
-    }
-
-    #[test]
-    fn an_rfc4121_mechanism_token_is_stripped_to_its_message() {
-        // 01 00 is TOK_ID for AP-REQ in RFC 4121's framing.
-        let mut token = vec![0x01, 0x00];
-        token.extend_from_slice(&ap_req_bytes());
-
-        let (ap_req, framing) = unwrap(token).expect("a ticket");
-        assert_eq!(ap_req, ap_req_bytes());
-        assert_eq!(framing, Framing::MechToken);
-    }
-
-    #[test]
-    fn a_gss_api_context_token_carrying_a_bare_ap_req_is_recognised() {
-        // What cyrus-sasl's GSSAPI plugin sends: [APPLICATION 0] { krb5 OID, AP-REQ }.
-        let (ap_req, framing) = unwrap(gss_wrap(&ap_req_bytes())).expect("a ticket");
-        assert_eq!(ap_req, ap_req_bytes());
-        assert_eq!(framing, Framing::Gss);
-    }
-
-    #[test]
-    fn a_gss_api_context_token_carrying_a_mechanism_token_is_recognised() {
-        let mut inner = vec![0x01, 0x00];
-        inner.extend_from_slice(&ap_req_bytes());
-        let (ap_req, framing) = unwrap(gss_wrap(&inner)).expect("a ticket");
-        assert_eq!(ap_req, ap_req_bytes());
-        assert_eq!(framing, Framing::Gss);
-    }
-
-    #[test]
-    fn something_that_is_not_a_ticket_is_refused_with_what_it_started_with() {
-        // The bytes come from an unauthenticated client, so the answer must not be a panic and
-        // must say what arrived.
-        let error = unwrap(vec![0x30, 0x02, 0x01, 0x02]).expect_err("must refuse");
-        match error {
-            SaslError::Undecodable(detail) => {
-                assert!(detail.contains("0x30") || detail.contains("30"), "{detail}")
-            }
-            other => panic!("expected an undecodable token, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_empty_token_is_refused() {
-        assert!(unwrap(Vec::new()).is_err());
-    }
-
-    #[test]
-    fn a_truncated_context_token_does_not_panic() {
-        // A three-octet "context token" whose length says more than it has.
-        assert!(unwrap(vec![0x60, 0x7f, 0x00]).is_err());
-        // A header that ends mid-length.
-        assert!(unwrap(vec![0x60]).is_err());
-    }
-
-    #[test]
-    fn the_reply_is_wrapped_the_way_the_token_arrived() {
-        // A client that spoke SPNEGO expects NegTokenResp; one that spoke bare GSS-API expects
-        // the AP-REP inside a context token. Guessing wrong means a client that cannot parse the
-        // answer, which looks like a server that hung.
-        let ap_rep = vec![0x6f, 0x02, 0x01, 0x02];
-
-        assert_eq!(
-            wrap_reply(&ap_rep, Framing::Bare, true).expect("bare"),
-            ap_rep
-        );
-
-        let mech = wrap_reply(&ap_rep, Framing::MechToken, true).expect("mech");
-        assert_eq!(&mech[..2], &[0x02, 0x00], "TOK_ID for AP-REP");
-        assert_eq!(&mech[2..], &ap_rep[..]);
-
-        let gss = wrap_reply(&ap_rep, Framing::Gss, true).expect("gss");
-        assert_eq!(gss[0], 0x60, "an [APPLICATION 0] context token");
-
-        let spnego = wrap_reply(&ap_rep, Framing::Spnego, true).expect("spnego");
-        // NegTokenResp ::= [APPLICATION 1] or [1]; either way the accept-completed state is
-        // present, which is what tells a SPNEGO client the conversation is over mechanism-wise.
-        assert!(!spnego.is_empty());
-    }
-
-    #[test]
-    fn a_long_der_length_takes_the_long_form() {
-        assert_eq!(der_length(0), vec![0x00]);
-        assert_eq!(der_length(127), vec![0x7f]);
-        assert_eq!(der_length(128), vec![0x81, 0x80]);
-        assert_eq!(der_length(256), vec![0x82, 0x01, 0x00]);
-        assert_eq!(der_length(70000), vec![0x83, 0x01, 0x11, 0x70]);
     }
 
     /// A security policy that has an acceptor, so the SASL path is reachable in a test.
@@ -957,16 +613,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.keytab");
 
-        let mut keytab = rskrb5::keytab::Keytab::new();
-        keytab
-            .add_entry_from_password(
-                rskrb5::keytab::Principal::new("EXAMPLE.COM", 1, ["ldap", "host.example.com"]),
-                b"secret",
-                std::time::SystemTime::now(),
-                1,
-                18,
-            )
-            .expect("an entry");
+        // A key rather than a password: `krb5` writes keytabs from key material, which is what a
+        // `ktadd` produces. Nothing here decrypts with it - the tests below either drive the
+        // exchange with a fabricated context key or check that a ticket-less token is refused.
+        let mut keytab = krb5::Keytab::new();
+        // `ServiceKey` is `#[non_exhaustive]`: a typed value is what the crate asks for, and it
+        // keeps a field added upstream from breaking this fixture.
+        keytab.add(krb5::ServiceKey::new(
+            "ldap/host.example.com",
+            "EXAMPLE.COM",
+            1,
+            krb5::EncType::AES256CtsHmacSha196,
+            vec![0x11; 32],
+        ));
         keytab.save(&path).expect("saved");
 
         let gssapi = crate::sasl::Gssapi::load(
@@ -1110,11 +769,10 @@ mod tests {
     /// Not `wrap_signed`, which produces an acceptor token - that is what the server sends, and its
     /// flag is what tells a reader which side made it. A test that used the server's wrapper to
     /// stand in for a client would be testing the wrong direction and would never notice.
-    fn client_choice(payload: &[u8], key: &rskrb5::keytab::EncryptionKey) -> Vec<u8> {
-        rskrb5::spnego::WrapToken::new_initiator(payload, key)
+    fn client_choice(payload: &[u8], tokens: &krb5::token::PerMessageTokens<krb5::token::ContextKey>) -> Vec<u8> {
+        tokens
+            .emit_wrap(0, payload)
             .expect("an initiator wrap")
-            .encode()
-            .expect("encoded")
     }
 
     /// A session holding an exchange at a given stage with a known key.
@@ -1122,19 +780,27 @@ mod tests {
     /// Built directly rather than by playing a real ticket through the round: the ticket's
     /// cryptography is the library's to test and a real client's to prove, while what this module
     /// decides is the shape of the exchange - which token is expected when, and what goes back.
-    fn exchanging(stage: Stage) -> Session {
-        let key = rskrb5::keytab::EncryptionKey {
-            etype: 18,
-            value: vec![0x11; 32],
-        };
+    /// AES256-CTS-HMAC-SHA1-96 over a fixed key: the enctype every modern KDC issues by default.
+    fn test_key() -> krb5::token::ContextKey {
+        krb5::token::ContextKey::new(18, &[0x11; 32]).expect("a key of the right length")
+    }
 
+    /// The same key from the client's side, which is what verifies what the server produced.
+    fn initiator_tokens() -> krb5::token::PerMessageTokens<krb5::token::ContextKey> {
+        krb5::token::PerMessageTokens::new(test_key(), krb5::token::Role::Initiator, false)
+    }
+
+    fn exchanging(stage: Stage) -> Session {
         let mut session = Session::new();
         session.set_encrypted(true);
         session.set_sasl(Exchange {
-            session_key: key,
+            tokens: krb5::token::PerMessageTokens::new(
+                test_key(),
+                krb5::token::Role::Acceptor,
+                false,
+            ),
             principal: "alice@EXAMPLE.COM".to_string(),
             identity: Identity::new("uid=alice,ou=users,dc=example,dc=com", false),
-            framing: Framing::Bare,
             stage,
         });
         session
@@ -1178,22 +844,12 @@ mod tests {
             .as_ref()
             .to_vec();
 
-        let key = session
-            .sasl_exchange()
-            .expect("still exchanging")
-            .session_key()
-            .clone();
-        // Decoded as an **acceptor** token, which is what it is: the flag says so, and a client
-        // checks it. Reading it back as an initiator token would be the wrong side of the exchange.
-        let mut token =
-            rskrb5::spnego::WrapToken::decode(&credentials, true).expect("an acceptor wrap");
-        assert!(
-            token
-                .verify(&key, rskrb5::spnego::GSSAPI_ACCEPTOR_SEAL_USAGE)
-                .expect("verifiable"),
-            "the offer is signed with the wrap key usage a client checks, not the MIC one"
-        );
-        let plain = token.payload.take().expect("with a payload");
+        // Opened from the **initiator** side, which is what a client is: the layer picks the seal
+        // usage from the side it speaks for, so a token sealed with the wrong usage fails here.
+        let opened = initiator_tokens()
+            .unwrap(&credentials)
+            .expect("the offer opens with the client's key");
+        let plain = opened.message;
 
         assert_eq!(
             plain,
@@ -1265,12 +921,7 @@ mod tests {
     fn a_choice_of_no_layer_completes_the_bind_with_the_mapped_identity() {
         let (security, _dir) = security_with_keytab();
         let mut session = exchanging(Stage::ChoiceExpected);
-        let key = session
-            .sasl_exchange()
-            .expect("exchanging")
-            .session_key()
-            .clone();
-        let choice = client_choice(&[0x01, 0x00, 0x00, 0x00], &key);
+        let choice = client_choice(&[0x01, 0x00, 0x00, 0x00], &initiator_tokens());
 
         let directory = crate::directory::Directory::from_entries(
             "dc=example,dc=com",
@@ -1304,13 +955,8 @@ mod tests {
         // plaintext - a connection that fails on the first search rather than at the bind.
         let (security, _dir) = security_with_keytab();
         let mut session = exchanging(Stage::ChoiceExpected);
-        let key = session
-            .sasl_exchange()
-            .expect("exchanging")
-            .session_key()
-            .clone();
         // Integrity only: bit 1 set, bit 0 clear.
-        let choice = client_choice(&[0x02, 0x00, 0x00, 0x00], &key);
+        let choice = client_choice(&[0x02, 0x00, 0x00, 0x00], &initiator_tokens());
 
         let directory = crate::directory::Directory::from_entries(
             "dc=example,dc=com",
@@ -1342,14 +988,9 @@ mod tests {
         // right an access rule grants, not a field a client may set.
         let (security, _dir) = security_with_keytab();
         let mut session = exchanging(Stage::ChoiceExpected);
-        let key = session
-            .sasl_exchange()
-            .expect("exchanging")
-            .session_key()
-            .clone();
         let mut payload = vec![0x01, 0x00, 0x00, 0x00];
         payload.extend_from_slice(b"uid=admin,ou=users,dc=example,dc=com");
-        let choice = client_choice(&payload, &key);
+        let choice = client_choice(&payload, &initiator_tokens());
 
         let directory = crate::directory::Directory::from_entries(
             "dc=example,dc=com",
@@ -1399,13 +1040,8 @@ mod tests {
         crate::model::Entry::new(cn, attributes)
     }
 
-    fn principal(text: &str) -> rskrb5::service::Principal {
-        let (name, realm) = text.split_once('@').expect("a realm");
-        rskrb5::service::Principal {
-            realm: realm.to_string(),
-            name_type: 1,
-            components: name.split('/').map(str::to_string).collect(),
-        }
+    fn principal(text: &str) -> krb5::Principal {
+        krb5::Principal::parse(text).expect("a well-formed principal")
     }
 
     /// An acceptor for `EXAMPLE.COM`, without needing a keytab on disk.
