@@ -215,6 +215,41 @@ impl Backend {
         matches!(self, Backend::Redb(_))
     }
 
+    /// Whether this backend can keep facts about the server itself: the domain SID, and the counter
+    /// that issues RIDs inside it.
+    ///
+    /// The same set as `stores_entries`, and for a weaker reason: a backend that cannot hold an
+    /// entry certainly cannot hold a SID, and the ones that can hold entries all can. Kept as its own
+    /// question so that a backend which one day stores entries without metadata answers honestly.
+    pub fn keeps_meta(&self) -> bool {
+        matches!(self, Backend::Redb(_))
+    }
+
+    /// A value the server recorded about itself, or `None`.
+    ///
+    /// Behind a method rather than an open table so that the key space has one owner: a second
+    /// reader with its own spelling of a key is a second place the spelling can be wrong.
+    pub fn meta_get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        match self {
+            Backend::Redb(store) => store.meta_get(key),
+            // A backend with no place to keep it has never written one, which is the same answer as
+            // an empty store.
+            _ => Ok(None),
+        }
+    }
+
+    /// Records a value about the server itself.
+    ///
+    /// Refused on a backend that cannot keep it, rather than accepted and forgotten: a domain SID
+    /// that exists only until the next start is a domain whose accounts change identity on restart,
+    /// and every ACL and every ticket that named them stops matching.
+    pub fn meta_set(&self, key: &str, value: &[u8]) -> Result<(), BackendError> {
+        match self {
+            Backend::Redb(store) => store.meta_set(key, value),
+            _ => Err(BackendError::UpdateNotSupported),
+        }
+    }
+
     /// The name this backend is configured under.
     /// Journal records after `csn`, oldest first.
     ///

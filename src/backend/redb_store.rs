@@ -963,6 +963,66 @@ impl RedbBackend {
         sequence_of(&meta)
     }
 
+    /// Reads a value this server keeps about itself, or `None` if it has never written one.
+    ///
+    /// The same `meta` table the change counter lives in. Exposed rather than each caller opening
+    /// the table itself: the key space is shared, and a second reader with its own conventions is a
+    /// second place a key can be spelled wrong.
+    pub fn meta_get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        let meta = match transaction.open_table(META) {
+            Ok(meta) => meta,
+            // A store that has never been written has no meta table at all, which is the same answer
+            // as having no key in it.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(source) => {
+                return Err(BackendError::Redb {
+                    path: "<meta>".to_string(),
+                    reason: source.to_string(),
+                });
+            }
+        };
+        let value = meta.get(key).map_err(|source| BackendError::Redb {
+            path: "<meta>".to_string(),
+            reason: source.to_string(),
+        })?;
+        Ok(value.map(|value| value.value().to_vec()))
+    }
+
+    /// Writes a value this server keeps about itself, replacing any previous one.
+    pub fn meta_set(&self, key: &str, value: &[u8]) -> Result<(), BackendError> {
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|source| BackendError::Redb {
+                path: "<database>".to_string(),
+                reason: source.to_string(),
+            })?;
+        {
+            let mut meta = transaction
+                .open_table(META)
+                .map_err(|source| BackendError::Redb {
+                    path: "<meta>".to_string(),
+                    reason: source.to_string(),
+                })?;
+            meta.insert(key, value)
+                .map_err(|source| BackendError::Redb {
+                    path: "<meta>".to_string(),
+                    reason: source.to_string(),
+                })?;
+        }
+        transaction.commit().map_err(|source| BackendError::Redb {
+            path: "<database>".to_string(),
+            reason: source.to_string(),
+        })
+    }
+
     /// Stores the index snapshot, replacing any previous one, and says which change it reflects.
     ///
     /// `sequence` is the counter value the index was built from. Deltas up to and including it

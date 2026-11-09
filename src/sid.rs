@@ -19,6 +19,8 @@
 //! every client in the world, before any client has asked the directory anything. A counter that
 //! began at 500 and handed them out again would produce a domain administrator nobody intended.
 
+pub mod domain;
+
 use std::fmt;
 
 /// A security identifier: `S-1-5-21-a-b-c-rid`, and the octets it is.
