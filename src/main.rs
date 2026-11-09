@@ -783,6 +783,41 @@ async fn serve() {
         None
     };
 
+    // SMB, when asked for. Port 445 is where a Samba member's join actually begins - an SMB
+    // connection to `\\DC\IPC$` - and that was measured, not assumed: the stand fails inside
+    // `libnet_join_connect_dc_ipc` before any RPC is spoken. Started after the KDC because a client
+    // that reaches the share still needs the realm behind it, and before the listener accepts
+    // because a machine that connects in the first moment must find it.
+    #[cfg(feature = "smb")]
+    let _smb = if config.smb.enabled {
+        let ip = match listener.local_addr().map(|addr| addr.ip()) {
+            Ok(ip) => ip,
+            Err(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        };
+        // The name CLDAP advertises, so that a client which found this server one way recognises it
+        // by the other: two names for one server is how a machine joins a controller it cannot reach.
+        let advertised = if config.cldap.enabled {
+            config.cldap.netbios_host.as_deref()
+        } else {
+            None
+        };
+        match rust_rest_ldap::smb::Settings::resolve(&config.smb, ip, advertised) {
+            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+            Ok(settings) => match rust_rest_ldap::smb::serve::start(&settings).await {
+                Ok(running) => {
+                    println!(
+                        "smb: serving {} as {} on {}",
+                        "IPC$", running.netbios_name, running.bind
+                    );
+                    Some(running)
+                }
+                Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+            },
+        }
+    } else {
+        None
+    };
+
     let reloading = tokio::spawn(rust_rest_ldap::reload::reload_on_interval_with(
         Arc::clone(&source),
         config.update_interval,

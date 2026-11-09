@@ -320,6 +320,13 @@ pub struct Config {
     /// network fault.
     #[cfg(feature = "kdc")]
     pub kerberos: crate::kerberos::KerberosConfig,
+    /// SMB on port 445: the `IPC$` share a join begins with.
+    ///
+    /// Off unless an operator turns it on, for the reason `cldap` is off: answering on 445 says
+    /// "this address is a domain controller", and a server that says so and cannot complete a join
+    /// sends a machine to a dead end.
+    #[cfg(feature = "smb")]
+    pub smb: crate::smb::SmbConfig,
     /// Where the change journal goes, if anywhere.
     pub observability: ObservabilityConfig,
     /// The first administrator of an empty store, if the operator configured one.
@@ -491,6 +498,10 @@ struct FileConfig {
     #[cfg(feature = "kdc")]
     #[serde(default)]
     kerberos: crate::kerberos::KerberosConfig,
+    /// SMB, off unless asked for.
+    #[cfg(feature = "smb")]
+    #[serde(default)]
+    smb: crate::smb::SmbConfig,
     /// Subtrees held elsewhere: `- dn: dc=remote,dc=com` with the URL a client should ask.
     #[serde(default)]
     referrals: Vec<ReferralConfig>,
@@ -864,6 +875,8 @@ pub fn resolve(
         cldap: file.cldap,
         #[cfg(feature = "kdc")]
         kerberos: file.kerberos.clone(),
+        #[cfg(feature = "smb")]
+        smb: file.smb.clone(),
         observability: file.observability,
         locale: {
             // The configuration wins over the host: an operator who wrote `locale: ru`

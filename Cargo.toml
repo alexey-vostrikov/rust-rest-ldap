@@ -72,9 +72,16 @@ yescrypt = "0.1.0"
 # `RUST_HEIMDAL_KDC`-free builds stay what they were.
 rust-heimdal-kdc = { path = "../rust-heimdal-kdc", optional = true, features = ["hdb-ldap"] }
 
+# SMB2/3 for `IPC$`, which is where a Samba member's join actually begins: it connects to
+# `\\DC\IPC$` and opens `lsarpc` through it. Without `localfs` - this server serves no files - and
+# with `krb5`, so a machine account can authenticate with the ticket it already has.
+smb-server = { path = "../rust-smb-server", version = "0.9.1", optional = true, default-features = false, features = ["krb5"] }
+
 [features]
 # Port 88: AS-REQ, TGS-REQ, and `krbtgt/<REALM>` provisioned on first start.
 kdc = ["dep:rust-heimdal-kdc"]
+# Port 445 and the `IPC$` share a join talks to.
+smb = ["dep:smb-server"]
 
 [dev-dependencies]
 rust-heimdal-kdc = { path = "../rust-heimdal-kdc" }

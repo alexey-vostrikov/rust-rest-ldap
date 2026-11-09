@@ -30,6 +30,19 @@ if [ -n "${kdc:-}" ]; then
   mounts="-v $kdc:/rust-heimdal-kdc:ro"
 fi
 
+# The SMB server is a sibling checkout for the same reason and with the same rules: mounted
+# read-only at the path the manifest names, and a missing one is `cargo`'s error to report.
+# `RR_LDAP_SMB` overrides where it lives.
+for candidate in "${RR_LDAP_SMB:-}" "$repo/../rust-smb-server" "$repo/../../rust-smb-server"; do
+  if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+    smb=$(cd "$candidate" && pwd)
+    break
+  fi
+done
+if [ -n "${smb:-}" ]; then
+  mounts="$mounts -v $smb:/rust-smb-server:ro"
+fi
+
 # MIRIFLAGS is passed through because otherwise `-Zmiri-disable-isolation` is dropped silently, and
 # a test that needs the filesystem fails with "mkdir not available when isolation is enabled" - which
 # reads as a defect in the code under test rather than in the harness.

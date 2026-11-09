@@ -67,5 +67,11 @@ pub mod server;
 /// Security identifiers: the binary form AD stores, the text form Windows prints, and the rule that
 /// a RID is handed out once.
 pub mod sid;
+/// SMB on port 445: the `IPC$` share a Samba member's join begins with.
+///
+/// Behind a feature for the same reason the KDC is: a directory that does not claim to be a domain
+/// controller should not answer on the port one uses.
+#[cfg(feature = "smb")]
+pub mod smb;
 pub mod tls;
 pub mod yaml_export;
