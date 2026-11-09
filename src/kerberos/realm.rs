@@ -124,6 +124,40 @@ impl Realm for RealmView {
         Ok(Some(attributes))
     }
 
+    /// The entry that publishes `spn` as a service principal name.
+    ///
+    /// A realm in AD shape does not name its machine accounts the way a client asks for them: the
+    /// client wants `cifs/host.ad.example.com`, the account is `HOST$`, and the name the client used
+    /// lives in `servicePrincipalName`. Looking up by principal alone misses it, and a Samba member
+    /// cannot get the one ticket its join needs.
+    ///
+    /// A scan rather than an index lookup, because this directory publishes `servicePrincipalName`
+    /// with an `eq` index only when an operator asked for it: correctness first, and the number of
+    /// entries this is asked about is one per ticket. When the index is there the attribute is
+    /// what a search would use, and this becomes the same work done by hand.
+    fn get_by_spn(&self, spn: &str) -> rust_heimdal_kdc::Result<Option<Attributes>> {
+        let directory = self.current();
+        let Some(entry) = directory.all().iter().find(|entry| {
+            entry
+                .attributes()
+                .get("servicePrincipalName")
+                .is_some_and(|attribute| {
+                    attribute
+                        .values
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(spn))
+                })
+        }) else {
+            return Ok(None);
+        };
+
+        // Not decoded here, unlike `get`: the caller checks that the entry really publishes this
+        // name, and an entry that fails to read back should be refused with that in hand rather than
+        // with a decode error about a mapping.
+        let attributes = to_realm_attributes(entry.attributes());
+        Ok(Some(attributes))
+    }
+
     fn put(&self, principal: &Principal, _attributes: &Attributes) -> rust_heimdal_kdc::Result<()> {
         // Not a limitation of this adapter but a decision: an account has a password policy, an
         // access check and a replication history, and all three live on the LDAP path. A KDC-side
@@ -388,6 +422,55 @@ mod tests {
         assert!(
             view.get(&bob).expect("read").is_some(),
             "after a refresh the new snapshot is what is served"
+        );
+    }
+
+    /// The account a Samba member's join asks about: the client wants `cifs/host.ad.example.com`,
+    /// the account is `HOST$`, and only `servicePrincipalName` connects the two. A realm that found
+    /// entries by principal alone would answer `None`, the TGS would refuse the one ticket the join
+    /// needs, and the failure would read as a service that does not exist.
+    #[test]
+    fn a_machine_account_is_found_by_the_service_name_it_publishes() {
+        let host = Principal::parse(&format!("HOST$@{REALM}")).expect("a principal");
+        let mut entry = HdbEntry::user(host.clone());
+        entry
+            .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"pw", 1)
+            .expect("a key");
+
+        let attributes = crate::kerberos::bootstrap::attributes_of(&entry)
+            .push(Attribute::single(
+                "servicePrincipalName",
+                "cifs/host.ad.example.com",
+            ))
+            .push(Attribute::single(
+                "servicePrincipalName",
+                "host/host.ad.example.com",
+            ));
+        let view = realm(vec![Entry::new(dn_for(&host, BASE), attributes)]);
+
+        // By the name a client asks for, which is not the account's name.
+        let found = view
+            .get_by_spn("cifs/host.ad.example.com")
+            .expect("the read succeeds")
+            .expect("the account that publishes it");
+        assert_eq!(
+            found.first(attrs::PRINCIPAL_NAME),
+            Some(format!("HOST$@{REALM}").as_bytes()),
+            "the entry is the machine account, not a principal named cifs/host"
+        );
+
+        // Ignoring case: a client spells the service name its own way and made no claim about case.
+        assert!(
+            view.get_by_spn("CIFS/Host.AD.Example.Com")
+                .expect("read")
+                .is_some()
+        );
+
+        // And a name nobody publishes is absent rather than approximated.
+        assert!(
+            view.get_by_spn("ldap/other.example.com")
+                .expect("read")
+                .is_none()
         );
     }
 
