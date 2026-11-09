@@ -96,6 +96,13 @@ pub struct Settings {
     /// against the realm it was told, and a wrong name sends it looking for another domain - so it
     /// comes from the same place CLDAP takes its answer from, not from a second derivation.
     pub dns_domain: Option<String>,
+    /// The domain's SID in the octets a directory stores, when this server issues one.
+    ///
+    /// `lsarpc` reports it with the domain's DNS information, and a member's join stores it as the
+    /// domain the machine belongs to. Filled by the daemon from the `sid::domain::Issuer` rather
+    /// than from the configuration: a SID written into a file is a SID that can disagree with the
+    /// one already on the accounts.
+    pub domain_sid: Option<Vec<u8>>,
 }
 
 impl Settings {
@@ -169,6 +176,7 @@ impl Settings {
             keytab: config.keytab.clone(),
             users,
             dns_domain: config.dns_domain.clone(),
+            domain_sid: None,
         })
     }
 }

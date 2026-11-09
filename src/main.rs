@@ -12,6 +12,22 @@ fn main() {
     rust_rest_ldap::runtime::multi_thread().block_on(serve());
 }
 
+/// Whether this process serves a domain, and so has a SID to issue.
+///
+/// Any one of the identity services is enough: a deployment may run tickets elsewhere and still be
+/// the directory those tickets are about.
+#[cfg(feature = "kdc")]
+fn serves_a_domain(config: &config::Config) -> bool {
+    if config.kerberos.enabled || config.cldap.enabled {
+        return true;
+    }
+    #[cfg(feature = "smb")]
+    if config.smb.enabled {
+        return true;
+    }
+    false
+}
+
 async fn serve() {
     let args: config::Args = cli::Cli::parse().into();
     let export = args.export_ldif.clone();
@@ -472,12 +488,13 @@ async fn serve() {
     // source takes ownership of the backend, because both live in that store, and a SID derived
     // after the fact would be a second SID.
     //
-    // Tied to `kerberos.enabled` for now, and the tie is deliberate rather than incidental: a server
-    // that issues tickets is the thing a domain controller means, and a directory that issues SIDs
-    // without a realm would be handing out identities no ticket can name. When there is a reason to
-    // separate them, this becomes its own section.
+    // A domain is what a process that names identities serves - tickets, CLDAP pings, SMB sessions
+    // - and not the same thing as a KDC. Tying this to `kerberos.enabled` alone was wrong and the
+    // stand showed it: there the KDC is a separate process serving the same realm, so this server
+    // answered a member's join with a NULL domain SID, which a join reads as an allocation failure
+    // it cannot explain.
     #[cfg(feature = "kdc")]
-    let domain = if config.kerberos.enabled {
+    let domain = if serves_a_domain(&config) {
         // Sixteen octets from the OS. Used only when the store has no domain yet, so a restart
         // cannot change an identity that already exists.
         let mut entropy = [0u8; 16];
@@ -828,16 +845,26 @@ async fn serve() {
         }
         match rust_rest_ldap::smb::Settings::resolve(&smb_config, ip, advertised) {
             Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
-            Ok(settings) => match rust_rest_ldap::smb::serve::start(&settings).await {
-                Ok(running) => {
-                    println!(
-                        "smb: serving IPC$ as {} on {}",
-                        running.netbios_name, running.bind
-                    );
-                    Some(running)
+            Ok(mut settings) => {
+                // The domain's SID, when this process issues one. `lsarpc` reports it beside the
+                // domain's name, and a member's join stores it as the domain the machine belongs
+                // to - so it comes from the issuer that already wrote the SIDs on the accounts,
+                // not from the configuration.
+                #[cfg(feature = "kdc")]
+                if let Some(issuer) = &domain {
+                    settings.domain_sid = Some(issuer.sid().to_bytes());
                 }
-                Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
-            },
+                match rust_rest_ldap::smb::serve::start(&settings).await {
+                    Ok(running) => {
+                        println!(
+                            "smb: serving IPC$ as {} on {}",
+                            running.netbios_name, running.bind
+                        );
+                        Some(running)
+                    }
+                    Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+                }
+            }
         }
     } else {
         None
