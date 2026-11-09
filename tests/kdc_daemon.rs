@@ -57,8 +57,7 @@ async fn source_with_account(dir: &std::path::Path, account: &str) -> Arc<Source
         if service {
             // Without SERVER the TGS refuses a ticket for it - see `TODO.md` in the KDC: the answer
             // is `S_PRINCIPAL_UNKNOWN`, and it reads as a policy refusal in the message.
-            entry.flags =
-                rust_kdc::hdb::flags::SERVER | rust_kdc::hdb::flags::FORWARDABLE;
+            entry.flags = rust_kdc::hdb::flags::SERVER | rust_kdc::hdb::flags::FORWARDABLE;
         }
         for enctype in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
             entry

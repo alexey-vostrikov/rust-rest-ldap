@@ -906,6 +906,15 @@ fn search_root_dse(
         .push(crate::model::Attribute::single(
             "subschemaSubentry",
             super::schema_entry::PRIMARY_DN,
+        ))
+        // RFC 4512 5.1: the DSA's notion of the current time, so a client can measure the
+        // difference without guessing from its own clock. Advisory clients print nothing without
+        // it - `net ads info` reports "Failed to get server's current time" and a server time of
+        // 1970 - and a clock difference is the first thing anybody checks when Kerberos rejects
+        // a ticket, so an absence here sends that check to the wrong place.
+        .push(crate::model::Attribute::single(
+            "currentTime",
+            &crate::operational::generalized_time(std::time::SystemTime::now()),
         ));
 
     let selection: Vec<String> = request
@@ -1055,6 +1064,25 @@ mod tests {
         }
     }
 
+    /// The values of one attribute of the first entry, as text.
+    fn attribute_values(messages: &[LdapMessage], name: &str) -> Vec<String> {
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResEntry(entry) => entry
+                .attributes
+                .iter()
+                .find(|attribute| attribute.r#type.0.eq_ignore_ascii_case(name))
+                .map(|attribute| {
+                    attribute
+                        .vals
+                        .iter()
+                        .map(|value| String::from_utf8_lossy(value).into_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            other => panic!("unexpected first message: {other:?}"),
+        }
+    }
+
     #[test]
     fn root_dse_publishes_naming_context_and_supported_control_constantly() {
         let session = admin_session();
@@ -1081,9 +1109,39 @@ mod tests {
                 // RFC 4512 requires the root DSE to name the subschema subentry, or a
                 // client cannot discover that this server publishes a schema at all.
                 "subschemaSubentry",
+                // RFC 4512 5.1: without it, a client cannot compare clocks.
+                "currentTime",
             ]
         );
         assert_eq!(result_code(&messages), ResultCode::Success);
+    }
+
+    #[test]
+    fn root_dse_current_time_is_the_present_moment_in_generalized_time() {
+        // The value is read back rather than matched as a string: a test that compared text
+        // would pass on a server whose clock is set to 1970, which is the failure the attribute
+        // exists to expose.
+        let session = admin_session();
+        let request = request(
+            "",
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let before = std::time::SystemTime::now();
+        let messages = search(&session, &request, None);
+        let after = std::time::SystemTime::now();
+
+        let text = attribute_values(&messages, "currentTime");
+        let value = text.first().expect("the root DSE carries currentTime");
+        let at = crate::operational::parse_generalized_time(value)
+            .unwrap_or_else(|| panic!("currentTime is a generalized time, got {value:?}"));
+        assert!(
+            at >= before && at <= after,
+            "the timestamp falls between the two reads of the clock: {value:?}"
+        );
     }
 
     #[test]

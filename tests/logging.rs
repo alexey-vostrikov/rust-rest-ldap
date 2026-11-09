@@ -15,9 +15,8 @@ use rust_rest_ldap::config::{self, Args};
 
 /// A configuration whose only purpose is to point the log at a file at debug level.
 fn config(log: &std::path::Path, timestamp: bool, caller: bool) -> rust_rest_ldap::config::Config {
-    let text = format!(
-        "base_dn: dc=example,dc=com\nlog_timestamp: {timestamp}\nlog_caller: {caller}\n"
-    );
+    let text =
+        format!("base_dn: dc=example,dc=com\nlog_timestamp: {timestamp}\nlog_caller: {caller}\n");
     let args = Args {
         log_path: Some(PathBuf::from(log)),
         debug: true,
