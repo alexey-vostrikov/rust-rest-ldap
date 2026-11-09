@@ -247,11 +247,15 @@ pub fn admit(
 /// group the directory does not hold is a group where a search must not match, and silence about it
 /// would make a missing import look like a working group.
 ///
-/// `objectSid` is compared as text in the form Windows prints (`S-1-5-21-...-512`), which is what
-/// the schema declares it as and what an operator writes when they populate the directory by hand.
-/// A directory that stores the binary form does not match here, and that is named in the
-/// documentation rather than guessed at: two encodings of one value would need a rule for which
-/// wins, and there is no evidence yet for which one a real deployment carries.
+/// The comparison is on the SID, not on the spelling of the SID. A directory stores the binary
+/// form - `objectSid` is declared as octets, and that is what Samba reads - while a PAC carries the
+/// text form, and a human types the text form into a filter. Comparing the two as strings would
+/// match nothing at all, and would do it silently: the group would be reported as absent from a
+/// directory that holds it, which is a logon that loses its rights for no stated reason.
+///
+/// So both sides are parsed into a `Sid` and compared as values. A value that is neither form is
+/// skipped rather than guessed at - it might be another attribute with a familiar name - and the
+/// entry is then reported as unmatched, which the caller is expected to count.
 pub fn resolve_groups<'a>(
     entries: impl Iterator<Item = (&'a str, &'a Attributes)>,
     wanted: &[String],
@@ -265,28 +269,49 @@ pub fn resolve_groups<'a>(
     // made no claim about its case mattering.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Every wanted SID, parsed once: the PAC's list is compared against every entry, and parsing it
+    // per entry would make a search quadratic in string work for no reason.
+    let wanted: Vec<(String, Option<crate::sid::Sid>)> = wanted
+        .iter()
+        .map(|text| {
+            (
+                text.clone(),
+                crate::sid::Sid::from_directory_value(text).ok(),
+            )
+        })
+        .collect();
+
     for (dn, attributes) in entries {
-        let Some(sid) = attributes
+        let Some(stored) = attributes
             .get("objectSid")
             .and_then(|attribute| attribute.values.first())
         else {
             continue;
         };
-        let sid = sid.trim();
+        let Ok(sid) = crate::sid::Sid::from_directory_value(stored) else {
+            continue;
+        };
 
         if wanted
             .iter()
-            .any(|candidate| candidate.trim().eq_ignore_ascii_case(sid))
+            .any(|(_, candidate)| candidate.as_ref() == Some(&sid))
         {
-            seen.insert(sid.to_ascii_uppercase());
+            seen.insert(sid.to_string());
             found.push((dn.to_string(), sid.to_string()));
         }
     }
 
     let unmatched = wanted
-        .iter()
-        .filter(|candidate| !seen.contains(&candidate.trim().to_ascii_uppercase()))
-        .cloned()
+        .into_iter()
+        .filter(|(_, parsed)| match parsed {
+            // A PAC SID nobody holds. Reported, so that a missing import is counted.
+            Some(sid) => !seen.contains(&sid.to_string()),
+            // A value on either side that is not a SID cannot be matched by anything, and reporting
+            // it is better than silently calling a group present: the text is what the caller can
+            // act on.
+            None => true,
+        })
+        .map(|(text, _)| text)
         .collect();
 
     (found, unmatched)
@@ -295,6 +320,7 @@ pub fn resolve_groups<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Attribute;
     use std::time::Duration;
 
     fn claim(logoff_in: Option<Duration>) -> Claim {
@@ -483,5 +509,83 @@ mod tests {
 
         assert!(found.is_empty());
         assert!(unmatched.is_empty());
+    }
+    /// The bug this replaced: `objectSid` was compared as text, so a binary value from the store
+    /// matched nothing and a group the directory holds came back as absent - a logon that silently
+    /// loses its rights.
+    #[test]
+    fn a_binary_object_sid_matches_the_text_form_a_pac_carries() {
+        let group = crate::sid::Sid::parse("S-1-5-21-1-2-3-512").expect("a SID");
+        let attributes = Attributes::new().push(group.attribute("objectSid"));
+
+        let (found, unmatched) = resolve_groups(
+            [("cn=Domain Admins,dc=example,dc=com", &attributes)].into_iter(),
+            &["S-1-5-21-1-2-3-512".to_string()],
+        );
+
+        assert_eq!(
+            found,
+            vec![(
+                "cn=Domain Admins,dc=example,dc=com".to_string(),
+                "S-1-5-21-1-2-3-512".to_string()
+            )],
+            "a stored binary SID is the same SID as the PAC's text"
+        );
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn a_text_object_sid_an_operator_typed_is_converted_rather_than_refused() {
+        // The choice the task left open: converted, not rejected. `S-1-5-21-...` is the only
+        // spelling a person can type, and refusing it would make a hand-populated directory's
+        // groups invisible to every logon.
+        let attributes =
+            Attributes::new().push(Attribute::single("objectSid", "S-1-5-21-1-2-3-513"));
+
+        let (found, unmatched) = resolve_groups(
+            [("cn=Domain Users,dc=example,dc=com", &attributes)].into_iter(),
+            &["S-1-5-21-1-2-3-513".to_string()],
+        );
+
+        assert_eq!(found.len(), 1);
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn a_group_the_directory_does_not_hold_is_reported_rather_than_assumed() {
+        let held = crate::sid::Sid::parse("S-1-5-21-1-2-3-512").expect("a SID");
+        let attributes = Attributes::new().push(held.attribute("objectSid"));
+
+        let (found, unmatched) = resolve_groups(
+            [("cn=Domain Admins,dc=example,dc=com", &attributes)].into_iter(),
+            &[
+                "S-1-5-21-1-2-3-512".to_string(),
+                "S-1-5-21-1-2-3-515".to_string(),
+            ],
+        );
+
+        assert_eq!(found.len(), 1, "only the one the directory holds");
+        assert_eq!(
+            unmatched,
+            vec!["S-1-5-21-1-2-3-515".to_string()],
+            "a group nobody holds is named, so a missing import is counted rather than silent"
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_sid_matches_nothing_and_is_not_invented() {
+        let attributes =
+            Attributes::new().push(Attribute::single("objectSid", "not a sid, and not base64!"));
+
+        let (found, unmatched) = resolve_groups(
+            [("cn=Broken,dc=example,dc=com", &attributes)].into_iter(),
+            &["S-1-5-21-1-2-3-512".to_string()],
+        );
+
+        assert!(
+            found.is_empty(),
+            "a value that is not a SID identifies nothing"
+        );
+        assert_eq!(unmatched.len(), 1);
     }
 }

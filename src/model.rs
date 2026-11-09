@@ -56,6 +56,43 @@ pub struct AttributeFlags {
     /// Server-internal: never projected and never matched by a filter; reachable
     /// only by the server's own code.
     pub internal: bool,
+    /// The values are octets carried as base64, not text.
+    ///
+    /// A directory's values are octets on the wire and a `String` in this model, so a binary
+    /// attribute - `objectSid`, a key, a certificate - needs an encoding. Base64 is the one LDAP
+    /// itself uses for that in LDIF, so choosing it means the store's form and the file format's
+    /// form agree, and a value imported from LDIF needs no conversion.
+    ///
+    /// The flag travels with the value rather than being looked up from the schema at every read:
+    /// one rule stated once, and a value that is in the store can be decoded without asking which
+    /// schema the server was started with.
+    pub binary: bool,
+}
+
+/// The stored form of a binary attribute's value: base64 of the octets.
+///
+/// One encoding, chosen once: base64 is what LDIF uses to carry octets in a text file, so the
+/// store's form and the file format's form agree and an import needs no conversion. The
+/// alternative - holding the octets in the string - is impossible for a value that is not UTF-8,
+/// which is most of them.
+#[must_use]
+pub fn encode_binary(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The octets of a binary attribute's stored value, or `None` if it is not base64.
+///
+/// `None` rather than a lossy decode on purpose: a caller that gets `None` can say so, and a
+/// caller that silently received the text bytes would pass them on as an identity. What a caller
+/// does with `None` is its own decision - the LDAP response sends the value as it is, because
+/// dropping an attribute makes a client act on its absence.
+#[must_use]
+pub fn decode_binary(value: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .ok()
 }
 
 /// Attribute descriptions repeat across every entry, so the text is interned and
@@ -193,6 +230,13 @@ impl Attribute {
     #[must_use]
     pub fn internal(mut self) -> Self {
         self.flags.internal = true;
+        self
+    }
+
+    /// The values are octets carried as base64, not text.
+    #[must_use]
+    pub fn binary(mut self) -> Self {
+        self.flags.binary = true;
         self
     }
 

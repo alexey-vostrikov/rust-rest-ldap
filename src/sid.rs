@@ -350,6 +350,45 @@ impl fmt::Display for Sid {
     }
 }
 
+/// The name the directory gives a SID.
+pub const ATTRIBUTE: &str = "objectSid";
+
+impl Sid {
+    /// The value a directory holds: base64 of the octets, because the octets are not text.
+    ///
+    /// One form in the store, and it is the form LDIF writes, so a value that arrived in a file
+    /// needs no conversion on the way in and none on the way out.
+    pub fn to_directory_value(&self) -> String {
+        crate::model::encode_binary(&self.to_bytes())
+    }
+
+    /// A SID from a value a directory holds, in either form it can be in.
+    ///
+    /// The binary form is what this server writes. The text form is what an operator writes by
+    /// hand, what `ldif` from an AD export can carry, and what a filter compares against - so it is
+    /// **converted**, not refused: a directory that rejected `S-1-5-21-...` would refuse the only
+    /// spelling a human can type, and the task of noticing that the value is a SID is one this
+    /// function can do.
+    pub fn from_directory_value(text: &str) -> Result<Self, SidError> {
+        let text = text.trim();
+        if text.starts_with("S-") || text.starts_with("s-") {
+            return Sid::parse(text);
+        }
+        let bytes = crate::model::decode_binary(text).ok_or_else(|| {
+            SidError::Syntax(format!(
+                "'{text}' is neither a SID ({ATTRIBUTE}) nor base64 of one"
+            ))
+        })?;
+        Sid::from_bytes(&bytes)
+    }
+
+    /// This SID as a directory attribute, in the binary form.
+    #[must_use]
+    pub fn attribute(&self, name: &str) -> crate::model::Attribute {
+        crate::model::Attribute::new(name, vec![self.to_directory_value()]).binary()
+    }
+}
+
 /// A domain SID and the counter that issues RIDs inside it.
 ///
 /// The counter is a value, not a store: whoever owns the directory holds the number and hands it

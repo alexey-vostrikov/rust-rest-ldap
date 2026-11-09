@@ -13,7 +13,7 @@ use rasn_ldap::{
 
 use super::paged::{self, PAGED_RESULTS_OID, Page};
 
-use crate::model::Attribute;
+use crate::model::{Attribute, decode_binary};
 
 /// Builds the `LdapResult` shared by all responses.
 pub fn ldap_result(code: ResultCode, diagnostic: &str) -> LdapResult {
@@ -56,7 +56,24 @@ pub fn search_result_entry_with_controls(
                     attribute
                         .values
                         .iter()
-                        .map(|value| AttributeValue::from(value.as_bytes()))
+                        .map(|value| {
+                            // A binary attribute is base64 in the store and octets on the wire - see
+                            // `AttributeFlags::binary`. Decoded here rather than stored as octets
+                            // because the model holds text, and base64 is the encoding LDIF itself
+                            // uses, so a value imported from a file needs no conversion.
+                            //
+                            // A flagged value that does not decode is sent as it is: dropping the
+                            // attribute would make an account look like it has no SID, and a
+                            // directory is read by clients that act on absence. Nothing this server
+                            // writes can produce that state - the writers encode - so the fallback
+                            // is for a store somebody else edited.
+                            let bytes = if attribute.flags.binary {
+                                decode_binary(value).unwrap_or_else(|| value.as_bytes().to_vec())
+                            } else {
+                                value.as_bytes().to_vec()
+                            };
+                            AttributeValue::from(bytes)
+                        })
                         .collect(),
                 ),
             )
@@ -199,6 +216,64 @@ pub fn control(oid: &str, criticality: bool, value: Option<&[u8]>) -> Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a client that reads `objectSid` actually gets.
+    ///
+    /// The value in the store is base64, because the model holds text and a SID is not text; on the
+    /// wire it has to be the octets, because that is what Samba and Windows parse - a client handed
+    /// the fourty-four characters of base64 would read them as a SID structure and produce an
+    /// authority and a RID that exist nowhere.
+    #[test]
+    fn a_binary_attribute_leaves_as_octets_not_as_base64() {
+        let sid = crate::sid::Sid::parse("S-1-5-21-1-2-3-512").expect("a SID");
+        let attribute = sid.attribute("objectSid");
+
+        // The store's form is text, and it is not the octets: it is their base64.
+        assert_ne!(
+            attribute.values[0].as_bytes(),
+            sid.to_bytes().as_slice(),
+            "the stored form is base64, not the raw octets"
+        );
+        assert_eq!(
+            crate::model::decode_binary(&attribute.values[0]).as_deref(),
+            Some(&sid.to_bytes()[..]),
+            "and it decodes back to them"
+        );
+
+        let message = search_result_entry(1, "cn=Domain Admins,dc=example,dc=com", &[attribute]);
+        let ProtocolOp::SearchResEntry(entry) = &message.protocol_op else {
+            panic!("expected a search result entry");
+        };
+        let value = entry
+            .attributes
+            .iter()
+            .find(|attribute| attribute.r#type.0.as_str() == "objectSid")
+            .expect("the attribute is in the response")
+            .vals
+            .iter()
+            .next()
+            .expect("it has a value");
+
+        assert_eq!(
+            value.as_ref(),
+            &sid.to_bytes()[..],
+            "what leaves is the SID's octets"
+        );
+    }
+
+    #[test]
+    fn a_text_attribute_is_unchanged_by_the_binary_path() {
+        // The other half of the same rule: only a flagged attribute is decoded, so a `cn` that
+        // happens to look like base64 is still the text it was.
+        let attribute = Attribute::single("cn", "YWxpY2U=");
+        let message = search_result_entry(1, "cn=alice,dc=example,dc=com", &[attribute]);
+
+        let ProtocolOp::SearchResEntry(entry) = &message.protocol_op else {
+            panic!("expected a search result entry");
+        };
+        let value = entry.attributes[0].vals.iter().next().expect("a value");
+        assert_eq!(value.as_ref(), b"YWxpY2U=", "text is not decoded");
+    }
 
     #[test]
     fn result_carries_code_and_diagnostic_message() {
