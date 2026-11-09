@@ -1035,6 +1035,8 @@ mod tests {
         let config = crate::config::Config {
             #[cfg(feature = "kdc")]
             kerberos: crate::kerberos::KerberosConfig::default(),
+            #[cfg(feature = "smb")]
+            smb: Default::default(),
             cldap: Default::default(),
             cache: crate::record_cache::CacheConfig::default(),
             backend: "redb".to_string(),

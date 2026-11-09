@@ -55,6 +55,8 @@ async fn serve(entries: Vec<Entry>) -> String {
     let config = Config {
         #[cfg(feature = "kdc")]
         kerberos: Default::default(),
+        #[cfg(feature = "smb")]
+        smb: Default::default(),
         cldap: Default::default(),
         cache: Default::default(),
         backend: "redb".to_string(),

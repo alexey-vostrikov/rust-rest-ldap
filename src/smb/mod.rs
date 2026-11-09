@@ -56,6 +56,11 @@ pub struct SmbConfig {
     /// and a password in it is a password in `ps` for anybody who can read one.
     #[serde(default)]
     pub users: Vec<SmbUser>,
+    /// The DNS name of the domain, `ad.example.com`.
+    ///
+    /// Derived from the naming context when absent, by the same rule `KerberosConfig` uses, so that
+    /// the realm, the CLDAP answer and this cannot disagree.
+    pub dns_domain: Option<String>,
     /// A keytab for Kerberos in SESSION_SETUP.
     ///
     /// Without it the server accepts NTLM only, which a Samba member can use with an administrator's
@@ -85,6 +90,12 @@ pub struct Settings {
     pub keytab: Option<PathBuf>,
     /// The accounts resolved to their passwords.
     pub users: Vec<(String, String)>,
+    /// The DNS name of the domain, `ad.example.com`.
+    ///
+    /// Answered by `lsarpc` when a member asks what domain it has reached. A client compares this
+    /// against the realm it was told, and a wrong name sends it looking for another domain - so it
+    /// comes from the same place CLDAP takes its answer from, not from a second derivation.
+    pub dns_domain: Option<String>,
 }
 
 impl Settings {
@@ -157,6 +168,7 @@ impl Settings {
             netbios_name,
             keytab: config.keytab.clone(),
             users,
+            dns_domain: config.dns_domain.clone(),
         })
     }
 }

@@ -61,6 +61,9 @@ pub async fn start(settings: &Settings) -> Result<Running, String> {
     if let Some(keytab) = &settings.keytab {
         builder = builder.keytab(keytab);
     }
+    if let Some(domain) = &settings.dns_domain {
+        builder = builder.dns_domain(domain.clone());
+    }
 
     // Passwords, when any are configured. Taken from the resolved settings rather than from the
     // environment here, so that a missing variable was already a startup error.

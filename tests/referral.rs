@@ -44,6 +44,8 @@ async fn serve(
     let config = Config {
         #[cfg(feature = "kdc")]
         kerberos: Default::default(),
+        #[cfg(feature = "smb")]
+        smb: Default::default(),
         cldap: Default::default(),
         cache: Default::default(),
         backend: "null".to_string(),
