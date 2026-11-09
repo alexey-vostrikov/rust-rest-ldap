@@ -96,6 +96,26 @@ fn authenticate(
         AuthenticationChoice::Simple(password) => {
             String::from_utf8_lossy(password.as_ref()).into_owned()
         }
+        // A SASL mechanism this server does not answer is refused by name: a client that gets
+        // "not supported" and no mechanism in the message has nothing to fall back to, and the
+        // operator cannot tell whether the server is misconfigured or the client is asking for
+        // something the deployment never offered.
+        AuthenticationChoice::Sasl(credentials) => {
+            let mechanism = credentials.mechanism.0.to_string();
+            tracing::warn!(
+                mechanism = %mechanism,
+                offered = ?crate::ldap::sasl_bind::MECHANISMS,
+                "bind: a SASL mechanism this server does not answer"
+            );
+            return bind_response(
+                message_id,
+                ResultCode::AuthMethodNotSupported,
+                &format!(
+                    "SASL mechanism {mechanism} is not supported; this server offers {}",
+                    crate::ldap::sasl_bind::MECHANISMS.join(", ")
+                ),
+            );
+        }
         other => {
             return bind_response(
                 message_id,
