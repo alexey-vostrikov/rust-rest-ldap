@@ -43,6 +43,42 @@ if [ -n "${smb:-}" ]; then
   mounts="$mounts -v $smb:/rust-smb-server:ro"
 fi
 
+# The image ships rustc and cargo only, so `clippy` and `rustfmt` are absent and a `make check`
+# run fails with "'cargo-clippy' is not installed" - a lint that never ran being reported as a
+# passing one is worse than a lint that fails. `RUSTUP_HOME` is a mounted volume, so installing
+# the components once makes them available to every later run and to the container's own
+# `rust-toolchain.toml` pin.
+#
+# Installed here rather than in the image because the image is a published one: a local image
+# would drift from the tag it claims to be, and the next person would build against a toolchain
+# nobody else has.
+ensure_components() {
+    missing=""
+    for component_bin in cargo-clippy cargo-fmt; do
+        found=""
+        for candidate in "$rustup_cache"/toolchains/*/bin/"$component_bin"; do
+            [ -x "$candidate" ] && found=1 && break
+        done
+        [ -n "$found" ] || missing="$missing $component_bin"
+    done
+    [ -n "$missing" ] || return 0
+
+    echo "installing$missing into $rustup_cache" >&2
+    docker run --rm \
+        -v "$rustup_cache:/rustup" \
+        -u "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -e RUSTUP_HOME=/rustup \
+        "$IMAGE" sh -c 'rustup component add clippy rustfmt' >&2 || {
+        echo "could not install the lint components; clippy and fmt would not run" >&2
+        exit 1
+    }
+}
+
+case "${1:-}" in
+clippy | fmt) ensure_components ;;
+esac
+
 # MIRIFLAGS is passed through because otherwise `-Zmiri-disable-isolation` is dropped silently, and
 # a test that needs the filesystem fails with "mkdir not available when isolation is enabled" - which
 # reads as a defect in the code under test rather than in the harness.

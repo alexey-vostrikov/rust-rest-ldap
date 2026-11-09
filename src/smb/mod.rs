@@ -61,6 +61,9 @@ pub struct SmbConfig {
     /// Derived from the naming context when absent, by the same rule `KerberosConfig` uses, so that
     /// the realm, the CLDAP answer and this cannot disagree.
     pub dns_domain: Option<String>,
+    /// The domain's NetBIOS name, `AD`. Derived from `dns_domain` when absent.
+    #[serde(default)]
+    pub domain_netbios: Option<String>,
     /// A keytab for Kerberos in SESSION_SETUP.
     ///
     /// Without it the server accepts NTLM only, which a Samba member can use with an administrator's
@@ -103,6 +106,12 @@ pub struct Settings {
     /// than from the configuration: a SID written into a file is a SID that can disagree with the
     /// one already on the accounts.
     pub domain_sid: Option<Vec<u8>>,
+    /// The domain's NetBIOS name, `AD` for `AD.EXAMPLE.COM`.
+    ///
+    /// A member compares it against its configured workgroup before joining, so it is the domain's
+    /// name and not this server's. Derived from the realm when the configuration does not state
+    /// one, by AD's own rule: the realm's first label, upper case.
+    pub domain_netbios: Option<String>,
 }
 
 impl Settings {
@@ -177,6 +186,16 @@ impl Settings {
             users,
             dns_domain: config.dns_domain.clone(),
             domain_sid: None,
+            // The domain's NetBIOS name by AD's own rule: the DNS domain's first label, upper
+            // case. Taken here rather than at the call site because the DNS name is resolved here,
+            // and two places computing one name is two answers a member could be sent to.
+            domain_netbios: config.domain_netbios.clone().or_else(|| {
+                config
+                    .dns_domain
+                    .as_deref()
+                    .and_then(|domain| domain.split('.').next())
+                    .map(|label| label.to_ascii_uppercase())
+            }),
         })
     }
 }
