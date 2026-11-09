@@ -45,12 +45,33 @@ pub struct SmbConfig {
     /// a client which found this server one way recognises it by the other. Two names for one server
     /// is how a machine ends up joined to a controller it cannot reach.
     pub netbios_name: Option<String>,
+    /// Accounts SMB accepts a password for.
+    ///
+    /// NTLM only, and deliberately narrow: this is for the one path a Kerberos realm cannot carry -
+    /// a client that joins with an account's password rather than a ticket. A deployment that has a
+    /// keytab needs none of these, and one that has only these has no domain logon.
+    ///
+    /// The password is named by an environment variable rather than written here, for the same
+    /// reason the bootstrap section does: a configuration file is read by whatever runs the server,
+    /// and a password in it is a password in `ps` for anybody who can read one.
+    #[serde(default)]
+    pub users: Vec<SmbUser>,
     /// A keytab for Kerberos in SESSION_SETUP.
     ///
     /// Without it the server accepts NTLM only, which a Samba member can use with an administrator's
     /// password and a Windows member will refuse. Read at start and never re-read: a keytab that
     /// changes under a running server is a keytab an operator meant to restart for.
     pub keytab: Option<PathBuf>,
+}
+
+/// One account SMB accepts a password for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmbUser {
+    /// The account name, without a domain prefix.
+    pub name: String,
+    /// The environment variable holding the password.
+    pub password_env: String,
 }
 
 /// The resolved form.
@@ -62,6 +83,8 @@ pub struct Settings {
     pub netbios_name: String,
     /// Where the keytab is, if there is one.
     pub keytab: Option<PathBuf>,
+    /// The accounts resolved to their passwords.
+    pub users: Vec<(String, String)>,
 }
 
 impl Settings {
@@ -106,10 +129,34 @@ impl Settings {
             return Err(format!("smb.keytab '{}' does not exist", keytab.display()));
         }
 
+        // Resolved here rather than at use: a password that is missing is a startup failure with
+        // the variable's name in it, not a session setup that fails later for reasons the operator
+        // has to guess at.
+        let mut users = Vec::with_capacity(config.users.len());
+        for user in &config.users {
+            if user.name.is_empty() {
+                return Err("smb.users: an account with an empty name".to_string());
+            }
+            let password = std::env::var(&user.password_env).map_err(|_| {
+                format!(
+                    "smb.users: '{}' names the password variable '{}', which is not set",
+                    user.name, user.password_env
+                )
+            })?;
+            if password.is_empty() {
+                return Err(format!(
+                    "smb.users: '{}' has an empty password in '{}'",
+                    user.name, user.password_env
+                ));
+            }
+            users.push((user.name.clone(), password));
+        }
+
         Ok(Settings {
             bind: SocketAddr::new(bind_ip, port),
             netbios_name,
             keytab: config.keytab.clone(),
+            users,
         })
     }
 }
@@ -167,6 +214,49 @@ mod tests {
         let error = Settings::resolve(&long, Ipv4Addr::LOCALHOST.into(), None)
             .expect_err("15 octets at most");
         assert!(error.contains("15"), "{error}");
+    }
+
+    #[test]
+    fn a_password_that_is_not_in_the_environment_stops_the_start() {
+        // Named by a variable rather than written in the file, so this is where a missing one is
+        // caught: a session setup failing later would say nothing about which variable to set.
+        let configured = SmbConfig {
+            users: vec![SmbUser {
+                name: "administrator".to_string(),
+                password_env: "RR_LDAP_TEST_MISSING_PASSWORD_VARIABLE".to_string(),
+            }],
+            ..config()
+        };
+        let error = Settings::resolve(&configured, Ipv4Addr::LOCALHOST.into(), Some("SAMBA"))
+            .expect_err("the variable is not set");
+        assert!(
+            error.contains("RR_LDAP_TEST_MISSING_PASSWORD_VARIABLE"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_account_resolves_to_its_password() {
+        // The one path a realm cannot carry: a client that joins with a password rather than a
+        // ticket, which is what NTLM needs.
+        //
+        // `PATH` rather than a variable of its own: this crate forbids `unsafe`, so a test cannot
+        // set one, and what is being checked is the reading, not the value.
+        let expected = std::env::var("PATH").expect("PATH is set for any process");
+        let configured = SmbConfig {
+            users: vec![SmbUser {
+                name: "administrator".to_string(),
+                password_env: "PATH".to_string(),
+            }],
+            ..config()
+        };
+
+        let settings =
+            Settings::resolve(&configured, Ipv4Addr::LOCALHOST.into(), Some("SAMBA")).expect("ok");
+        assert_eq!(
+            settings.users,
+            vec![("administrator".to_string(), expected)]
+        );
     }
 
     #[test]

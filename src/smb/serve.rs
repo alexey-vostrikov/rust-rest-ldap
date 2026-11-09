@@ -62,6 +62,12 @@ pub async fn start(settings: &Settings) -> Result<Running, String> {
         builder = builder.keytab(keytab);
     }
 
+    // Passwords, when any are configured. Taken from the resolved settings rather than from the
+    // environment here, so that a missing variable was already a startup error.
+    for (name, password) in &settings.users {
+        builder = builder.user(name.clone(), password.clone());
+    }
+
     let server = builder
         .build()
         .map_err(|err| format!("smb '{}': {err}", settings.bind))?;
