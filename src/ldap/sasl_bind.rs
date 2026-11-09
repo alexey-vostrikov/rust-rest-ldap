@@ -173,6 +173,20 @@ pub fn handle_gssapi(
     request: &BindRequest,
     security: &Security,
 ) -> rasn_ldap::LdapMessage {
+    // The mechanism and the token's first bytes, on every round: a client that fails here names
+    // neither, and which mechanism arrived is the first thing to know. `GSS-SPNEGO` can carry either
+    // Kerberos or NTLM inside, and the two need different answers.
+    if let AuthenticationChoice::Sasl(credentials) = &request.authentication {
+        tracing::debug!(
+            mechanism = %credentials.mechanism.0,
+            token = credentials.credentials.as_ref().map_or(0, |value| value.len()),
+            first = credentials.credentials.as_ref().map_or_else(String::new, |value| {
+                value.iter().take(8).map(|b| format!("{b:02x}")).collect()
+            }),
+            "sasl bind"
+        );
+    }
+
     let Some(gssapi) = security.gssapi.clone() else {
         session.reset();
         return bind_response(

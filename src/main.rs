@@ -857,10 +857,13 @@ async fn serve() {
                 // The domain's NetBIOS name, by AD's own rule: the realm's first label, upper
                 // case. This is the last place it can be stated explicitly; `Settings::resolve`
                 // derives it from the DNS domain otherwise.
-                if let Some(realm) = &config.kerberos.realm {
-                    if let Some(first) = realm.split('.').next() {
-                        settings.domain_netbios = Some(first.to_ascii_uppercase());
-                    }
+                if let Some(first) = config
+                    .kerberos
+                    .realm
+                    .as_deref()
+                    .and_then(|realm| realm.split('.').next())
+                {
+                    settings.domain_netbios = Some(first.to_ascii_uppercase());
                 }
                 match rust_rest_ldap::smb::serve::start(&settings).await {
                     Ok(running) => {
