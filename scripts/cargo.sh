@@ -5,13 +5,34 @@
 # version is the one pinned in rust-toolchain.toml and the image below.
 set -eu
 
-IMAGE="${RR_LDAP_IMAGE:-rust:1.99.1-slim-trixie}"
 repo=$(cd "$(dirname "$0")/.." && pwd)
-cargo_cache="${RR_LDAP_CARGO_CACHE:-$HOME/.cache/rrl/cargo}"
+# One registry for every Rust project on this machine, named after the base it serves: a registry
+# filled under one glibc is one the next toolchain may not be able to use. `RR_LDAP_CARGO_CACHE`
+# still overrides it for a one-off run.
+cargo_cache="${RR_LDAP_CARGO_CACHE:-rrl-cargo-bullseye}"
 rustup_cache="${RR_LDAP_RUSTUP_CACHE:-$HOME/.cache/rrl/rustup}"
 target_cache="${RR_LDAP_TARGET_CACHE:-$HOME/.cache/rrl/target}"
 
-mkdir -p "$cargo_cache" "$rustup_cache" "$target_cache"
+# Bullseye, assembled locally: `rust:<version>-bullseye` is not published, and the reason to want
+# it is glibc - bullseye gives 2.31, which the stands and Astra Linux run, while bookworm gives 2.36
+# and a binary built there will not start. The assembly is `docker/toolchain.Dockerfile`, the same
+# file rust-smb-server uses, so the two crates build on one toolchain.
+TOOLCHAIN_CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$repo/rust-toolchain.toml")
+IMAGE="${RR_LDAP_IMAGE:-rust:${TOOLCHAIN_CHANNEL}-bullseye}"
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "building $IMAGE from docker/toolchain.Dockerfile (once)" >&2
+    docker build -f "$repo/docker/toolchain.Dockerfile" -t "$IMAGE" \
+        --build-arg "RUST_TOOLCHAIN=${TOOLCHAIN_CHANNEL}" "$repo/docker" >&2
+fi
+
+mkdir -p "$target_cache"
+case "$cargo_cache" in
+/* | .*) mkdir -p "$cargo_cache" ;;
+*) docker volume create "$cargo_cache" >/dev/null ;;
+esac
+case "$rustup_cache" in
+/* | .*) mkdir -p "$rustup_cache" ;;
+esac
 
 # The KDC is a sibling checkout, not a published crate, so the container has to see it at the path
 # the manifest names: `/w/../rust-kdc` resolves to `/rust-kdc`. Mounted read-only - this repository
@@ -43,41 +64,6 @@ if [ -n "${smb:-}" ]; then
   mounts="$mounts -v $smb:/rust-smb-server:ro"
 fi
 
-# The image ships rustc and cargo only, so `clippy` and `rustfmt` are absent and a `make check`
-# run fails with "'cargo-clippy' is not installed" - a lint that never ran being reported as a
-# passing one is worse than a lint that fails. `RUSTUP_HOME` is a mounted volume, so installing
-# the components once makes them available to every later run and to the container's own
-# `rust-toolchain.toml` pin.
-#
-# Installed here rather than in the image because the image is a published one: a local image
-# would drift from the tag it claims to be, and the next person would build against a toolchain
-# nobody else has.
-ensure_components() {
-    missing=""
-    for component_bin in cargo-clippy cargo-fmt; do
-        found=""
-        for candidate in "$rustup_cache"/toolchains/*/bin/"$component_bin"; do
-            [ -x "$candidate" ] && found=1 && break
-        done
-        [ -n "$found" ] || missing="$missing $component_bin"
-    done
-    [ -n "$missing" ] || return 0
-
-    echo "installing$missing into $rustup_cache" >&2
-    docker run --rm \
-        -v "$rustup_cache:/rustup" \
-        -u "$(id -u):$(id -g)" \
-        -e HOME=/tmp \
-        -e RUSTUP_HOME=/rustup \
-        "$IMAGE" sh -c 'rustup component add clippy rustfmt' >&2 || {
-        echo "could not install the lint components; clippy and fmt would not run" >&2
-        exit 1
-    }
-}
-
-case "${1:-}" in
-clippy | fmt) ensure_components ;;
-esac
 
 # MIRIFLAGS is passed through because otherwise `-Zmiri-disable-isolation` is dropped silently, and
 # a test that needs the filesystem fails with "mkdir not available when isolation is enabled" - which
@@ -86,13 +72,11 @@ exec docker run --rm \
   -v "$repo:/w" \
   $mounts \
   -v "$cargo_cache:/cargo" \
-  -v "$rustup_cache:/rustup" \
   -v "$target_cache:/target" \
   -w /w \
   -u "$(id -u):$(id -g)" \
   -e HOME=/tmp \
   -e CARGO_HOME=/cargo \
-  -e RUSTUP_HOME=/rustup \
   -e CARGO_TARGET_DIR=/target \
   -e CARGO_TERM_COLOR=never \
   -e "MIRIFLAGS=${MIRIFLAGS:-}" \
