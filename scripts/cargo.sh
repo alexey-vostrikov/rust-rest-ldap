@@ -14,12 +14,12 @@ target_cache="${RR_LDAP_TARGET_CACHE:-$HOME/.cache/rrl/target}"
 mkdir -p "$cargo_cache" "$rustup_cache" "$target_cache"
 
 # The KDC is a sibling checkout, not a published crate, so the container has to see it at the path
-# the manifest names: `/w/../rust-heimdal-kdc` resolves to `/rust-heimdal-kdc`. Mounted read-only -
-# this repository only ever consumes it, and a build that could write into a neighbouring project is
-# a build that can corrupt one. Where it lives is a checkout detail (`RR_LDAP_KDC` overrides it), so
-# a missing one is not fatal: `cargo` then reports the missing package itself, which is the honest
-# failure rather than a mount that quietly succeeds nowhere.
-for candidate in "${RR_LDAP_KDC:-}" "$repo/../rust-heimdal-kdc" "$repo/../../rust-heimdal-kdc"; do
+# the manifest names: `/w/../rust-kdc` resolves to `/rust-kdc`. Mounted read-only - this repository
+# only ever consumes it, and a build that could write into a neighbouring project is a build that
+# can corrupt one. Where it lives is a checkout detail (`RR_LDAP_KDC` overrides it), so a missing
+# one is not fatal: `cargo` then reports the missing package itself, which is the honest failure
+# rather than a mount that quietly succeeds nowhere.
+for candidate in "${RR_LDAP_KDC:-}" "$repo/../rust-kdc" "$repo/../../rust-kdc" "$repo/../rust-heimdal-kdc"; do
   if [ -n "$candidate" ] && [ -d "$candidate" ]; then
     kdc=$(cd "$candidate" && pwd)
     break
@@ -27,7 +27,7 @@ for candidate in "${RR_LDAP_KDC:-}" "$repo/../rust-heimdal-kdc" "$repo/../../rus
 done
 mounts=""
 if [ -n "${kdc:-}" ]; then
-  mounts="-v $kdc:/rust-heimdal-kdc:ro"
+  mounts="-v $kdc:/rust-kdc:ro"
 fi
 
 # The SMB server is a sibling checkout for the same reason and with the same rules: mounted

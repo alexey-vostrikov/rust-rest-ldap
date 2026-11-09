@@ -1,6 +1,6 @@
 //! The realm, read out of this server's own directory.
 //!
-//! Implements `rust_heimdal_kdc::hdb::ldap::Directory`, which is the whole contract a KDC has with
+//! Implements `rust_kdc::hdb::ldap::Directory`, which is the whole contract a KDC has with
 //! whatever holds its principals: read one, write one, delete one, list them. Three of the four are
 //! the directory's job here, so what this file mostly is, is a translation between two spellings of
 //! "attribute" - and a statement about the fourth, which is refused.
@@ -20,9 +20,9 @@
 
 use std::sync::{Arc, RwLock};
 
-use rust_heimdal_kdc::Error;
-use rust_heimdal_kdc::hdb::ldap::{Attributes, Directory as Realm, attrs, dn_for, from_attributes};
-use rust_heimdal_kdc::name::Principal;
+use rust_kdc::Error;
+use rust_kdc::hdb::ldap::{Attributes, Directory as Realm, attrs, dn_for, from_attributes};
+use rust_kdc::name::Principal;
 
 use crate::directory::Directory;
 use crate::model::Entry;
@@ -107,7 +107,7 @@ impl RealmView {
 }
 
 impl Realm for RealmView {
-    fn get(&self, principal: &Principal) -> rust_heimdal_kdc::Result<Option<Attributes>> {
+    fn get(&self, principal: &Principal) -> rust_kdc::Result<Option<Attributes>> {
         let Some(entry) = self.entry_for(principal) else {
             return Ok(None);
         };
@@ -135,7 +135,7 @@ impl Realm for RealmView {
     /// with an `eq` index only when an operator asked for it: correctness first, and the number of
     /// entries this is asked about is one per ticket. When the index is there the attribute is
     /// what a search would use, and this becomes the same work done by hand.
-    fn get_by_spn(&self, spn: &str) -> rust_heimdal_kdc::Result<Option<Attributes>> {
+    fn get_by_spn(&self, spn: &str) -> rust_kdc::Result<Option<Attributes>> {
         let directory = self.current();
         let Some(entry) = directory.all().iter().find(|entry| {
             entry
@@ -158,7 +158,7 @@ impl Realm for RealmView {
         Ok(Some(attributes))
     }
 
-    fn put(&self, principal: &Principal, _attributes: &Attributes) -> rust_heimdal_kdc::Result<()> {
+    fn put(&self, principal: &Principal, _attributes: &Attributes) -> rust_kdc::Result<()> {
         // Not a limitation of this adapter but a decision: an account has a password policy, an
         // access check and a replication history, and all three live on the LDAP path. A KDC-side
         // write would create an entry that skipped them, and the entry would then be
@@ -168,13 +168,13 @@ impl Realm for RealmView {
         )))
     }
 
-    fn delete(&self, principal: &Principal) -> rust_heimdal_kdc::Result<bool> {
+    fn delete(&self, principal: &Principal) -> rust_kdc::Result<bool> {
         Err(Error::Hdb(format!(
             "the realm is read-only here: delete '{principal}' through LDAP"
         )))
     }
 
-    fn list(&self) -> rust_heimdal_kdc::Result<Vec<Principal>> {
+    fn list(&self) -> rust_kdc::Result<Vec<Principal>> {
         let directory = self.current();
         let mut out = Vec::new();
         for entry in directory.all() {
@@ -246,10 +246,10 @@ fn is_binary(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    use rust_heimdal_kdc::crypto::{Enctype, OwnCipher};
-    use rust_heimdal_kdc::hdb::Hdb as _;
-    use rust_heimdal_kdc::hdb::HdbEntry;
-    use rust_heimdal_kdc::hdb::ldap::LdapHdb;
+    use rust_kdc::crypto::{Enctype, OwnCipher};
+    use rust_kdc::hdb::Hdb as _;
+    use rust_kdc::hdb::HdbEntry;
+    use rust_kdc::hdb::ldap::LdapHdb;
 
     use crate::model::{Attribute, Attributes, Entry};
 
@@ -388,7 +388,7 @@ mod tests {
         let view = realm(vec![principal_entry("alice", None)]);
         let alice = Principal::parse(&format!("alice@{REALM}")).expect("a principal");
 
-        let put = view.put(&alice, &rust_heimdal_kdc::hdb::ldap::Attributes::new());
+        let put = view.put(&alice, &rust_kdc::hdb::ldap::Attributes::new());
         let delete = view.delete(&alice);
 
         for error in [

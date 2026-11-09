@@ -1968,7 +1968,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-heimdal-kdc"
+name = "rust-kdc"
 version = "0.1.0"
 dependencies = [
  "aes 0.9.4",
@@ -2006,7 +2006,7 @@ dependencies = [
  "rcgen",
  "redb",
  "roaring",
- "rust-heimdal-kdc",
+ "rust-kdc",
  "rustls",
  "rustls-pemfile",
  "rustls-rustcrypto",

@@ -10,11 +10,11 @@
 //! `AcceptOptions` at all. The cryptography underneath is the crate's, and it has its own vectors.
 use std::sync::Arc;
 
-use rust_heimdal_kdc::crypto::{Enctype, OwnCipher};
-use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
-use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
-use rust_heimdal_kdc::name::Principal as HdbPrincipal;
-use rust_heimdal_kdc::transport::{RunningKdc, serve_loopback};
+use rust_kdc::crypto::{Enctype, OwnCipher};
+use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
+use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::name::Principal as HdbPrincipal;
+use rust_kdc::transport::{RunningKdc, serve_loopback};
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -40,9 +40,9 @@ fn realm() -> Arc<dyn Hdb> {
     // sets `CLIENT`, which is why this is not one.
     let mut service =
         HdbEntry::user(HdbPrincipal::parse(&format!("{SERVICE}@{REALM}")).expect("a principal"));
-    service.flags = rust_heimdal_kdc::hdb::flags::SERVER
-        | rust_heimdal_kdc::hdb::flags::FORWARDABLE
-        | rust_heimdal_kdc::hdb::flags::PROXIABLE;
+    service.flags = rust_kdc::hdb::flags::SERVER
+        | rust_kdc::hdb::flags::FORWARDABLE
+        | rust_kdc::hdb::flags::PROXIABLE;
     for enctype in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
         alice
             .add_password_key(&cipher, enctype, PASSWORD.as_bytes(), 1)

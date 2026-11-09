@@ -23,10 +23,10 @@
 
 use std::path::Path;
 
-use rust_heimdal_kdc::crypto::{Enctype, OwnCipher};
-use rust_heimdal_kdc::hdb::HdbEntry;
-use rust_heimdal_kdc::hdb::ldap::{attrs, dn_for, to_attributes};
-use rust_heimdal_kdc::name::Principal;
+use rust_kdc::crypto::{Enctype, OwnCipher};
+use rust_kdc::hdb::HdbEntry;
+use rust_kdc::hdb::ldap::{attrs, dn_for, to_attributes};
+use rust_kdc::name::Principal;
 
 use crate::backend::EntryChange;
 use crate::model::{Attribute, AttributeFlags, Attributes, Entry};
@@ -123,7 +123,7 @@ pub fn attributes_of(entry: &HdbEntry) -> Attributes {
     to_directory_attributes(&to_attributes(entry))
 }
 
-fn to_directory_attributes(attributes: &rust_heimdal_kdc::hdb::ldap::Attributes) -> Attributes {
+fn to_directory_attributes(attributes: &rust_kdc::hdb::ldap::Attributes) -> Attributes {
     use base64::Engine as _;
 
     let mut out = Attributes::new();
