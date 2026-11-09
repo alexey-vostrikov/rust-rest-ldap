@@ -96,7 +96,7 @@ attributetype ( 1.2.840.113556.1.4.96 NAME 'pwdLastSet'
 objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTURAL
     MAY ( userPrincipalName $ sAMAccountName $ userAccountControl $ objectGUID $ objectSid $
           servicePrincipalName $ primaryGroupID $ accountExpires $ pwdLastSet $ mail $
-          displayName $ telephoneNumber $ title $ description $ memberOf ) )
+          displayName $ telephoneNumber $ title $ description $ memberOf $ unicodePwd ) )
 
 objectclass ( 1.2.840.113556.1.5.8 NAME 'group' SUP top STRUCTURAL
     MUST cn
@@ -104,8 +104,26 @@ objectclass ( 1.2.840.113556.1.5.8 NAME 'group' SUP top STRUCTURAL
 
 # A computer account: the machine identity Kerberos actually uses most of the time.
 objectclass ( 1.2.840.113556.1.5.5 NAME 'computer' SUP user STRUCTURAL
-    MAY ( sAMAccountName $ userAccountControl $ servicePrincipalName $ operatingSystem $
-          operatingSystemVersion ) )
+    MAY ( sAMAccountName $ userAccountControl $ servicePrincipalName $ dNSHostName $
+          msDS-SupportedEncryptionTypes $ operatingSystem $ operatingSystemVersion ) )
+
+# The name a machine is reached by, and the one `net ads join` writes first. A member reads it back
+# to find itself in the directory.
+attributetype ( 1.2.840.113556.1.4.619 NAME 'dNSHostName'
+    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+# The enctypes an account is willing to use. Written by the member once it has seen the KDC; read
+# when the KDC decides which key to issue. An integer, not a bit string: so AD declares it.
+attributetype ( 1.2.840.113556.1.4.1963 NAME 'msDS-SupportedEncryptionTypes'
+    EQUALITY integerMatch ORDERING integerOrderingMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+
+# The password of an account, as a client writes it. AD carries it as an octet string and never
+# returns it; that it is write-only is the ACL rules' business, not the syntax's.
+attributetype ( 1.2.840.113556.1.4.90 NAME 'unicodePwd'
+    EQUALITY octetStringMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
 
 attributetype ( 1.2.840.113556.1.4.373 NAME 'operatingSystem'
     EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
@@ -214,6 +232,9 @@ mod tests {
             "grouptype",
             "accountexpires",
             "pwdlastset",
+            "dnshostname",
+            "msds-supportedencryptiontypes",
+            "unicodepwd",
         ] {
             assert!(
                 schema.attribute(name).is_some(),
@@ -255,6 +276,58 @@ mod tests {
 
         if let Err(violations) = schema.check(&entry) {
             panic!("an AD-shaped user must validate: {violations:?}");
+        }
+    }
+
+    #[test]
+    fn an_entry_shaped_like_a_computer_that_joined_validates() {
+        // Exactly what `net ads join` writes, attribute by attribute: the four SPNs it derives from
+        // its own name, the host name a member reads back to find itself, the account flags, and the
+        // enctypes. If any of these is missing from the schema, the member's single `add` is refused
+        // as a whole and the failure reads as a schema complaint rather than as a missing attribute
+        // - which is the state this test was written to end.
+        let schema = with_ad();
+        let entry = crate::model::Entry::new(
+            "cn=samba,cn=computers,dc=ad,dc=example,dc=com",
+            crate::model::Attributes::new()
+                .push(crate::model::Attribute::new(
+                    "objectClass",
+                    vec![
+                        "top".to_string(),
+                        "person".to_string(),
+                        "organizationalPerson".to_string(),
+                        "user".to_string(),
+                        "computer".to_string(),
+                    ],
+                ))
+                .push(crate::model::Attribute::single("cn", "samba"))
+                .push(crate::model::Attribute::single("sn", "samba"))
+                .push(crate::model::Attribute::single("sAMAccountName", "samba$"))
+                .push(crate::model::Attribute::single(
+                    "dNSHostName",
+                    "samba.ad.example.com",
+                ))
+                .push(crate::model::Attribute::new(
+                    "servicePrincipalName",
+                    vec![
+                        "HOST/samba".to_string(),
+                        "HOST/samba.ad.example.com".to_string(),
+                        "RestrictedKrbHost/samba".to_string(),
+                        "RestrictedKrbHost/samba.ad.example.com".to_string(),
+                    ],
+                ))
+                .push(crate::model::Attribute::single(
+                    "userAccountControl",
+                    "4128",
+                ))
+                .push(crate::model::Attribute::single(
+                    "msDS-SupportedEncryptionTypes",
+                    "24",
+                )),
+        );
+
+        if let Err(violations) = schema.check(&entry) {
+            panic!("a computer account as a member writes it must validate: {violations:?}");
         }
     }
 
