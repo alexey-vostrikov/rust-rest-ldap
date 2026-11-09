@@ -12,9 +12,15 @@ use thiserror::Error;
 
 pub mod file;
 pub mod http;
+/// The index as an artefact, apart from the entries it indexes.
+pub mod index_store;
+/// The change journal as its own boundary: `rrl-sync` wants it, `rrl-ldap` does not.
+pub mod journal;
 pub mod null;
 pub mod redb_store;
 pub mod rest;
+/// What the directory needs from whatever stores it.
+pub mod store;
 
 pub use file::FileBackend;
 pub use null::NullBackend;
