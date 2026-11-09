@@ -169,6 +169,69 @@ impl Domain {
     }
 }
 
+/// The issuer a write path calls: the domain, behind a mutex, and the store that keeps it.
+///
+/// Behind a `Mutex` because issuing is a read-modify-write of one number: two concurrent adds that
+/// both read the counter would both write the same next value, and the second account would get the
+/// first one's SID. The lock is held for two store writes, which is the price of the one property
+/// that matters here - a number handed out once.
+#[derive(Debug)]
+pub struct Issuer {
+    backend: Backend,
+    domain: std::sync::Mutex<Domain>,
+}
+
+impl Issuer {
+    /// An issuer over `domain`, recording positions in `backend`.
+    #[must_use]
+    pub fn new(backend: Backend, domain: Domain) -> Self {
+        Issuer {
+            backend,
+            domain: std::sync::Mutex::new(domain),
+        }
+    }
+
+    /// Reads or creates the domain, and returns an issuer for it.
+    pub fn open(backend: &Backend, entropy: [u8; 16]) -> Result<Self, Error> {
+        let domain = Domain::ensure(backend, entropy)?;
+        Ok(Issuer::new(backend.clone(), domain))
+    }
+
+    /// The domain's SID.
+    pub fn sid(&self) -> Sid {
+        self.lock().sid().clone()
+    }
+
+    /// The position the next RID will take.
+    pub fn peek(&self) -> u32 {
+        self.lock().allocator().peek()
+    }
+
+    /// Takes the next RID.
+    ///
+    /// A poisoned lock is recovered rather than propagated: the domain behind it is still a whole
+    /// domain, and refusing every account creation for the rest of the process because one writer
+    /// panicked is worse than the panic.
+    pub fn take(&self) -> Result<Sid, Error> {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        domain.take(&self.backend)
+    }
+
+    /// The SID of a built-in account or group.
+    pub fn reserved(&self, rid: u32) -> Result<Sid, Error> {
+        self.lock().reserved(rid)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Domain> {
+        self.domain
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +369,39 @@ mod tests {
             Err(Error::Invalid(detail)) => assert!(detail.contains("reserved"), "{detail}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn two_writers_at_once_get_two_different_sids() {
+        // The property the mutex is for. Two concurrent adds that both read the counter before
+        // either wrote it would both record the same next value, and the two accounts would end up
+        // with one SID - one account's rights, on somebody else's entry.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = store(dir.path());
+        let issuer = std::sync::Arc::new(Issuer::open(&backend, [11u8; 16]).expect("an issuer"));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let issuer = std::sync::Arc::clone(&issuer);
+                std::thread::spawn(move || issuer.take().expect("a SID"))
+            })
+            .collect();
+
+        let mut sids: Vec<Sid> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("no panic"))
+            .collect();
+        sids.sort();
+        sids.dedup();
+        assert_eq!(sids.len(), 8, "eight writers, eight distinct SIDs");
+
+        // And the store agrees: the counter moved past everything handed out, so a restart cannot
+        // hand one of them out again.
+        let stored = Domain::load(&backend).expect("read").expect("present");
+        assert_eq!(
+            stored.allocator().peek(),
+            crate::sid::FIRST_UNRESERVED_RID + 8
+        );
     }
 
     #[test]

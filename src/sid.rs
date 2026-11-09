@@ -19,6 +19,7 @@
 //! every client in the world, before any client has asked the directory anything. A counter that
 //! began at 500 and handed them out again would produce a domain administrator nobody intended.
 
+pub mod assign;
 pub mod domain;
 
 use std::fmt;

@@ -462,6 +462,36 @@ async fn serve() {
         }
     }
 
+    // The domain's identity: its SID, and the counter that issues RIDs inside it. Opened before the
+    // source takes ownership of the backend, because both live in that store, and a SID derived
+    // after the fact would be a second SID.
+    //
+    // Tied to `kerberos.enabled` for now, and the tie is deliberate rather than incidental: a server
+    // that issues tickets is the thing a domain controller means, and a directory that issues SIDs
+    // without a realm would be handing out identities no ticket can name. When there is a reason to
+    // separate them, this becomes its own section.
+    #[cfg(feature = "kdc")]
+    let domain = if config.kerberos.enabled {
+        // Sixteen octets from the OS. Used only when the store has no domain yet, so a restart
+        // cannot change an identity that already exists.
+        let mut entropy = [0u8; 16];
+        if let Err(err) = getrandom::fill(&mut entropy) {
+            fatal(&i18n::t(
+                "error.server",
+                &[("detail", &format!("randomness: {err}"))],
+            ));
+        }
+        match rust_rest_ldap::sid::domain::Issuer::open(&backend, entropy) {
+            Ok(issuer) => {
+                println!("domain: {} (next RID {})", issuer.sid(), issuer.peek());
+                Some(Arc::new(issuer))
+            }
+            Err(err) => fatal(&i18n::t("error.server", &[("detail", &err.to_string())])),
+        }
+    } else {
+        None
+    };
+
     let (source, directory) = match rust_rest_ldap::reload::Source::load(&config, backend).await {
         Ok(loaded) => loaded,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
@@ -484,7 +514,15 @@ async fn serve() {
         );
     }
 
-    let security = Security::from_config(&config)
+    #[cfg(feature = "kdc")]
+    let security = match &domain {
+        Some(domain) => Security::from_config(&config).with_domain(Arc::clone(domain)),
+        None => Security::from_config(&config),
+    };
+    #[cfg(not(feature = "kdc"))]
+    let security = Security::from_config(&config);
+
+    let security = security
         .with_gssapi(gssapi)
         .with_schema(source.shared_schema())
         // The file backend stores a fixed user/group document and refuses a whole entry, so an

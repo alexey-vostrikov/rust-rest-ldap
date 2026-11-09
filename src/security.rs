@@ -230,6 +230,13 @@ pub struct Security {
     /// time - a line on stderr per bind, forever. Deciding once, here, is what makes it a
     /// startup statement instead of a per-request one.
     pub can_upgrade_password_hashes: bool,
+    /// The domain's identity, when this server issues SIDs.
+    ///
+    /// Rides here for the same reason `config_document` does: `Security` is the per-server handle the
+    /// protocol layer already receives, and a second parameter through every `ldap::handle` call
+    /// site would be threaded for one attribute. `None` means "not a domain": an ordinary directory
+    /// has no SID to give, and an entry created in it carries none.
+    pub domain: Option<std::sync::Arc<crate::sid::domain::Issuer>>,
     /// Subtrees this server does not hold, and where the client is sent for them.
     pub referrals: crate::referral::Referrals,
     /// The server's own size and time limits.
@@ -252,6 +259,7 @@ impl Default for Security {
         Self {
             respect_control_criticality: true,
             can_upgrade_password_hashes: true,
+            domain: None,
             referrals: crate::referral::Referrals::default(),
             gssapi: None,
             limits: crate::limits::Limits::default(),
@@ -303,6 +311,9 @@ impl Security {
     pub fn from_config(config: &Config) -> Self {
         Self {
             respect_control_criticality: config.respect_control_criticality,
+            // A domain is attached by the daemon once the store is open, not derived from the
+            // configuration here: the SID lives in the store, and this function has no store.
+            domain: None,
             passwords: config.passwords.clone(),
             acl: config.acl.clone(),
             allow_unencrypted_bind: config.allow_unencrypted_bind,
@@ -350,6 +361,12 @@ impl Security {
     }
 
     /// The same policy, knowing whether a hash upgrade can be stored at all.
+    /// Makes this server the issuer of a domain's SIDs.
+    pub fn with_domain(mut self, domain: std::sync::Arc<crate::sid::domain::Issuer>) -> Self {
+        self.domain = Some(domain);
+        self
+    }
+
     pub fn with_password_upgrade(mut self, possible: bool) -> Self {
         self.can_upgrade_password_hashes = possible;
         self

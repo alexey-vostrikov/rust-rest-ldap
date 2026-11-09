@@ -257,6 +257,21 @@ pub fn handle_add(
         attributes = attributes.push(built);
     }
 
+    // The SID, before the schema check rather than after: the schema has something to say about
+    // `objectSid`, and checking an entry to which the attribute has not been added yet would be
+    // checking a different entry. A write refused later therefore spends a RID, which is the
+    // intended trade - a number skipped is invisible, a number reused is an account with somebody
+    // else's rights.
+    match crate::sid::assign::decide(&attributes, security) {
+        crate::sid::assign::Assigned::Attribute(attribute) => {
+            attributes = attributes.push(attribute);
+        }
+        crate::sid::assign::Assigned::Nothing => {}
+        crate::sid::assign::Assigned::Refused(detail) => {
+            return reject(response(ResultCode::InvalidAttributeSyntax, &detail));
+        }
+    }
+
     let entry = Entry::new(entry_dn.clone(), attributes);
 
     let published = crate::security::current_schema(&security.schema);
@@ -586,6 +601,91 @@ mod tests {
         attributes
             .get(name)
             .map(|attribute| attribute.values.to_vec())
+    }
+
+    /// The wiring, as opposed to the rule: `decide` has its own tests, and what this holds is that
+    /// `handle_add` calls it at all. Removing the call leaves every rule test green and every new
+    /// account without an identity.
+    #[cfg(feature = "kdc")]
+    #[test]
+    fn an_added_account_leaves_with_a_sid_when_this_server_is_a_domain() {
+        use rasn::types::SetOf;
+        use rasn_ldap::Attribute as WireAttribute;
+        use rasn_ldap::{AddRequest, AttributeDescription, AttributeValue, LdapDn};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("directory.redb");
+        let text = format!(
+            "base_dn: dc=example,dc=com\n\
+             access:\n  - subject: anonymous\n    attributes: [\"*\"]\n    rights: [read, search, write, compare]\n\
+             backends:\n  redb:\n    path: {}\n\
+             kerberos:\n  enabled: true\n",
+            path.display()
+        );
+        let config = crate::config::resolve(crate::config::Args::default(), Some(&text), |_| None)
+            .expect("config");
+        let backend = crate::backend::Backend::from_config("redb", config.backends.get("redb"))
+            .expect("backend");
+        let domain = crate::sid::domain::Domain::ensure(&backend, [77u8; 16]).expect("a domain");
+        let issuer = std::sync::Arc::new(crate::sid::domain::Issuer::new(backend.clone(), domain));
+        // From the configuration rather than `default()`, so the schema is the one the config built:
+        // with `kerberos.enabled` the AD vocabulary is applied, and `user` with `objectSid` validates.
+        let security = Security::from_config(&config).with_domain(std::sync::Arc::clone(&issuer));
+
+        // The base and the users OU, so the add has a parent.
+        let directory = crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        );
+
+        let attribute = |name: &str, values: Vec<&str>| {
+            WireAttribute::new(
+                AttributeDescription::from(name),
+                SetOf::from_vec(
+                    values
+                        .into_iter()
+                        .map(|value| AttributeValue::from(value.as_bytes().to_vec()))
+                        .collect(),
+                ),
+            )
+        };
+
+        let request = AddRequest {
+            entry: LdapDn::from("cn=alice,ou=users,dc=example,dc=com"),
+            attributes: vec![
+                attribute("objectClass", vec!["top", "person", "user"]),
+                attribute("cn", vec!["alice"]),
+                attribute("sn", vec!["Surname"]),
+            ],
+        };
+
+        // Anonymous, because that is what the configuration above grants `write` to. The subject of
+        // this test is the SID, not the access rules, which have their own tests.
+        let session = Session::new();
+
+        let outcome = handle_add(&session, &directory, 1, &request, &security);
+        let changes = match outcome {
+            Outcome::Persist { changes, .. } => changes,
+            Outcome::Reject(message) => panic!("the add was refused: {message:?}"),
+        };
+
+        let added = changes
+            .iter()
+            .find_map(|change| match change {
+                EntryChange::Upsert { entry } => Some(entry),
+                _ => None,
+            })
+            .expect("the entry to write");
+
+        let attribute = added
+            .attributes()
+            .get(crate::sid::ATTRIBUTE)
+            .expect("a new account carries a SID");
+        assert!(attribute.flags.binary, "in the store's form");
+        let sid = crate::sid::Sid::from_directory_value(&attribute.values[0]).expect("a SID");
+        assert_eq!(sid.parent(), Some(issuer.sid()), "and it is this domain's");
     }
 
     #[test]
