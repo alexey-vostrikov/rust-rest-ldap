@@ -114,6 +114,28 @@ impl std::fmt::Debug for Exchange {
 /// different wrapper, and accepting both costs nothing because the framing is detected anyway.
 pub const MECHANISMS: [&str; 2] = ["GSSAPI", "GSS-SPNEGO"];
 
+/// The NTLMSSP OID, DER-encoded: `1.3.6.1.4.1.311.2.2.10`.
+///
+/// `GSS-SPNEGO` is a container, and which mechanism is inside decides who can answer: a client that
+/// put NTLMSSP there is asking for something this server does not offer, and saying "the token is
+/// not a Kerberos ticket" sends the operator to look at the ticket instead of at the client's
+/// choice. The OID is the only part of a negTokenInit that names the arm without parsing DER.
+const NTLMSSP_OID: [u8; 12] = [
+    0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+];
+
+/// Whether a token offers NTLMSSP among its mechanisms.
+///
+/// A scan, not a parse: the OID appears in the clear in every negTokenInit that offers NTLM, and a
+/// full DER walk to learn one fact would be a parser to keep correct for a message this server
+/// refuses anyway. A token that offers both Kerberos and NTLM still contains the OID, and is
+/// reported as offering NTLM - which is true, and the reason the refusal says what it says.
+pub fn offers_ntlmssp(token: &[u8]) -> bool {
+    token
+        .windows(NTLMSSP_OID.len())
+        .any(|window| window == NTLMSSP_OID)
+}
+
 /// Whether this request is a SASL bind this module handles.
 pub fn is_gssapi(request: &BindRequest) -> bool {
     match &request.authentication {
@@ -322,6 +344,17 @@ fn begin(
              server knows",
             token.first()
         )));
+    }
+
+    // A `GSS-SPNEGO` conversation whose inner mechanism is NTLMSSP is not a Kerberos token that
+    // failed to parse - it is a client asking for a mechanism this server does not offer, and the
+    // refusal has to say which. See `NTLMSSP_OID`.
+    if offers_ntlmssp(&token) {
+        return Err(SaslError::Undecodable(
+            "the SPNEGO token offers NTLMSSP, which this server does not accept: it accepts \
+             Kerberos, so a Samba member joins with `net ads join -k` and a ticket from `kinit`"
+                .to_string(),
+        ));
     }
 
     // Whether the PAC's signature is checked at all is the operator's setting, and the default is
@@ -827,6 +860,74 @@ mod tests {
         };
         assert_eq!(body.result_code, ResultCode::InvalidCredentials);
         assert!(session.identity().is_none());
+    }
+
+    /// NTLMSSP's OID spelled out, `1.3.6.1.4.1.311.2.2.10`, and deliberately not `NTLMSSP_OID`.
+    ///
+    /// A fixture built from the constant it tests moves with it: changing one octet of the constant
+    /// used to leave these tests green, because both sides changed together. These bytes come from
+    /// the OID's own arithmetic, so a wrong constant now fails instead of agreeing with itself.
+    const NTLMSSP_AS_SENT: [u8; 12] = [
+        0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+    ];
+
+    /// The OID, in the framing a client puts it in: `[APPLICATION 0]` wrapping `[0]` wrapping the
+    /// mechanism list. Only the bytes the scan looks for matter here.
+    fn spnego_offering(oid: &[u8]) -> Vec<u8> {
+        let mut token = vec![0x60, 0x00, 0x06, 0x00, 0x2b, 0x06];
+        token.extend_from_slice(oid);
+        token
+    }
+
+    #[test]
+    fn a_spnego_token_offering_ntlmssp_is_refused_by_name() {
+        // `net ads join` with a password puts NTLMSSP inside GSS-SPNEGO: Samba's own trace says
+        // `Starting GENSEC submechanism ntlmssp`, and the LDAP bind that follows is refused. Which
+        // refusal matters to the operator: "this is not a Kerberos ticket" sends them to look at
+        // the ticket, while the truth is that the client was never asked for one.
+        let (security, _dir) = security_with_keytab();
+        let mut session = session();
+
+        let response = handle_gssapi(
+            &mut session,
+            &crate::directory::Directory::from_entries(
+                "dc=example,dc=com",
+                "users",
+                "groups",
+                Vec::new(),
+            ),
+            1,
+            &gssapi_request(Some(spnego_offering(&NTLMSSP_AS_SENT))),
+            &security,
+        );
+
+        let rasn_ldap::ProtocolOp::BindResponse(body) = &response.protocol_op else {
+            panic!("expected a bind response");
+        };
+        assert_eq!(body.result_code, ResultCode::InvalidCredentials);
+        assert!(
+            body.diagnostic_message.0.contains("NTLMSSP"),
+            "the refusal names the mechanism that arrived: {}",
+            body.diagnostic_message.0
+        );
+        assert!(
+            body.diagnostic_message.0.contains("-k"),
+            "and says how a Samba member does reach Kerberos: {}",
+            body.diagnostic_message.0
+        );
+        assert!(session.identity().is_none());
+    }
+
+    #[test]
+    fn a_kerberos_token_is_not_mistaken_for_ntlm() {
+        // The scan must not answer yes to a ticket. The Kerberos OID sits in the same position in
+        // the same framing, so a substring that matched loosely would refuse every real bind - the
+        // kind of defect that only appears against a client that works.
+        let kerberos_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+        assert!(!offers_ntlmssp(&spnego_offering(&kerberos_oid)));
+        assert!(offers_ntlmssp(&spnego_offering(&NTLMSSP_AS_SENT)));
+        // And a bare AP-REQ, which is what `-Y GSSAPI` sends: no negTokenInit, no OID list.
+        assert!(!offers_ntlmssp(&ap_req_bytes()));
     }
 
     #[test]

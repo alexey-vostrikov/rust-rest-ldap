@@ -107,14 +107,26 @@ fn authenticate(
                 offered = ?crate::ldap::sasl_bind::MECHANISMS,
                 "bind: a SASL mechanism this server does not answer"
             );
-            return bind_response(
-                message_id,
-                ResultCode::AuthMethodNotSupported,
-                &format!(
+            // NTLM is named apart from the rest because it is not a mechanism this server forgot:
+            // it is one it decides not to offer. Checking a password here would be a second
+            // implementation beside the one in the SMB session and the one in this directory's own
+            // simple bind, and two checks of one password are two chances to disagree. A Samba
+            // member reaches Kerberos with `-k` or with a ticket in `KRB5CCNAME`.
+            let message = if is_ntlm(&mechanism) {
+                format!(
+                    "SASL mechanism {mechanism} is not offered: this server accepts Kerberos \
+                     ({}), not NTLM. A Samba member joins with `net ads join -k` and a ticket \
+                     from `kinit`; a password makes it choose NTLM, which this directory does not \
+                     check.",
+                    crate::ldap::sasl_bind::MECHANISMS.join(", ")
+                )
+            } else {
+                format!(
                     "SASL mechanism {mechanism} is not supported; this server offers {}",
                     crate::ldap::sasl_bind::MECHANISMS.join(", ")
-                ),
-            );
+                )
+            };
+            return bind_response(message_id, ResultCode::AuthMethodNotSupported, &message);
         }
         other => {
             return bind_response(
@@ -124,6 +136,17 @@ fn authenticate(
             );
         }
     };
+
+    /// Whether a mechanism name is one of NTLM's.
+    ///
+    /// Samba's client uses two spellings depending on which plugin answered: `NTLMSSP` for the bare
+    /// mechanism and `GSS-NTLMSSP` for the SPNEGO-wrapped one. Both mean the same thing here, and the
+    /// answer to both is the same sentence.
+    fn is_ntlm(mechanism: &str) -> bool {
+        ["NTLMSSP", "GSS-NTLMSSP"]
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(mechanism))
+    }
 
     let bind_dn = dn::normalize(&request.name.0);
 
@@ -483,6 +506,41 @@ mod tests {
             "{}",
             diagnostic(&response)
         );
+    }
+
+    #[test]
+    fn a_sasl_mechanism_that_is_ntlm_is_refused_differently_from_an_unknown_one() {
+        // Two different facts for the operator: "never heard of it" and "deliberately not offered".
+        // Samba spells the wrapped one `GSS-NTLMSSP` and the bare one `NTLMSSP`, and a client that
+        // takes the password path sends one of these - the refusal has to lead to `-k`, not to a
+        // mechanism list.
+        let directory = directory();
+
+        for name in ["GSS-NTLMSSP", "NTLMSSP", "ntlmssp"] {
+            let mut session = Session::new();
+            let sasl = BindRequest::new(
+                3,
+                rasn_ldap::LdapDn::from(ADMIN_DN),
+                AuthenticationChoice::Sasl(rasn_ldap::SaslCredentials::new(
+                    rasn_ldap::LdapString::from(name),
+                    None,
+                )),
+            );
+
+            let response = handle_bind(&mut session, &directory, 10, &sasl, &security());
+            let message = diagnostic(&response);
+
+            assert_eq!(
+                code(&response),
+                ResultCode::AuthMethodNotSupported,
+                "{name}"
+            );
+            assert!(message.contains(name), "{name}: {message}");
+            assert!(
+                message.contains("-k"),
+                "{name}: the answer says how to reach Kerberos: {message}"
+            );
+        }
     }
 
     #[test]
