@@ -77,6 +77,12 @@ async fn serve() {
         Err(err) => fatal(&err.message()),
     };
 
+    // Before anything else that could fail: a startup error is the one an operator most needs
+    // to see reported, and until the subscriber exists every `error!` in this process is a no-op.
+    if let Err(err) = rust_rest_ldap::logging::install(&config) {
+        fatal(&format!("log file: {err}"));
+    }
+
     // Now the file has spoken: its `locale:` overrides the environment.
     install_language(
         &config::Args::default(),
@@ -801,13 +807,32 @@ async fn serve() {
         } else {
             None
         };
-        match rust_rest_ldap::smb::Settings::resolve(&config.smb, ip, advertised) {
+        // The DNS name is the naming context read as a domain, by the same rule the realm uses:
+        // three answers - realm, CLDAP, lsarpc - that disagree is a client sent to a domain it
+        // cannot reach.
+        let mut smb_config = config.smb.clone();
+        if smb_config.dns_domain.is_none() {
+            smb_config.dns_domain = Some(
+                config
+                    .base_dn
+                    .split(',')
+                    .filter_map(|rdn| {
+                        rdn.trim()
+                            .strip_prefix("dc=")
+                            .or_else(|| rdn.trim().strip_prefix("DC="))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
+            .filter(|domain| domain.contains('.'));
+        }
+        match rust_rest_ldap::smb::Settings::resolve(&smb_config, ip, advertised) {
             Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
             Ok(settings) => match rust_rest_ldap::smb::serve::start(&settings).await {
                 Ok(running) => {
                     println!(
-                        "smb: serving {} as {} on {}",
-                        "IPC$", running.netbios_name, running.bind
+                        "smb: serving IPC$ as {} on {}",
+                        running.netbios_name, running.bind
                     );
                     Some(running)
                 }

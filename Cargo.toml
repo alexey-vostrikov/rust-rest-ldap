@@ -77,6 +77,16 @@ rust-heimdal-kdc = { path = "../rust-heimdal-kdc", optional = true, features = [
 # with `krb5`, so a machine account can authenticate with the ticket it already has.
 smb-server = { path = "../rust-smb-server", version = "0.9.1", optional = true, default-features = false, features = ["krb5"] }
 
+# Logging. `tracing` without a subscriber records nothing, and the call sites look instrumented
+# either way - which is how a refusal in the RPC dispatcher came to be invisible. The subscriber
+# reads what the configuration and the command line already offered: `-d`, `log_timestamp`,
+# `log_caller`, `--log`.
+tracing = "0.1.44"
+# `env-filter` for `RUST_LOG`: the reason to reach for it is always one module that misbehaves,
+# and `RUST_LOG=smb_server::rpc=debug` says that without raising the whole process. `time` for
+# `log_timestamp` in RFC 3339.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
+
 [features]
 # Port 88: AS-REQ, TGS-REQ, and `krbtgt/<REALM>` provisioned on first start.
 kdc = ["dep:rust-heimdal-kdc"]

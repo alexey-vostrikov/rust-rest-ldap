@@ -45,6 +45,7 @@ pub mod ldap;
 pub mod ldif;
 pub mod ldif_read;
 pub mod limits;
+pub mod logging;
 pub mod mapping;
 pub mod memory;
 pub mod metrics;
