@@ -123,6 +123,7 @@ pub async fn import(
     let entries: Vec<Entry> = entries
         .into_iter()
         .map(|entry| {
+            let entry = canonicalise_sid(entry, &mut warnings);
             if entry
                 .attributes()
                 .get(crate::operational::ATTR_ENTRY_CSN)
@@ -148,6 +149,45 @@ pub async fn import(
         entries: changes.len(),
         warnings,
     })
+}
+
+/// An `objectSid` from an LDIF file, rewritten in the form the store uses.
+///
+/// An export writes the SID the way Windows prints it (`S-1-5-21-...`), and the store keeps octets
+/// as base64. An import that left it as text would put into the store a value that the wire then
+/// hands out as text - a SID every client would read as a structure and misparse, and would do it
+/// without complaint, because the length is plausible.
+///
+/// A value that is neither form is left exactly as the file wrote it and reported. An import
+/// preserves what the file says; refusing the whole file over one bad attribute would throw away
+/// everything else it holds.
+fn canonicalise_sid(entry: Entry, warnings: &mut Vec<String>) -> Entry {
+    let Some(existing) = entry.attributes().get(crate::sid::ATTRIBUTE) else {
+        return entry;
+    };
+    let Some(value) = existing.values.first() else {
+        return entry;
+    };
+    let Ok(sid) = crate::sid::Sid::from_directory_value(value) else {
+        warnings.push(format!(
+            "{}: '{}' is not a SID; kept as the file wrote it",
+            entry.dn(),
+            crate::sid::ATTRIBUTE
+        ));
+        return entry;
+    };
+
+    let attributes = entry
+        .attributes()
+        .values()
+        .iter()
+        .filter(|attribute| !attribute.name.eq_ignore_ascii_case(crate::sid::ATTRIBUTE))
+        .fold(crate::model::Attributes::new(), |acc, attribute| {
+            acc.push((*attribute).clone())
+        })
+        .push(sid.attribute(crate::sid::ATTRIBUTE));
+
+    Entry::new(entry.dn(), attributes)
 }
 
 /// Checks one entry against the schema, according to the configured mode.
@@ -196,6 +236,67 @@ fn check_schema(
 
 #[cfg(test)]
 mod tests {
+    use crate::model::Attribute;
+
+    /// A file that says `objectSid: S-1-5-21-...` — the way an export writes it — must not reach the
+    /// store as text. The wire hands out what the store holds, so a text value would be sent as text
+    /// and every client would parse it as a SID structure and misread it, silently.
+    #[test]
+    fn an_imported_sid_is_rewritten_in_the_store_form() {
+        let sid = crate::sid::Sid::parse("S-1-5-21-1-2-3-512").expect("a SID");
+        let entry = crate::model::Entry::new(
+            "cn=Domain Admins,ou=groups,dc=example,dc=com",
+            crate::model::Attributes::new()
+                .push(Attribute::new(
+                    "objectClass",
+                    vec!["top".to_string(), "group".to_string()],
+                ))
+                .push(Attribute::single(crate::sid::ATTRIBUTE, &sid.to_string())),
+        );
+
+        let mut warnings = Vec::new();
+        let canonical = canonicalise_sid(entry, &mut warnings);
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let written = canonical
+            .attributes()
+            .get(crate::sid::ATTRIBUTE)
+            .expect("the attribute survived");
+        assert!(
+            written.flags.binary,
+            "the store's form is octets, and the flag says so"
+        );
+        assert_eq!(
+            crate::sid::Sid::from_directory_value(&written.values[0]).expect("a SID"),
+            sid,
+            "and it is the same SID the file named"
+        );
+    }
+
+    #[test]
+    fn an_imported_value_that_is_not_a_sid_is_kept_and_reported() {
+        // An import preserves what the file says. Refusing the whole file over one attribute would
+        // throw away everything else it holds, and silently dropping the attribute would make an
+        // account look like it has no identity.
+        let entry = crate::model::Entry::new(
+            "cn=broken,ou=groups,dc=example,dc=com",
+            crate::model::Attributes::new()
+                .push(Attribute::single(crate::sid::ATTRIBUTE, "not a sid at all")),
+        );
+
+        let mut warnings = Vec::new();
+        let kept = canonicalise_sid(entry, &mut warnings);
+
+        assert_eq!(warnings.len(), 1, "the operator is told");
+        assert!(warnings[0].contains(crate::sid::ATTRIBUTE), "{warnings:?}");
+        let written = kept
+            .attributes()
+            .get(crate::sid::ATTRIBUTE)
+            .expect("kept as the file wrote it");
+        assert_eq!(written.values[0], "not a sid at all");
+        assert!(!written.flags.binary, "and not claimed to be octets");
+    }
+
     use super::*;
     use crate::config::Args;
 
