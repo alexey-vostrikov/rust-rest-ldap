@@ -5,20 +5,24 @@
 `stand.sh`. Код этого репозитория здесь **не правился**: всё ниже — находки с воспроизведением,
 решать и делать тому, кто ведёт `rust-rest-ldap`.
 
-## Состояние на 9 ноября
+## Состояние на 10 ноября
 
 | п. | что | состояние |
 | --- | --- | --- |
 | 1 | доктест `sync.rs` валит `cargo test` | закрыт, `5d1ac8f` |
 | 2 | передача channel binding не покрыта | закрыт, тест на `accept_options` |
 | 3 | формулировка §про SASL в плане | открыт |
-| 4 | нет `currentTime` в root DSE | открыт |
-| 5 | следующий блокер — MS-RPC | открыт, отказ сдвинулся дважды |
+| 4 | нет `currentTime` в root DSE | закрыт, `ed7e77a` |
+| 5 | следующий блокер — MS-RPC | **неверно**: блокером был выключенный SMB в стенде; см. §5 |
+| 6 | в стенде нет `smb:`, поэтому SMB-путь не измерялся ни разу | открыт, §6 |
+| 7 | клиентский TGS для `cifs/…` падает на FAST/сроках тикета (сторона KDC) | открыт, §7 |
+| 8 | SASL security layer: `net ads join` заворачивает LDAP (`ADS_SASL_SEAL`), сервер не умеет | закрыт, §8 |
+| 9 | `WKGUID` в базе поиска не разбирается — контейнер компьютеров не находится | открыт, §9 |
 
 По п. 5 за день стало известно больше, чем было при записи: `NT_STATUS_OBJECT_NAME_NOT_FOUND`
 (труба `lsarpc` не открывалась) → `The procedure number is out of range` (клиент зовёт
-`lsa_OpenPolicy`, opnum 6, а был реализован 44) → `{Buffer Too Small}`. То есть до Netlogon
-дело не дошло: упирается в lsarpc, а не в secure channel.
+`lsa_OpenPolicy`, opnum 6, а был реализован 44) → `{Buffer Too Small}`. Все три закрыты, и
+последний прогон стенда (§5) показывает, что `lsarpc` отдаёт члену домена доменное имя, лес и SID.
 
 ## 1. Блокер: `cargo test` падает на доктесте
 
@@ -109,25 +113,147 @@ Server time offset: 0
 сверяют по нему часы и печатают предупреждение; при расхождении часов это первое, что проверяют.
 Формат — `GeneralizedTime`, хелпер уже есть: `crate::operational::generalized_time`.
 
-## 5. Следующий блокер после этого — Netlogon, и он измерен
+## 5. Следующий блокер — LDAP, а не MS-RPC: SMB в стенде был выключен
 
-Что стенд показал по шагам (факты, не оценки):
+Что стенд показал по шагам (факты, не оценки), прогон 10 ноября, Samba 4.17.12:
 
 | шаг | результат |
 |---|---|
-| `kinit administrator@AD.EXAMPLE.COM` | TGT выдан `rust-heimdal-kdc`, MIT-клиент |
+| `kinit administrator@AD.EXAMPLE.COM` | TGT выдан `kdc-stand`, MIT-клиент |
 | `ldapsearch -Y GSSAPI -O maxssf=0` | bind прошёл (после `0bc3c6f`) |
-| `net ads info -S samba.ad.example.com` | DC найден: LDAP 127.0.0.1:389, realm `AD.EXAMPLE.COM`, KDC найден |
-| `net ads join -k` | **отказ**: `failed to lookup DC info for domain 'AD.EXAMPLE.COM' over rpc: The transport-connection attempt was refused by the remote system` |
+| `net ads info -S samba.ad.example.com` | DC найден: LDAP 127.0.0.1:389, realm `AD.EXAMPLE.COM`, KDC найден, `currentTime` сверен |
+| `net ads join -k` (как есть) | отказ: `failed to lookup DC info … over rpc: The transport-connection attempt was refused by the remote system` |
+| `net ads join -k` (с `smb:` в конфиге) | SMB и `lsarpc` пройдены, отказ сдвинулся на LDAP: `failed to connect to AD: Authentication method not supported` |
 
-То есть Kerberos и LDAP для вступления уже достаточны; упирается в MS-RPC (Netlogon secure channel,
-endpoint mapper 135 / SMB 445). Это совпадает с §плана «MS-NRPC Netlogon» — но теперь у него есть
-воспроизведение: `~/DevOps/rust-heimdal-kdc/stand/ad-join/run.sh all`, четыре шага, отказ печатается
-как есть.
+Причина первого отказа — не RPC: в `stand/ad-join/rrd.yaml` нет секции `smb:`, процесс не слушает
+445, `/dev/tcp/127.0.0.1/445` даёт `Connection refused`. `libnet_join_connect_dc_ipc` упирается в
+закрытый порт, и всё, что дальше, стенд не измерял ни разу.
+
+Когда SMB включили, путь прошёл целиком: `NEGOTIATE` до `Smb311`, Kerberos session setup на
+`cifs/samba.ad.example.com`, `TREE_CONNECT IPC$`, `lsarpc`, и join получил из `QueryInfoPolicy2`
+доменное имя, лес и `domain_sid = S-1-5-21-3982645575-1531477709-3248814646` (`domain_is_ad = 1`).
+
+**Про `netr_DsRGetDCName` (это была задача «следующий блокер»).** На пути `net ads join` его нет.
+`source3/libnet/libnet_join.c` 4.17.12: строка 1197 открывает `ndr_table_lsarpc`, 1213 зовёт
+`QueryInfoPolicy2`; `ndr_table_netlogon` появляется на 1274 и 1853, но это `ServerAuthenticate3` и
+`ServerPasswordSet2` (защищённый канал, RRL-2.9). Контролёра ищет `dsgetdcname()` — CLDAP-пинг,
+который уже отвечается. `netr_DsRGetDCName` (opnum 0x14) нужен Windows-клиенту, а не Samba-члену.
+
+Следующий настоящий блокер — RRL-2.15 (SASL-механизм для `ads_connect`), код этого репозитория.
 
 Полезное для планирования: `-k` в Samba 4.23 помечен deprecated, а `net ads join` без `-k`
 спрашивает пароль администратора и идёт тем же путём — то есть альтернативы RPC нет, и «offline
 join» стоит проверить отдельно, прежде чем считать эту работу неделями.
+
+## 6. В стенде нет `smb:` — и секция нигде не описана
+
+Чтобы SMB заработал, в конфиг стенда достаточно добавить:
+
+```yaml
+smb:
+  enabled: true
+  netbios_name: SAMBA
+  keytab: /shared/service.keytab
+  dns_domain: ad.example.com
+  domain_netbios: AD
+```
+
+Отдельно стоит знать: секции `smb:` нет ни в `README.md`, ни в `deploy/config.example.yaml`, ни в
+`config.yaml` — единственное её описание в `src/smb/mod.rs`. Поэтому её и не включили ни в стенде,
+ни где-либо ещё, а SMB-часть проверялась только тестами `smb-server`.
+
+## 7. Клиентский TGS для `cifs/…` падает на FAST и сроках (сторона KDC)
+
+На свежем ccache первый же `net ads join` падает у клиента, в `gse_get_client_auth_token`, и отказ
+чередуется между прогонами:
+
+```
+FAST fast response is missing FX-FAST (cifs/samba.ad.example.com@AD.EXAMPLE.COM)
+the TGT expires before the ticket would start (KRB-ERROR 11) (cifs/...)
+```
+
+`kvno cifs/samba.ad.example.com` тем же MIT-клиентом билет получает, после чего join идёт дальше.
+RRL-2.16, 2.18 и 2.21 помечены закрытыми — на этом стенде их надо перепроверить. Отдельно:
+`wait_for_port` в `stand.sh` ждёт 10 секунд, а `kdc-stand` под нагрузкой сеялся дольше (один прогон
+упал на «the KDC did not start»).
+
+## 8. SASL security layer: join заворачивает LDAP, и это не настройка
+
+**Состояние: закрыт по реализации, 10 ноября.** Приём и выдача sealed-wrap работают, проверено живым
+`net ads join` (см. ниже). Осталось то, что описано в §9.
+
+После правки §3 (`supportedSASLMechanisms` + `GSS-SPNEGO`, начиная с сервера) `net ads join` проходит
+SMB, lsarpc и LDAP-bind — и на первом же запросе после bind присылает не LDAP:
+
+```
+00 00 00 b7 05 04 02 ff ...
+```
+
+Это четырёхоктетная длина и токен RFC 4121 с id `05 04` и flags `02` (sealed): Samba завернула
+LDAP-запрос в SASL. Причина не в конфигурации клиента: `libnet_connect_ads`
+(`source3/libnet/libnet_join.c`, 4.17.12, строка 148) вызывает `ads_init(..., ADS_SASL_SEAL)`
+безусловно. Проверено: `client ldap sasl wrapping = plain` в `smb.conf` перехват не меняет —
+sealed-токен на том же месте.
+
+Следствия:
+
+- `net ads join` этим каталогом не завершается, пока не реализован слой (seal как минимум, sign —
+  следующим). Это меняет оценку §плана «SASL security layer. **Не делать.**»: для LDAP-клиентов
+  libsasl слой действительно необязателен (`-O maxssf=0`), а для вступления машины он обязателен.
+- Сервер теперь называет отказ в журнале (`FrameError::SaslWrapped`) вместо `message is not a BER
+  sequence (tag 0x00)`, после которого клиент через 20 секунд печатал `Time limit exceeded` — то есть
+  жаловался на таймаут, а не на слой.
+
+Что нужно знать, если брать это в работу: обёртка по RFC 4752 §3.2 — четырёхоктетный префикс длины
+поверх обычного `gss_wrap` (RFC 4121), маска слоёв согласуется **только** у libsasl-клиентов; клиент
+на `gensec` её не согласует вовсе и начинает заворачивать сразу после контекста. То есть сервер обязан
+принимать wrap и без предварительного обмена маской.
+
+### Как это сделано и что дал прогон
+
+`src/ldap/sasl_bind.rs` — `Wrap`: пара `PerMessageTokens` (ключ из билета), свои счётчики `send` и
+`recv`, флаг `pending` до момента, когда объявляющий ответ записан. `src/ldap/codec.rs` —
+`read_message_with`/`write_message_with`: если слой в силе, кадр — четыре октета длины и токен Wrap.
+
+**Подводный камень, найденный только живым клиентом: SND_SEQ начинается не с нуля.** Первый прогон
+после реализации дал
+
+```
+client 127.0.0.1:58316: SASL security layer: the client's message carries sequence number
+316063208 where 0 was next: a repeated or reordered wrap on one connection is not a retransmission
+```
+
+Токен расшифровался (значит, ключ верный), и отказал только счётчик. Причина: RFC 4121 §4.2.1
+разрешает случайный начальный номер, и MIT/Heimdal так и делают. Правило стало другим: **первый**
+номер задаёт базу, каждый следующий обязан быть ровно на единицу больше. Тест на повтор номера
+переписан под это: сначала сообщение с произвольным `seq`, потом то же самое ещё раз — второе
+отвергается.
+
+**Результат на стенде.** `net ads join -k` после правки проходит SMB, lsarpc, LDAP-bind и **sealed
+поиск**: сервер расшифровал запрос, ответил зашифрованным ответом, клиент его принял. Следующий отказ
+— уже не про слой, а про содержимое каталога (§9).
+
+## 9. `WKGUID` в базе поиска: `/computers` ищется виртуально
+
+`net ads join` после успешного bind ищет контейнер компьютеров так:
+
+```
+Failed while searching for: <WKGUID=AA312825768811D1ADED00C04FD8D5CD,dc=AD,dc=EXAMPLE,dc=COM>
+Error connecting to SAM pipe. Error was NT_STATUS_OBJECT_NAME_NOT_FOUND
+error_string: 'failed to join domain ... over rpc: The object name is not found.'
+```
+
+`WKGUID=AA312825768811D1ADED00C04FD8D5CD` — well-known GUID контейнера `CN=Computers`
+(MS-ADTS 6.1.1.4.2 / wellKnownObjects). Настоящий AD разрешает такую базу: GUID ищется в атрибуте
+`wellKnownObjects` доменного раздела, найденный DN подставляется вместо неё. У нас этого нет, поэтому
+поиск возвращает пустоту, Samba уходит на резервный путь через трубу `samr` — а её в `IPC$` нет — и
+печатает `The object name is not found`.
+
+Что нужно: `wellKnownObjects` в доменном разделе (значения вида
+`B:32:AA312825768811D1ADED00C04FD8D5CD:<dn контейнера>`), разбор `WKGUID`-базы в поиске и сам
+`cn=Computers` (или любое OU, на которое указывает значение) вместе с ACL, разрешающим машине
+создать там свою учётку (RRL-2.24). Задачи `RRL-2.13`/`RRL-2.24` остаются открытыми; это первый
+измеримый шаг в них.
 
 ## Чего в этом файле нет
 

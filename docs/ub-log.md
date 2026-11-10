@@ -5941,3 +5941,201 @@ TASQ-3.9 с той же темой и вдвое большей оценкой. 
 **Что не проверено:** живым клиентом. `net ads join` до этого шага пока не доходит — упирается в
 KDC (сроки тикетов, RRL-2.18/2.21) и в SASL (RRL-2.15). Права на создание в `cn=computers`
 (RRL-2.24) и превращение пароля в ключи (RRL-2.23) — отдельные задачи, без них шаг не закрыт.
+
+## Поиск контролёра: что join делает на самом деле, и где SMB был выключен
+
+**Зачем это записано.** Задача стояла так: следующий блокер — `netr_DsRGetDCName` (поиск
+контролёра по MS-NRPC, «до защищённого канала»), реализовать его и двигаться к Netlogon. Прогон
+стенда показал, что на пути `net ads join` этого вызова нет вовсе, а отказ, который принимали за
+отсутствующий RPC, был выключенным SMB.
+
+**Что мерил.** Стенд `rust-kdc/stand/ad-join`, `./run.sh all`, клиент — Samba 4.17.12 из образа
+(Debian bookworm), сервер — сборка этого репозитория `~/.cache/rrl/target/release/rust-rest-ldap`.
+
+**Отказ, который был.** Шаг 4 (`net ads join -k`) печатал
+
+```
+Failed to join domain: failed to lookup DC info for domain 'AD.EXAMPLE.COM' over rpc:
+  The transport-connection attempt was refused by the remote system.
+```
+
+`NT_STATUS_CONNECTION_REFUSED` — но не от RPC: в `stand/ad-join/rrd.yaml` **нет секции `smb:`**, то
+есть процесс не слушал 445 вовсе. Проверено прямо: `/dev/tcp/127.0.0.1/445` — `Connection
+refused`, в `/tmp/rrd.log` нет строки `smb: serving IPC$`. SMB в этом стенде не включался ни разу:
+`libnet_join_connect_dc_ipc` упирался в закрытый порт, и всё, что за ним, не измерялось.
+
+**Что стало, когда SMB включили.** Копия конфига стенда с добавленной секцией
+
+```yaml
+smb:
+  enabled: true
+  netbios_name: SAMBA
+  keytab: /shared/service.keytab
+  dns_domain: ad.example.com
+  domain_netbios: AD
+```
+
+и путь живым клиентом прошёл целиком: `NEGOTIATE` до `Smb311`, `Accepting Kerberos GSS token`,
+`Found service key: cifs/samba.ad.example.com`, `TREE_CONNECT share=IPC$`, затем `lsarpc`. В ответе
+join'а — то, что `libnet_join_lookup_dc_rpc` вычитал из `QueryInfoPolicy2`: `domain_is_ad = 1`,
+`netbios_domain_name = 'AD'`, `dns_domain_name = 'ad.example.com'`, `forest_name`, и
+`domain_sid = S-1-5-21-3982645575-1531477709-3248814646`. То есть RRL-2.12 и RRL-2.13 проверены не
+только тестом диспетчера, но и настоящим членом домена — впервые.
+
+**Почему `netr_DsRGetDCName` не на этом пути.** По исходникам той же версии Samba
+(`source3/libnet/libnet_join.c`, 4.17.12):
+
+| строка | что делает join |
+|---|---|
+| 1166 | `libnet_join_lookup_dc_rpc` — после подключения к `IPC$` |
+| 1197 | `cli_rpc_pipe_open_noauth(..., &ndr_table_lsarpc, ...)` |
+| 1213 | `dcerpc_lsa_QueryInfoPolicy2(LSA_POLICY_INFO_DNS)` |
+| 1274, 1853 | `ndr_table_netlogon` — но это `ServerAuthenticate3` и `ServerPasswordSet2` (защищённый канал), а не поиск |
+
+Контролёра ищет `dsgetdcname()`, то есть CLDAP-пинг, который уже отвечается (`src/cldap/`).
+`netr_DsRGetDCName` (opnum 0x14) в этом файле не вызывается ни разу — он нужен Windows-клиенту,
+который ищет DC по RPC, а не Samba-члену. Netlogon на пути join есть, но входит он позже и другими
+вызовами — это RRL-2.9, и начинать его надо не с `DsRGetDCName`.
+
+**Следующий отказ, уже настоящий.** После lsarpc join идёт в LDAP (`Connecting to 127.0.0.1 at port
+389`) и падает там:
+
+```
+Failed to join domain: failed to connect to AD: Authentication method not supported
+```
+
+Это ровно RRL-2.15 (SASL-механизм, который просит `ads_connect`), и он — следующий блокер. Проверено
+дважды, в том числе на чистом ccache.
+
+**Побочная находка: KDC и FAST (сторона `rust-kdc`).** На свежем TGT первый же join падает не у
+сервера, а у клиента, в `gse_get_client_auth_token`, и отказ чередуется между прогонами:
+
+```
+FAST fast response is missing FX-FAST (cifs/samba.ad.example.com@AD.EXAMPLE.COM)
+the TGT expires before the ticket would start (KRB-ERROR 11) (cifs/...)
+```
+
+`kvno cifs/samba.ad.example.com` тем же MIT-клиентом билет получает и кладёт в ccache, после чего
+join проходит дальше. То есть билет выдаётся, а требование клиента к FAST-ответу выполняется не
+всегда. RRL-2.16, 2.18 и 2.21 помечены закрытыми — судя по этому прогону, их надо перепроверить на
+этом стенде, а не считать закрытыми.
+
+**Побочная находка: `smb:` нигде не описан.** Секции нет ни в `README.md`, ни в
+`deploy/config.example.yaml`, ни в `config.yaml`; единственное место, где она существует, —
+`src/smb/mod.rs`. Поэтому стенд её и не включил, и поэтому же SMB-часть проверялась только
+тестами `smb-server`. Документировать — отдельная работа, здесь она не делалась.
+
+**Побочная находка: ожидание KDC.** `wait_for_port` в `stand.sh` ждёт 10 секунд, а `kdc-stand` под
+нагрузкой сеялся дольше (один прогон упал на «the KDC did not start», при том что KDC поднялся через
+несколько секунд). Стенд — соседний репозиторий, здесь только запись.
+
+**Что не проверено.** Путь ADS после RRL-2.15 (создание учётки по LDAP), Netlogon и защищённый
+канал (`ServerReqChallenge`/`ServerAuthenticate3`, RRL-2.9), поведение Windows-клиента. Ни одна
+строка кода этого репозитория для находок выше не менялась.
+
+## RRL-2.15: «Authentication method not supported» — две причины, обе в этом репозитории
+
+**Что было.** `net ads join` доходил до `Connecting to 127.0.0.1 at port 389`, печатал
+`Connected to LDAP server` и падал: `failed to connect to AD: Authentication method not supported`.
+Задача числила это как «Samba's ads_connect получает отказ», и это было верно ровно наполовину: отказ
+приходил **до** того, как клиент присылал хоть один SASL-токен, так что «метод» тут ни при чём.
+
+**Причина первая: rootDSE не публиковал `supportedSASLMechanisms`.** `ads_sasl_bind`
+(`source3/libads/sasl.c`) читает этот атрибут поиском по rootDSE и сравнивает значения **строкой**
+с `GSS-SPNEGO`; не найдя — возвращает `LDAP_AUTH_METHOD_NOT_SUPPORTED`, то есть ровно то сообщение,
+которое видел оператор. Атрибута не было ни в коде, ни в ответе: `ldapsearch -b "" -s base
+supportedSASLMechanisms` на живом сервере возвращал пустую запись. Исправлено: `src/ldap/search.rs`
+публикует `GSSAPI` и `GSS-SPNEGO`, но только когда acceptor есть — сервер без keytab не должен
+обещать механизм, который обязан отказать.
+
+**Причина вторая: `GSS-SPNEGO` у Samba начинается с сервера, а не с клиента.** Даже с найденным
+механизмом `ads_sasl_spnego_bind` делает `ldap_sasl_bind_s(NULL, "GSS-SPNEGO", NULL, ...)` — bind без
+токена — и ждёт `NegTokenInit` со списком механизмов. Наш модуль требовал билет в первом же токене и
+отвечал `Invalid credentials`. Добавлено: пустой bind с `GSS-SPNEGO` получает `NegTokenInit`
+(`src/ldap/spnego_offer.rs`, DER выписан по RFC 4178 §4.2.1, тест сверяет байты целиком), следующий
+токен клиента идёт в тот же `SpnegoAcceptor`, что и в клиентском порядке, а последний — пустой — bind
+завершает `success`. Четвёртый раунд libsasl (обёрнутая маска security layer) для `GSS-SPNEGO` не
+делается: у клиента на `gensec` его нет вовсе.
+
+**Что видно на проводе** (перехват через логирующий TCP-прокси, `~/.hermes/cache/scratch/ldap_proxy.py`):
+
+```text
+C>S  bind(msgid 3, "GSS-SPNEGO", без токена)
+S>C  saslBindInProgress, 60 26 06 06 2b 06 01 05 05 02 a0 1c 30 1a a0 18 30 16 06 09 ...  (NegTokenInit)
+C>S  bind(msgid 4, NegTokenInit с AP-REQ, 688 байт)
+S>C  saslBindInProgress, negTokenResp(accept-completed, ап-реп, supportedMech = MS krb5)
+C>S  bind(msgid 5, "GSS-SPNEGO", без токена)
+S>C  success
+C>S  00 00 00 b7 05 04 02 ff ...            <- дальше LDAP завёрнут в SASL
+```
+
+В клиентском журнале это подтверждается построчно: `Found SASL mechanism GSS-SPNEGO`,
+`ads_sasl_spnego_bind: got OID=1.2.840.113554.1.2.2`, `got OID=1.2.840.48018.1.2.2` — то есть
+Samba разобрала наш `NegTokenInit` и обе OID. После правки join проходит и SMB, и lsarpc, и LDAP-bind,
+и падает уже на следующем шаге — создании учётной записи компьютера.
+
+**Следующий блокер измерен: security layer.** Последняя строка перехвата — не LDAP: это
+`00 00 00 b7` (четырёхоктетная длина) и токен RFC 4121 с id `05 04`, flags `02` (sealed). Samba
+заворачивает каждый LDAP-запрос после bind. В `libnet_connect_ads` (`source3/libnet/libnet_join.c`,
+4.17.12, строка 148) стоит `ads_init(..., ADS_SASL_SEAL)` — **без выбора**, поэтому
+`client ldap sasl wrapping = plain` в `smb.conf` ни на что не влияет: проверено, перехват тот же.
+Следствие: без реализации SASL-слоя `net ads join` этим каталогом не завершается, и это уже не
+«необязательная функция», как считалось в §плана «SASL security layer. Не делать».
+
+**Что сделано с этим сейчас.** Сервер больше не молчит: чтение кадра узнаёт этот вид
+(`FrameError::SaslWrapped`) и пишет в журнал, что клиент завернул данные, какой слой сервер
+предлагает и что libsasl-клиенту нужен `-O maxssf=0`, а `net ads join` так настроить нельзя. До правки
+в журнале было `message is not a BER sequence (tag 0x00)`, а клиент через 20 секунд сообщал
+`Time limit exceeded` — то есть про таймаут, а не про слой.
+
+**Что проверено.** `make`-гейты (fmt, clippy `-D warnings`, 344 модульных + все интеграционные тесты,
+доктесты); стенд: `ldapwhoami -Y GSSAPI -O maxssf=0` возвращает `dn:cn=administrator,...` (путь
+libsasl не сломан); `net ads join` доходит до создания учётной записи компьютера.
+
+**Что не проверено.** Реализация слоя (seal/sign) — отдельная задача, здесь только отказ с именем.
+Создание учётки по LDAP (RRL-2.13/2.24), Netlogon (RRL-2.9) и Windows-клиент — по-прежнему вне
+этого шага.
+
+## Слой реализован: sealed LDAP после bind, и SND_SEQ, который не начинается с нуля
+
+**Что добавлено.** `Wrap` (`src/ldap/sasl_bind.rs`): ключ из билета, свои счётчики `send`/`recv`,
+флаг `pending`, пока объявляющий ответ не записан, — клиент начинает заворачивать только после того,
+как прочитал `success`, и сервер, запечатавший сам `success`, послал бы шифртекст пиру, который ещё
+читает BER. `read_message_with`/`write_message_with` (`src/ldap/codec.rs`) — кадр из четырёх октетов
+длины и токена Wrap, когда слой в силе. Серверный цикл (`src/server.rs`) ходит через них; ветка отказа
+`FrameError::SaslWrapped` из прошлого шага осталась как диагностика для сервера без слоя.
+
+**Подводный камень, который нашёл только живой клиент.** Первый прогон wall-нулся на счётчике:
+
+```
+SASL security layer: the client's message carries sequence number 316063208 where 0 was next
+```
+
+Токен расшифровался — ключ верный, отказ был только про номер. RFC 4121 §4.2.1 разрешает случайный
+начальный SND_SEQ, и MIT/Heimdal так и делают. Правило теперь: первый номер задаёт базу, каждый
+следующий — ровно на единицу больше; повтор отвергается (LDAP поверх TCP не переотправляет, значит
+повтор — это повтор сообщения). Тест переписан под это: сообщение с произвольным `seq`, затем то же
+самое ещё раз.
+
+**Проверено.** Гейты: 347 модульных, все интеграционные и доктесты зелёные, clippy `-D warnings` чист,
+fmt чист. Стенд (kdc-stand из свежего `rust-kdc`, `net ads join -k`): SMB → lsarpc → LDAP-bind →
+**sealed поиск** от клиента расшифрован, ответ запечатан и принят клиентом. Три новых теста гоняют
+слой в обе стороны с настоящим ключом: клиентский `Role::Initiator` запечатывает, серверный
+`Role::Acceptor` открывает, и наоборот.
+
+**Следующий отказ — про каталог, не про слой:**
+
+```
+Failed while searching for: <WKGUID=AA312825768811D1ADED00C04FD8D5CD,dc=AD,dc=EXAMPLE,dc=COM>
+```
+
+Это well-known GUID контейнера `CN=Computers`, который настоящий AD разрешает через `wellKnownObjects`.
+Записано в `docs/todo-ad-join-stand.md` §9.
+
+**Побочно, про стенд.** `run.sh` берёт `KDC_BIN` из `$KDC_ROOT/target/debug/examples/kdc-stand`, а
+обёртка `scripts/cargo.sh` кладёт сборку в `target/<toolchain>/debug/...`. В стенде из-за этого
+оставался бинарь от 9 ноября; здесь использован свежий (`target/1.99.1-bullseye/...`) через переменную
+окружения. Стоит либо поправить `run.sh`, либо собирать в `target/debug`.
+
+**Что не проверено.** Подпись без шифрования (`sign`) — Samba просит seal, поэтому ветка sign не
+прогонялась живым клиентом; `WKGUID` и создание учётки (RRL-2.13/2.24); Netlogon (RRL-2.9).
