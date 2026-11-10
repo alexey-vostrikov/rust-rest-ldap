@@ -107,6 +107,13 @@ objectclass ( 1.2.840.113556.1.5.5 NAME 'computer' SUP user STRUCTURAL
     MAY ( sAMAccountName $ userAccountControl $ servicePrincipalName $ dNSHostName $
           msDS-SupportedEncryptionTypes $ operatingSystem $ operatingSystemVersion ) )
 
+# A plain container, which is what a domain creates for `CN=Computers` and `CN=Users`. Not an
+# `organizationalUnit`: a member's join finds the computers container by GUID and then checks what
+# kind of object it reached, and the class is the answer it reads.
+objectclass ( 1.2.840.113556.1.5.2 NAME 'container' SUP top STRUCTURAL
+    MUST cn
+    MAY ( description $ objectGUID $ objectSid $ showInAdvancedViewOnly ) )
+
 # The name a machine is reached by, and the one `net ads join` writes first. A member reads it back
 # to find itself in the directory.
 attributetype ( 1.2.840.113556.1.4.619 NAME 'dNSHostName'

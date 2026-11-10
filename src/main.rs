@@ -447,6 +447,19 @@ async fn serve() {
         }
     }
 
+    // The containers a domain has before anybody joins it. Written before the listener for the same
+    // reason the first administrator is: a member's join adds its account under `cn=Computers`, and
+    // a parent that appears only after the first member is a parent the first member never has.
+    if serves_a_domain(&config) {
+        match rust_rest_ldap::provision::ensure_containers(&backend, &config.base_dn).await {
+            Ok(created) if !created.is_empty() => {
+                eprintln!("provision: created {}", created.join(", "));
+            }
+            Ok(_) => {}
+            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+        }
+    }
+
     // Before the first write, because a change stamped before this point carries the id of
     // "no node" and a peer could not tell it from its own.
     rust_rest_ldap::replication::set_server_id(config.server_id);

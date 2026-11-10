@@ -56,6 +56,7 @@ pub mod pac_policy;
 pub mod password;
 pub mod peers;
 pub mod prepare;
+pub mod provision;
 pub mod record_cache;
 pub mod referral;
 pub mod reload;
