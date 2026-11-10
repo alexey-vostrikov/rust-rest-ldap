@@ -70,7 +70,13 @@ yescrypt = "0.1.0"
 #
 # Optional because a directory server that does not issue tickets should not carry a KDC, and
 # `RUST_HEIMDAL_KDC`-free builds stay what they were.
-rust-kdc = { path = "../rust-kdc", optional = true, features = ["hdb-ldap"] }
+#
+# From git, not from a path: a checkout that lives beside this one is a developer's convenience,
+# and a path dependency silently becomes "no such package" on CI and on any machine that clones
+# this repository alone. `branch = "main"` rather than `rev`: the two crates are developed
+# together, and a pinned commit turns every KDC change into a second commit here before anything
+# can be compiled against it. Run `cargo update -p rust-kdc` to take a newer revision.
+rust-kdc = { git = "https://github.com/alexey-vostrikov/rust-kdc", branch = "main", optional = true, features = ["hdb-ldap"] }
 
 # SMB2/3 for `IPC$`, which is where a Samba member's join actually begins: it connects to
 # `\\DC\IPC$` and opens `lsarpc` through it. Without `localfs` - this server serves no files - and
@@ -94,7 +100,7 @@ kdc = ["dep:rust-kdc"]
 smb = ["dep:smb-server"]
 
 [dev-dependencies]
-rust-kdc = { path = "../rust-kdc" }
+rust-kdc = { git = "https://github.com/alexey-vostrikov/rust-kdc", branch = "main" }
 futures = "0.3.34"
 rcgen = "0.14.10"
 serde_json = "1.0.154"

@@ -1947,6 +1947,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rrl-crypto"
+version = "0.1.0"
+source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#6997762943d47ee6ef1873ae53cd226bd28eed35"
+dependencies = [
+ "aes 0.9.4",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "md-5 0.11.0",
+ "sha1",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1970,11 +1985,11 @@ dependencies = [
 [[package]]
 name = "rust-kdc"
 version = "0.1.0"
+source = "git+https://github.com/alexey-vostrikov/rust-kdc?branch=main#092bf8d6e1faf58a131aa18eba7c2ebffb34fb8f"
 dependencies = [
- "aes 0.9.4",
- "getrandom 0.4.3",
  "hmac 0.13.0",
  "md-5 0.11.0",
+ "rrl-crypto",
  "sha1",
  "sha2 0.11.1",
  "thiserror 2.0.21",
