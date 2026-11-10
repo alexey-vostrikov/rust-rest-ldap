@@ -18,7 +18,7 @@
 | 7 | клиентский TGS для `cifs/…` падает на FAST/сроках тикета (сторона KDC) | открыт, §7 |
 | 8 | SASL security layer: `net ads join` заворачивает LDAP (`ADS_SASL_SEAL`), сервер не умеет | закрыт, §8 |
 | 9 | `WKGUID` в базе поиска не разбирается — контейнер компьютеров не находится | закрыт по разбору и по контейнеру, §9 |
-| 10 | `net ads join` создаёт учётку через трубу `samr` — её в `IPC$` нет | открыт, §10 |
+| 10 | `net ads join` создаёт учётку через трубу `samr` — её в `IPC$` нет | труба добавлена, `CreateUser2` отказывает честно (§10) |
 
 По п. 5 за день стало известно больше, чем было при записи: `NT_STATUS_OBJECT_NAME_NOT_FOUND`
 (труба `lsarpc` не открывалась) → `The procedure number is out of range` (клиент зовёт
@@ -258,6 +258,9 @@ client 127.0.0.1:58316: SASL security layer: the client's message carries sequen
 
 ## 10. Следующая стена: труба `samr`, а не LDAP
 
+**Состояние: труба добавлена в `rust-smb-server` (`a44c2c8`), 10 ноября.** Отказ сдвинулся с
+«нет трубы» на честный отказ самой операции: `The request is not supported` — это `CreateUser2`.
+
 После §8 и §9 join на стенде проходит SMB, lsarpc, LDAP-bind, sealed-поиск и находит контейнер
 компьютеров. Отказ сдвинулся на создание учётной записи:
 
@@ -273,16 +276,35 @@ pipe opened name=lsarpc
 no such pipe name=samr
 ```
 
-То есть `libnet_join` создаёт учётку машины не по LDAP, а через `samr` (`samr_Connect5`,
-`samr_CreateUser2`, `samr_SetInformationUser`), и без этой трубы дальше не идёт. Прежняя запись
-«Failed to pre-create account … Time limit exceeded» была тем же отказом, только медленным: клиент
-ждал ответа на открытие трубы, которой нет.
+То есть `libnet_join` создаёт учётку машины не по LDAP, а через `samr` (`samr_Connect2`,
+`samr_OpenDomain`, `samr_CreateUser2`, `samr_SetUserInfo2`), и без этой трубы дальше не идёт.
+Прежняя запись «Failed to pre-create account … Time limit exceeded» была тем же отказом, только
+медленным: клиент ждал ответа на открытие трубы, которой нет.
 
-Работа эта — в `rust-smb-server` (`src/rpc/`), а не в этом репозитории: там уже есть `lsarpc` и
-`srvsvc` как образец диспетчера и NDR, и `samr` добавляется тем же способом. Минимальный набор для
-вступления: `samr_Connect5/Connect2`, `samr_LookupDomain`, `samr_CreateUser2` (или
-`samr_CreateUser`), `samr_SetInformationUser` (пароль, `userAccountControl`, SPN), `samr_Close`.
-После этого — тот же `add` в каталог, который уже проверен тестом `a_member_can_add_its_computer_account`.
+### Что сделано в `rust-smb-server`
+
+`src/rpc/samr.rs`: `Connect`, `Connect2`, `Connect5`, `Close`, `OpenDomain`, `LookupDomain`
+отвечаются — это факты о собственном домене сервера (его SID из `ServerConfig::domain_sid`, его
+NetBIOS- и DNS-имя). `CreateUser2` **отказывает** `NT_STATUS_NOT_SUPPORTED`: создание учётной
+записи машины — запись в каталог, а этот крейт каталога не читает. Ответить `success` и ничего не
+записать значило бы выдать клиенту RID, которым нечего делать, и получить отказ позже — «машина не
+может аутентифицироваться», что диагностируется хуже, чем честный отказ сейчас. Труба зарегистрирована
+в списке известных, синтаксис `samr` — в `negotiate`.
+
+**Три вещи, которые знал только клиент** (каждая — отдельный прогон стенда):
+
+1. **Версия синтаксиса `samr` — 1.0, а не 0.0.** Скопированная с `lsarpc` константа отвергалась на
+   каждом bind, и клиент печатал `{Buffer Too Small}` вместо «интерфейс не принят».
+2. **Контекстный хэндл маршалится без referent id**, хотя в IDL стоит `[out,ref] policy_handle *`.
+   С referent'ом клиент прочитал `samr` из тела хэндла как статус: `NT code 0x726d6173`.
+3. **Два скаляра `CreateUser2` тоже читаются inline**, без referent'ов: иначе клиент читает
+   `NT code 0x00020004` — второй referent вместо статуса.
+
+**Что осталось.** Ответ на `CreateUser2` (и `SetUserInfo2` с паролем машины) — работа того, кто
+владеет каталогом: `rust-rest-ldap` уже умеет путь записи учётной записи компьютера (тест
+`a_member_can_add_its_computer_account`), но `samr` живёт в `rust-smb-server`, и связать их — это
+обратный вызов из `ServerConfig` в каталог. Форма: трейт вида `MachineAccounts` с
+`create_user2(account, flags) -> Result<(rid, handle)>`, реализуемый демоном.
 
 ## Чего в этом файле нет
 
