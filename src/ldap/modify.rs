@@ -204,6 +204,11 @@ pub fn handle_modify(
         Vec::new()
     };
 
+    // A password written here becomes the keys the KDC reads, in the same change: an account that
+    // exists without keys answers `S_PRINCIPAL_UNKNOWN` to every ticket request.
+    #[cfg(feature = "kdc")]
+    let modified = crate::kerberos::unicode_pwd::seal(&modified, security);
+
     Outcome::Persist {
         entry: modified,
         extra,
