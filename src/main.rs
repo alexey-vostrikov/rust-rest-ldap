@@ -450,7 +450,19 @@ async fn serve() {
     // The containers a domain has before anybody joins it. Written before the listener for the same
     // reason the first administrator is: a member's join adds its account under `cn=Computers`, and
     // a parent that appears only after the first member is a parent the first member never has.
-    if serves_a_domain(&config) {
+    // The same rule `serves_a_domain` states, spelled out because that function is behind the `kdc`
+    // feature and this call is not: a realm, CLDAP or SMB is a server claiming to be a domain
+    // controller, whichever of the three is compiled in.
+    #[cfg(feature = "kdc")]
+    let realm = config.kerberos.enabled;
+    #[cfg(not(feature = "kdc"))]
+    let realm = false;
+    #[cfg(feature = "smb")]
+    let smb = config.smb.enabled;
+    #[cfg(not(feature = "smb"))]
+    let smb = false;
+
+    if config.cldap.enabled || realm || smb {
         match rust_rest_ldap::provision::ensure_containers(&backend, &config.base_dn).await {
             Ok(created) if !created.is_empty() => {
                 eprintln!("provision: created {}", created.join(", "));
