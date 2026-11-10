@@ -94,6 +94,81 @@ fn master_file(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// A keytab holding one key for `principal`, as `kadmin ktadd` would have written it.
+fn keytab_for(dir: &std::path::Path, principal: &str) -> std::path::PathBuf {
+    let path = dir.join("service.keytab");
+    let mut keytab = krb5::Keytab::new();
+    keytab.add(krb5::ServiceKey::new(
+        principal,
+        REALM,
+        1,
+        // The key material is arbitrary and nothing decrypts with it here: what the test asks is
+        // whether the realm came to hold a principal with keys at all, and the answer to that is
+        // the difference between a TGS-REP and S_PRINCIPAL_UNKNOWN.
+        krb5::EncType::AES256CtsHmacSha196,
+        vec![0x5a; 32],
+    ));
+    keytab.save(&path).expect("saved");
+    path
+}
+
+/// A service the keytab knows is one the realm can issue a ticket for.
+///
+/// Measured on the AD-join stand: the SMB acceptor held `cifs/…` in its keytab and the realm held
+/// no such principal, so a member asking for the ticket got `S_PRINCIPAL_UNKNOWN` and reported
+/// `NT_STATUS_LOGON_FAILURE` - a message about a password for a missing entry. The keytab says what
+/// a service can decrypt; the directory says what a client may ask for, and only both together
+/// make a ticket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_in_the_keytab_can_be_asked_for() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Deliberately only the account: the service is *not* seeded the way
+    // `source_with_account` seeds it, so the ticket below can only exist because of the keytab.
+    let source = source_with_account(dir.path(), "alice").await;
+    let service = format!("{SERVICE}@{REALM}");
+    let service_dn = dn_for(
+        &rust_kdc::name::Principal::parse(&service).expect("a principal"),
+        BASE_DN,
+    );
+    source
+        .apply(&[EntryChange::Delete {
+            dn: service_dn.clone(),
+            kind: None,
+        }])
+        .await
+        .expect("the service starts absent");
+    assert!(source.directory().await.find(&service_dn).is_none());
+
+    let master = master_file(dir.path());
+    let keytab = keytab_for(dir.path(), SERVICE);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let running = serve::start(
+        &settings(REALM),
+        Arc::clone(&source),
+        BASE_DN.to_string(),
+        Some(&master),
+        Some(&keytab),
+        shutdown_rx,
+    )
+    .await
+    .expect("the KDC starts");
+
+    assert!(
+        source.directory().await.find(&service_dn).is_some(),
+        "the realm must hold the principal the keytab names"
+    );
+
+    let client = krb5::KdcClient::new(REALM, [running.bind.to_string().as_str()]);
+    let alice = krb5::Principal::parse(&format!("alice@{REALM}")).expect("a principal");
+    let tgt = client.login_with_password(&alice, PASSWORD).expect("a TGT");
+    let wanted = krb5::Principal::parse(&service).expect("a principal");
+    client
+        .service_ticket(&tgt, &wanted)
+        .expect("the realm issues a ticket for the service the keytab names");
+
+    let _ = shutdown_tx.send(true);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_logs_in_against_the_daemon() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -106,6 +181,7 @@ async fn a_client_logs_in_against_the_daemon() {
         Arc::clone(&source),
         BASE_DN.to_string(),
         Some(&master),
+        None,
         shutdown_rx,
     )
     .await
@@ -146,6 +222,7 @@ async fn a_framed_request_over_tcp_gets_a_framed_reply() {
         Arc::clone(&source),
         BASE_DN.to_string(),
         Some(&master),
+        None,
         shutdown_rx,
     )
     .await
@@ -199,6 +276,7 @@ async fn a_frame_length_no_message_could_have_closes_the_connection() {
         Arc::clone(&source),
         BASE_DN.to_string(),
         Some(&master),
+        None,
         shutdown_rx,
     )
     .await
@@ -246,6 +324,7 @@ async fn a_wrong_password_gets_no_ticket() {
         Arc::clone(&source),
         BASE_DN.to_string(),
         Some(&master),
+        None,
         shutdown_rx,
     )
     .await
@@ -274,6 +353,7 @@ async fn a_realm_without_a_krbtgt_and_without_a_master_password_does_not_start()
         &settings(REALM),
         Arc::clone(&source),
         BASE_DN.to_string(),
+        None,
         None,
         shutdown_rx,
     )
@@ -320,6 +400,7 @@ async fn the_realm_is_provisioned_once_and_survives_a_restart() {
             Arc::clone(&source),
             BASE_DN.to_string(),
             Some(&master),
+            None,
             rx,
         )
         .await
@@ -350,6 +431,7 @@ async fn the_realm_is_provisioned_once_and_survives_a_restart() {
         Arc::clone(&source),
         BASE_DN.to_string(),
         Some(&master),
+        None,
         rx,
     )
     .await

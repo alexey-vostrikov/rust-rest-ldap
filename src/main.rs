@@ -841,6 +841,7 @@ async fn serve() {
             Arc::clone(&source),
             config.base_dn.clone(),
             config.kerberos.master_key_file.as_deref(),
+            config.sasl.keytab.as_deref(),
             shutdown_rx.clone(),
         )
         .await

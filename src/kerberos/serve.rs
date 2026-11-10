@@ -160,6 +160,7 @@ pub async fn start(
     source: Arc<crate::reload::Source>,
     base_dn: String,
     master_key_file: Option<&std::path::Path>,
+    keytab: Option<&std::path::Path>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Running, String> {
     use rust_kdc::crypto::OwnCipher;
@@ -167,6 +168,18 @@ pub async fn start(
     use rust_kdc::kdc::KdcConfig;
 
     super::bootstrap::ensure_krbtgt(&source, &settings.realm, &base_dn, master_key_file).await?;
+
+    // The realm learns its services before it answers anybody: a client that asks for a `cifs/`
+    // ticket must find the principal the acceptors are already configured with. Said out loud
+    // because a realm that quietly gained entries is a realm an operator will not recognise.
+    if let Some(keytab) = keytab {
+        for dn in
+            super::bootstrap::ensure_keytab_principals(&source, &settings.realm, &base_dn, keytab)
+                .await?
+        {
+            eprintln!("kerberos: provisioned {dn}");
+        }
+    }
 
     let view = Arc::new(super::realm::RealmView::new(
         settings.realm.clone(),

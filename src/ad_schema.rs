@@ -326,9 +326,13 @@ mod tests {
         // - which is the state this test was written to end.
         // Both vocabularies, as a server that is a domain controller loads them: the AD one
         // publishes the classes, the realm one defines the key attributes they now permit.
-        let mut schema = with_ad();
-        #[cfg(feature = "kdc")]
-        crate::kerberos::schema::extend(&mut schema).expect("the realm vocabulary parses");
+        let schema = {
+            #[allow(unused_mut)]
+            let mut schema = with_ad();
+            #[cfg(feature = "kdc")]
+            crate::kerberos::schema::extend(&mut schema).expect("the realm vocabulary parses");
+            schema
+        };
         let entry = crate::model::Entry::new(
             "cn=samba,cn=computers,dc=ad,dc=example,dc=com",
             crate::model::Attributes::new()
