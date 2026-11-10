@@ -19,6 +19,7 @@ pub mod sort;
 pub mod spnego_offer;
 pub mod starttls;
 pub mod sync;
+pub mod wkguid;
 pub mod write;
 
 use rasn_ldap::{LdapMessage, ProtocolOp, ResultCode};

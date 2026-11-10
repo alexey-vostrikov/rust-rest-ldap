@@ -40,12 +40,33 @@ pub fn handle_search(
     controls: Option<&Controls>,
     security: &Security,
 ) -> Vec<LdapMessage> {
-    let base_object = request.base_object.0.to_string();
+    let mut base_object = request.base_object.0.to_string();
 
     // Root DSE is served before any access check: clients need it to discover the
     // naming contexts before they can bind.
     if base_object.is_empty() {
         return search_root_dse(message_id, request, directory.base_dn(), security);
+    }
+
+    // `<WKGUID=…,dc=…>`: the first RDN names a GUID and the real DN comes from the parent's
+    // `wellKnownObjects` (MS-ADTS 6.1.1.4.2). A Samba member looks for the computers container
+    // this way and by no other name, so an unresolved GUID is a join that reports a missing name.
+    if let Some(well_known) = super::wkguid::parse(&base_object) {
+        match super::wkguid::resolve(&well_known, directory) {
+            Some(resolved) => base_object = resolved,
+            None => {
+                return vec![responses::search_done(
+                    message_id,
+                    ResultCode::NoSuchObject,
+                    &format!(
+                        "'{}' names a well-known object this directory does not have: no \
+                         wellKnownObjects value answers for the GUID, and it is not one of the \
+                         containers a domain creates",
+                        well_known.guid
+                    ),
+                )];
+            }
+        }
     }
 
     // The subschema subentry does not live under the naming context; a client addresses
@@ -1163,6 +1184,62 @@ mod tests {
         assert!(
             at >= before && at <= after,
             "the timestamp falls between the two reads of the clock: {value:?}"
+        );
+    }
+
+    #[test]
+    fn a_well_known_base_reaches_the_container_it_names() {
+        // What a Samba member searches: base `<WKGUID=AA312825…,dc=example,dc=com>`. Resolved, the
+        // answer is about `cn=computers`; unresolved, the client reports a name it never got wrong.
+        let session = admin_session();
+        let request = request(
+            &format!(
+                "WKGUID={},dc=example,dc=com",
+                super::super::wkguid::COMPUTERS
+            ),
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let messages = search(&session, &request, None);
+
+        // The container itself is not in this fixture, so the honest answer is "no such object" -
+        // but for the resolved DN, which the diagnostic names. A directory that does carry it
+        // answers with the entry (see the wkguid tests for the resolution itself).
+        assert_eq!(result_code(&messages), ResultCode::NoSuchObject);
+        let text = match &messages[0].protocol_op {
+            ProtocolOp::SearchResDone(done) => done.0.diagnostic_message.0.clone(),
+            other => panic!("unexpected first message: {other:?}"),
+        };
+        assert!(
+            text.contains("cn=computers,dc=example,dc=com"),
+            "the answer names the DN the GUID resolved to: {text}"
+        );
+    }
+
+    #[test]
+    fn a_well_known_guid_nothing_answers_for_is_refused_by_guid() {
+        let session = admin_session();
+        let request = request(
+            "WKGUID=0123456789ABCDEF0123456789ABCDEF,dc=example,dc=com",
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let messages = search(&session, &request, None);
+
+        assert_eq!(result_code(&messages), ResultCode::NoSuchObject);
+        let text = match &messages[0].protocol_op {
+            ProtocolOp::SearchResDone(done) => done.0.diagnostic_message.0.clone(),
+            other => panic!("unexpected first message: {other:?}"),
+        };
+        assert!(
+            text.contains("0123456789ABCDEF0123456789ABCDEF"),
+            "the refusal names the GUID: {text}"
         );
     }
 
