@@ -37,7 +37,14 @@ redb = "4.4.0"
 # Kerberos for SASL GSSAPI, in pure Rust and with no C: the accept side, the SPNEGO wrapper and the
 # per-message tokens all come from here. It replaces the vendored `rskrb5` and the hand-written
 # framing this crate used to carry.
-krb5 = "1.0"
+#
+# From the fork, because what a domain controller needs is not in the 1.0.0 release: DER and
+# `KerberosTime` come from `rrl-krb` there, so the two sides read the same encoding, and a `Key`
+# wipes its octets when it is dropped. Both are on the branch this points at and neither is on
+# crates.io. `branch` rather than `rev`, for the same reason as the dependencies below: the two
+# crates are developed together and a pinned commit turns every change into a second commit here.
+# Move it back to `krb5 = "1.0"` once those commits are in a release.
+krb5 = { git = "https://github.com/alexey-vostrikov/krb5", branch = "main" }
 roaring = "0.12.0"
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2.2.0"
