@@ -81,7 +81,13 @@ rust-kdc = { git = "https://github.com/alexey-vostrikov/rust-kdc", branch = "mai
 # SMB2/3 for `IPC$`, which is where a Samba member's join actually begins: it connects to
 # `\\DC\IPC$` and opens `lsarpc` through it. Without `localfs` - this server serves no files - and
 # with `krb5`, so a machine account can authenticate with the ticket it already has.
-smb-server = { path = "../rust-smb-server", version = "0.9.1", optional = true, default-features = false, features = ["krb5"] }
+#
+# From the fork, on the branch that carries what a join needs: `lsarpc`, `samr` and Kerberos in
+# SESSION_SETUP do not exist in the upstream release, and a path dependency on a sibling checkout
+# resolves to "no such package" on any machine that cloned this repository alone. `branch` rather
+# than `rev` for the same reason as `rust-kdc` above; `cargo update -p smb-server` takes a newer
+# revision. Move this back to `paltaio/rust-smb-server` once that branch is merged upstream.
+smb-server = { git = "https://github.com/alexey-vostrikov/rust-smb-server", branch = "krb5-support", optional = true, default-features = false, features = ["krb5"] }
 
 # Logging. `tracing` without a subscriber records nothing, and the call sites look instrumented
 # either way - which is how a refusal in the RPC dispatcher came to be invisible. The subscriber
