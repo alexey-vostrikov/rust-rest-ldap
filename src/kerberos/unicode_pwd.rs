@@ -142,6 +142,30 @@ const KEPT: [&str; 3] = [
     "msDS-KeyVersionNumber",
 ];
 
+/// The keys of a password this caller holds in the clear, for an account it is about to create.
+///
+/// The bootstrap path has the password because it has to hash it anyway; going through
+/// `unicodePwd` there would mean writing the clear password into the entry first and deleting it
+/// afterwards, which is a window nobody needs.
+pub fn keys_for(password: &str, principal: &str, realm: &str) -> Result<Attributes, String> {
+    derive(password, principal, realm)
+}
+
+/// The attributes of `derived` merged into `into`, and `unicodePwd` dropped.
+///
+/// `unicodePwd` is write-only in AD and this server was storing it: a search returned the
+/// account's password in the clear, in UTF-16, which is a password store with extra steps. The
+/// value has served its purpose by the time the keys exist.
+pub fn merge_keys(into: &Attributes, derived: &Attributes) -> Attributes {
+    let mut attributes = into.clone();
+    for name in KEPT {
+        if let Some(attribute) = derived.get(name) {
+            attributes = attributes.push(attribute.clone());
+        }
+    }
+    attributes.without("unicodePwd")
+}
+
 /// The entry with its keys derived from a password it carries, or unchanged.
 ///
 /// Called where a write is turned into changes, so the entry that reaches the store is already
@@ -178,13 +202,10 @@ pub fn seal(
         }
     };
 
-    let mut attributes = entry.attributes().clone();
-    for name in KEPT {
-        if let Some(attribute) = derived.get(name) {
-            attributes = attributes.push(attribute.clone());
-        }
-    }
-    crate::model::Entry::new(entry.dn().to_string(), attributes)
+    crate::model::Entry::new(
+        entry.dn().to_string(),
+        merge_keys(entry.attributes(), &derived),
+    )
 }
 
 /// The name the realm knows this account by: `sAMAccountName`, then `userPrincipalName`, then `cn`.
