@@ -45,6 +45,16 @@ pub struct Base {
 /// first RDN merely *starts* with those letters is an ordinary entry with an unusual name, and
 /// treating it as well-known would make an entry unreachable by its own DN.
 pub fn parse(base: &str) -> Option<Base> {
+    // Both spellings arrive. Samba sends the bracketed form, `<WKGUID=…,dc=…>` (its own
+    // `dsdb_dn` notation, which a real AD accepts), and a client that assembled the DN itself
+    // sends it bare. Measured: a server that took only the bare form left the join at
+    // "Failed while searching for: <WKGUID=…>".
+    let base = base.trim();
+    let base = base
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or(base);
+
     let (first, rest) = base.split_once(',')?;
     let value = first.trim().strip_prefix("WKGUID=").or_else(|| {
         first
@@ -133,9 +143,12 @@ mod tests {
 
     #[test]
     fn the_base_samba_searches_with_parses_to_a_guid_and_a_parent() {
-        // The angle brackets in a capture are Samba's `dsdb_dn` notation and are not sent: the
-        // search carries the DN itself, and the client strips them before calling.
-        assert!(parse(&format!("<WKGUID={COMPUTERS},{PARENT}>")).is_none());
+        // Samba sends the bracketed spelling, and a client that built the DN itself sends it bare.
+        // Both name the same container, and a server that took only one of them refused the client
+        // that used the other.
+        let bracketed = parse(&format!("<WKGUID={COMPUTERS},{PARENT}>"))
+            .expect("the bracketed form is what Samba sends");
+        assert_eq!(bracketed, base());
 
         let parsed = base();
         assert_eq!(parsed.guid, COMPUTERS);
