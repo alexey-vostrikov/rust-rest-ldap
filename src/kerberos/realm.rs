@@ -75,12 +75,19 @@ impl RealmView {
     }
 
     /// The entry for `principal`, by the canonical DN first and by its principal name second.
+    ///
+    /// Both lookups go through `record`, not through the snapshot. A restarted server holds a
+    /// snapshot of *skeletons* - DN and indexed attributes, records read from the store when an
+    /// answer needs them - so `all()` and `find()` return entries whose attribute list is empty.
+    /// Measured: after a restart the realm could not find `admin@REALM` at all, because the scan
+    /// below looked for `userPrincipalName` on identities that carry no attributes, and the KDC
+    /// answered `KDC_ERR_C_PRINCIPAL_UNKNOWN` for an account the directory still held.
     fn entry_for(&self, principal: &Principal) -> Option<Entry> {
         let directory = self.current();
 
         let canonical = dn_for(principal, &self.base_dn);
-        if let Some(entry) = directory.find(&canonical) {
-            return Some(entry.clone());
+        if let Some(entry) = directory.record(&canonical) {
+            return Some(entry.into_owned());
         }
 
         // Not the canonical DN, so this account was created where a person put it. Compared on the
@@ -88,21 +95,48 @@ impl RealmView {
         // `userPrincipalName` is the Microsoft spelling that a Windows client writes, and
         // `krb5PrincipalName` is the one a realm bootstrap writes.
         let wanted = principal.to_string();
-        directory
-            .all()
-            .iter()
-            .find(|entry| {
-                [attrs::PRINCIPAL_NAME, "userPrincipalName"]
-                    .iter()
-                    .any(|name| match entry.attributes().get(name) {
-                        Some(attribute) => attribute
+        // `sAMAccountName` is the third spelling, and the one a machine is written under: `kinit
+        // HOST$` asks for `HOST$@REALM` and the account the join created calls itself `HOST$` in
+        // that attribute alone. It carries no realm, so it is compared against the name part.
+        let account = principal.components.join("/");
+        let matches = |entry: &Entry| {
+            [attrs::PRINCIPAL_NAME, "userPrincipalName"]
+                .iter()
+                .any(|name| match entry.attributes().get(name) {
+                    Some(attribute) => attribute
+                        .values
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(&wanted)),
+                    None => false,
+                })
+                || entry
+                    .attributes()
+                    .get("sAMAccountName")
+                    .is_some_and(|attribute| {
+                        attribute
                             .values
                             .iter()
-                            .any(|value| value.eq_ignore_ascii_case(&wanted)),
-                        None => false,
+                            .any(|value| value.eq_ignore_ascii_case(&account))
                     })
-            })
-            .cloned()
+        };
+        self.first_complete(|entry| matches(entry))
+    }
+
+    /// The first entry whose *complete* record matches, read one DN at a time.
+    ///
+    /// A scan is already the fallback - the canonical DN answers a lookup in one read - and this
+    /// keeps it honest on a snapshot of skeletons by reading each candidate from the store.
+    fn first_complete(&self, matches: impl Fn(&Entry) -> bool) -> Option<Entry> {
+        let directory = self.current();
+        for identity in directory.entries_in_order() {
+            let Some(record) = directory.record(identity.dn()) else {
+                continue;
+            };
+            if matches(&record) {
+                return Some(record.into_owned());
+            }
+        }
+        None
     }
 }
 
@@ -188,8 +222,7 @@ impl Realm for RealmView {
     /// entries this is asked about is one per ticket. When the index is there the attribute is
     /// what a search would use, and this becomes the same work done by hand.
     fn get_by_spn(&self, spn: &str) -> rust_kdc::Result<Option<Attributes>> {
-        let directory = self.current();
-        let Some(entry) = directory.all().iter().find(|entry| {
+        let Some(entry) = self.first_complete(|entry| {
             entry
                 .attributes()
                 .get("servicePrincipalName")
@@ -205,7 +238,7 @@ impl Realm for RealmView {
 
         // The principal this entry answers to, when the entry does not name itself: a machine
         // account is `HOST$`, and the ticket the client asked for is for `cifs/host...`.
-        let Some(account) = self.name_of(entry) else {
+        let Some(account) = self.name_of(&entry) else {
             return Err(Error::Hdb(format!(
                 "entry '{}' publishes '{spn}' and no account name, so there is no principal to \
                  seal a ticket for",
@@ -216,7 +249,7 @@ impl Realm for RealmView {
         // Not decoded here, unlike `get`: the caller checks that the entry really publishes this
         // name, and an entry that fails to read back should be refused with that in hand rather than
         // with a decode error about a mapping.
-        let attributes = self.published(entry, &account);
+        let attributes = self.published(&entry, &account);
         Ok(Some(attributes))
     }
 
@@ -239,7 +272,10 @@ impl Realm for RealmView {
     fn list(&self) -> rust_kdc::Result<Vec<Principal>> {
         let directory = self.current();
         let mut out = Vec::new();
-        for entry in directory.all() {
+        for identity in directory.entries_in_order() {
+            let Some(entry) = directory.record(identity.dn()) else {
+                continue;
+            };
             let Some(values) = entry.attributes().get(attrs::PRINCIPAL_NAME) else {
                 continue;
             };
@@ -491,6 +527,7 @@ mod tests {
     /// the account is `HOST$`, and only `servicePrincipalName` connects the two. A realm that found
     /// entries by principal alone would answer `None`, the TGS would refuse the one ticket the join
     /// needs, and the failure would read as a service that does not exist.
+
     #[test]
     fn a_machine_account_is_found_by_the_service_name_it_publishes() {
         let host = Principal::parse(&format!("HOST$@{REALM}")).expect("a principal");
@@ -534,6 +571,74 @@ mod tests {
                 .expect("read")
                 .is_none()
         );
+    }
+
+    /// A restarted server holds a snapshot of identities, not records, and the realm has to read
+    /// through it.
+    ///
+    /// Measured on the AD-join stand: after a restart `kinit admin@REALM` answered
+    /// `C_PRINCIPAL_UNKNOWN` for an account the directory still held and LDAP search still found.
+    /// The lookup scanned `all()` for `userPrincipalName`, and a skeleton's attribute list is
+    /// empty - so every account that lives where a person put it, rather than at the canonical DN,
+    /// became invisible the moment the server was restarted.
+    #[test]
+    fn a_snapshot_of_skeletons_still_answers_for_an_account() {
+        // `principal_entry` appends the realm itself: the name goes in bare, or the principal is
+        // `alice@EXAMPLE.COM@EXAMPLE.COM` and nothing finds it.
+        let entry = principal_entry("alice", Some(&format!("cn=alice,ou=users,{BASE}")));
+        let full = std::collections::HashMap::from([(entry.dn().to_string(), entry.clone())]);
+
+        // The snapshot the restart builds: identities only, records a read away.
+        let mut directory = Directory::from_entries(BASE, "users", "groups", vec![entry]);
+        directory.release_records();
+        directory.attach_source(Arc::new(Store(full)));
+        assert!(
+            directory.is_skeleton(),
+            "the test must exercise the skeleton path"
+        );
+        assert!(
+            directory
+                .find(&format!("cn=alice,ou=users,{BASE}"))
+                .is_some_and(|entry| entry.attributes().values().is_empty()),
+            "a skeleton holds no attributes, which is what made the scan find nothing"
+        );
+
+        let view = RealmView::new(REALM, BASE, Arc::new(directory));
+        let principal = Principal::parse(&format!("alice@{REALM}")).expect("a principal");
+        assert!(
+            view.first_complete(|entry| entry
+                .attributes()
+                .get(attrs::PRINCIPAL_NAME)
+                .is_some_and(|a| a.values.iter().any(|v| v.contains("alice"))))
+                .is_some(),
+            "the scan must find a record the snapshot does not hold"
+        );
+        assert!(
+            view.entry_for(&principal).is_some(),
+            "the lookup by principal name must find the account"
+        );
+        let attributes = view
+            .get(&principal)
+            .expect("the lookup itself succeeds")
+            .expect("the account exists");
+        assert!(
+            attributes.has(attrs::KEY),
+            "the record must be read from the store, keys and all"
+        );
+    }
+
+    /// Where a skeleton's records come from.
+    struct Store(std::collections::HashMap<String, Entry>);
+
+    impl crate::directory::EntrySource for Store {
+        fn get(&self, dn: &str) -> Option<Entry> {
+            self.0.get(&crate::dn::normalize(dn)).cloned().or_else(|| {
+                self.0
+                    .values()
+                    .find(|entry| crate::dn::normalize(entry.dn()) == crate::dn::normalize(dn))
+                    .cloned()
+            })
+        }
     }
 
     #[test]

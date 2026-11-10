@@ -151,6 +151,15 @@ pub async fn ensure_keytab_principals(
         if key.principal.starts_with("krbtgt/") || key.principal == "krbtgt" {
             continue;
         }
+        // Only service principals, which are the ones a keytab exists to describe. A name without
+        // a slash is an *account* - `HOST$`, `alice` - and its keys belong to the entry the account
+        // already lives in: a client that joins creates `cn=host,cn=computers,…` with a password of
+        // its own, and a second entry at the canonical DN would shadow it. Measured: `kinit HOST$`
+        // resolved to the keytab's entry and answered `KDC_ERR_POLICY`, because that entry is a
+        // service and not a client, while the account the join had just created went unread.
+        if !key.principal.contains('/') {
+            continue;
+        }
         let Some(enctype) = Enctype::from_id(key.enctype as i32) else {
             continue;
         };
