@@ -31,14 +31,15 @@ pub fn modifications(request: &ModifyRequest) -> Vec<mutate::Modification> {
                 rasn_ldap::ChangeOperation::Delete => mutate::Op::Delete,
                 rasn_ldap::ChangeOperation::Replace => mutate::Op::Replace,
             };
+            let name = change.modification.r#type.0.to_string();
             let values = change
                 .modification
                 .vals
                 .iter()
-                .map(|value| String::from_utf8_lossy(value.as_ref()).into_owned())
+                .map(|value| crate::model::value_text(&name, value.as_ref()))
                 .collect();
 
-            mutate::Modification::new(op, change.modification.r#type.0.to_string(), values)
+            mutate::Modification::new(op, name, values)
         })
         .collect()
 }

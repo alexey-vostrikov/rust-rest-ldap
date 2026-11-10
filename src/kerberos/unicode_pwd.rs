@@ -100,7 +100,7 @@ pub fn keys(
 }
 
 fn derive(password: &str, principal: &str, realm: &str) -> Result<Attributes, String> {
-    use rust_kdc::crypto::{Enctype, OwnCipher};
+    use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
 
     let name = rust_kdc::name::Principal::parse(&format!("{principal}@{realm}"))
         .map_err(|err| format!("'{principal}@{realm}' is not a principal: {err}"))?;
@@ -113,10 +113,21 @@ fn derive(password: &str, principal: &str, realm: &str) -> Result<Attributes, St
         Enctype::Aes256Sha1,
         Enctype::Aes128Sha1,
     ];
+    // AD's salt, not the one MIT's default constructs. The two agree for an account whose name is
+    // its principal name and differ for every machine: AD salts with `REALMhostNAME`, lower-cased,
+    // and a client in ADS mode derives its key that way without asking. Measured on the AD-join
+    // stand: with the MIT salt, `kinit HOST$` after a successful join answered `Preauthentication
+    // failed` - the account existed, the password was the one the client had just set, and the two
+    // sides had ground different keys out of it.
+    //
+    // The salt is written into the entry, so the KDC publishes it in `ETYPE-INFO2` and a client
+    // that reads the reply derives the same key rather than assuming one.
+    let salt = ad_salt(realm, principal);
     for enctype in ENCTYPES {
-        entry
-            .add_password_key(&OwnCipher, enctype, password.as_bytes(), 1)
+        let key = OwnCipher
+            .s2k(enctype, password.as_bytes(), salt.as_bytes(), None)
             .map_err(|err| format!("a key for {enctype:?}: {err}"))?;
+        entry.add_key(key, 1, Some(salt.as_bytes().to_vec()));
     }
 
     let derived = crate::kerberos::bootstrap::attributes_of(&entry);
@@ -129,6 +140,19 @@ fn derive(password: &str, principal: &str, realm: &str) -> Result<Attributes, St
         }
     }
     Ok(out)
+}
+
+/// The salt AD derives an account's keys with: `REALM` + `host` + the account name, lower-cased.
+///
+/// The trailing `$` of a machine account is not part of it - the name AD salts with is the one a
+/// person would say out loud, and the mark is there to keep a machine from colliding with a user.
+fn ad_salt(realm: &str, account: &str) -> String {
+    format!(
+        "{}{}{}",
+        realm.to_ascii_uppercase(),
+        "host",
+        account.trim_end_matches('$').to_ascii_lowercase()
+    )
 }
 
 /// The derived attributes that belong on an account entry.

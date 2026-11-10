@@ -238,7 +238,7 @@ pub fn handle_add(
         let values: Vec<String> = attribute
             .vals
             .iter()
-            .map(|value| String::from_utf8_lossy(value.as_ref()).into_owned())
+            .map(|value| crate::model::value_text(&name, value.as_ref()))
             .collect();
 
         if values.is_empty() {

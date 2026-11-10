@@ -337,7 +337,7 @@ fn to_realm_attributes(attributes: &crate::model::Attributes) -> Attributes {
 fn is_binary(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     let name = name.split(';').next().unwrap_or(&name);
-    matches!(name, "krb5key" | "supplementalcredentials")
+    matches!(name, "krb5key" | "supplementalcredentials" | "unicodepwd")
 }
 
 #[cfg(test)]

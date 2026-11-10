@@ -1949,7 +1949,7 @@ dependencies = [
 [[package]]
 name = "rrl-crypto"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#6997762943d47ee6ef1873ae53cd226bd28eed35"
+source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#7a416e202270224755cfa0884271435ea1fe33b6"
 dependencies = [
  "aes 0.9.4",
  "getrandom 0.4.3",
@@ -1959,6 +1959,18 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "zeroize",
+]
+
+[[package]]
+name = "rrl-krb"
+version = "0.1.0"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb?branch=main#724ed08e6cfe8f07388959da8f2860a96df13095"
+dependencies = [
+ "hmac 0.13.0",
+ "md-5 0.11.0",
+ "rrl-crypto",
+ "sha1",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -1985,11 +1997,12 @@ dependencies = [
 [[package]]
 name = "rust-kdc"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rust-kdc?branch=main#2aa48d5fa77ce4e7285acdb08ced821e109d24be"
+source = "git+https://github.com/alexey-vostrikov/rust-kdc?branch=main#2ad7f3f9c8480dbbef777e886c4936f503442fd3"
 dependencies = [
  "hmac 0.13.0",
  "md-5 0.11.0",
  "rrl-crypto",
+ "rrl-krb",
  "sha1",
  "sha2 0.11.1",
  "thiserror 2.0.21",
