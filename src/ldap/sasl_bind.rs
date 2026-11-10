@@ -2,17 +2,33 @@
 //!
 //! An LDAP SASL bind is a conversation, not a request. The client sends a token, the server
 //! answers `saslBindInProgress` with a token of its own, and the bind ends either with `success`
-//! and an identity or with a failure code. GSSAPI needs three rounds:
+//! and an identity or with a failure code. Two conversations exist, and which one runs is decided
+//! by the mechanism name and by whether the first bind carried anything:
+//!
+//! **`GSSAPI`, client-first** - what `ldapsearch -Y GSSAPI` speaks, and libsasl's three rounds:
 //!
 //! 1. the client's AP-REQ (a ticket plus an authenticator), answered with an AP-REP;
-//! 2. RFC 4752 §3.1: the client's choice of security layer, answered with the server's;
-//! 3. an empty final token, which proves the client can process what it was sent.
+//! 2. the client's empty token, answered with the server's security-layer mask;
+//! 3. the client's wrapped choice of layer, and the bind succeeds.
 //!
-//! # Why three rounds and not one
+//! **`GSS-SPNEGO`, server-first** - what a Samba member speaks (`ads_sasl_bind`), and two rounds
+//! fewer of ceremony:
+//!
+//! 1. a bind naming the mechanism and carrying nothing, answered with a `NegTokenInit` that lists
+//!    the mechanisms (see [`super::spnego_offer`]);
+//! 2. the client's `NegTokenInit` carrying the AP-REQ, answered with `accept-completed` and the
+//!    server's AP-REP;
+//! 3. an empty token, which is the bind's last request, answered with `success`.
+//!
+//! Step 1 is not politeness. Samba never sends a token first, so a server that waits for one
+//! refuses every domain member with `Authentication method not supported` before the ticket is
+//! even on the wire - and that is the refusal this module used to give.
+//!
+//! # Why more than one round at all
 //!
 //! A ticket proves the client knows a secret; the AP-REP proves **the server** does too, and the
 //! key that protects the AP-REP is the session key from the ticket. Skipping the exchange means a
-//! client cannot tell a real server from one replaying a captured ticket. The third round exists
+//! client cannot tell a real server from one replaying a captured ticket. The rounds after it exist
 //! for the same reason in reverse: the client must show it could unwrap what the server sent.
 //!
 //! # What this deliberately does not do
@@ -57,6 +73,13 @@ pub enum Stage {
     OfferSent,
     /// Our mask was sent; the client's wrapped choice is expected, and ends the exchange.
     ChoiceExpected,
+    /// The client's ticket was accepted and `accept-completed` sent.
+    ///
+    /// The last round of a `GSS-SPNEGO` bind, which is not the libsasl sequence above: there is no
+    /// wrapped security-layer mask between the ticket and the end, only an empty token from the
+    /// client, because a client that negotiates through `gensec` (Samba's `ads_sasl_bind`) has no
+    /// RFC 4752 layer to negotiate at all.
+    SpnegoAccepted,
 }
 
 /// The state a GSSAPI conversation keeps between two binds on one connection.
@@ -95,6 +118,134 @@ impl Exchange {
     pub fn set_stage(&mut self, stage: Stage) {
         self.stage = stage;
     }
+
+    /// Takes what the finished exchange leaves behind: the per-message tokens and the identity.
+    ///
+    /// Needed because the conversation outlives the bind. After `success` the client wraps every
+    /// LDAP message with the key from the ticket, and the same key has to be here, with sequence
+    /// numbers that continue from where the negotiation left them.
+    pub fn into_parts(
+        self,
+    ) -> (
+        krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+        Identity,
+    ) {
+        (self.tokens, self.identity)
+    }
+}
+
+/// The SASL security layer of one connection: confidentiality of every message after the bind.
+///
+/// RFC 4422 §3.2 puts a four-octet big-endian length in front of each SASL buffer; RFC 4752 §3.2
+/// makes that buffer a `gss_wrap` output, so what travels is
+///
+/// ```text
+/// 00 00 00 b7 | 05 04 02 ff 00 00 00 1c … | sealed LDAP message …
+/// \_________/   \__/ \/ \/ \__/ \__/ \__/
+///  length        TOK_ID Sealed  EC   RRC   SND_SEQ
+/// ```
+///
+/// Sequence numbers are this side's own: the peer's SND_SEQ must arrive in order on a connection,
+/// and one that repeats is a replayed message, not a retransmission - LDAP over TCP has no
+/// retransmissions, and a duplicated wrap is either a bug or an attack.
+pub struct Wrap {
+    tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+    send: u64,
+    /// The peer's next sequence number, once its first message has shown where it starts.
+    ///
+    /// `None` until then on purpose: RFC 4121 §4.2.1 says the initial SND_SEQ *should* be random to
+    /// keep known-plaintext attacks out, and MIT's and Heimdal's acceptors do exactly that. Measured
+    /// on the stand: Samba's first sealed message carried 316063208, so a server that insists on 0
+    /// refuses every join after a successful bind.
+    recv: Option<u64>,
+    /// Whether the layer is still waiting for the `success` that announces it.
+    ///
+    /// The bind response itself is plain LDAP: the client starts wrapping only after it reads that
+    /// answer, so a server that sealed its own success would be sealing something the client is
+    /// not yet looking at.
+    pending: bool,
+}
+
+impl Wrap {
+    /// A layer that takes effect after the next message this side writes.
+    fn pending(tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>) -> Self {
+        Self {
+            tokens,
+            send: 0,
+            recv: None,
+            pending: true,
+        }
+    }
+
+    /// A layer that takes effect immediately, for tests that drive the framing directly.
+    #[cfg(test)]
+    pub fn active_for_test(tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>) -> Self {
+        Self {
+            tokens,
+            send: 0,
+            recv: None,
+            pending: false,
+        }
+    }
+
+    /// Whether a message written now must be sealed.
+    pub fn is_active(&self) -> bool {
+        !self.pending
+    }
+
+    /// Lets the layer take effect: called once the announcing response has been written.
+    pub fn activate(&mut self) {
+        self.pending = false;
+    }
+
+    /// Seals one LDAP message, with the four-octet length RFC 4422 §3.2 puts in front of it.
+    pub fn seal(&mut self, message: &[u8]) -> Result<Vec<u8>, String> {
+        let token = self
+            .tokens
+            .emit_wrap(self.send, message)
+            .map_err(|err| format!("the SASL layer could not seal a reply: {err}"))?;
+        self.send += 1;
+        let mut framed = Vec::with_capacity(4 + token.len());
+        framed.extend_from_slice(&(token.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&token);
+        Ok(framed)
+    }
+
+    /// Opens one sealed message: the token's own length prefix has already been stripped.
+    pub fn open(&mut self, token: &[u8]) -> Result<Vec<u8>, String> {
+        let verified = self
+            .tokens
+            .unwrap(token)
+            .map_err(|err| format!("the client's SASL layer could not be opened: {err}"))?;
+        // The first message names the starting point; every one after it must be exactly one more.
+        // Accepting a jump would reopen the replay the sequence number exists to close, and
+        // accepting the initial value from the client is not a concession: RFC 4121 §4.2.1 lets it
+        // start anywhere.
+        match self.recv {
+            None => self.recv = Some(verified.seq.wrapping_add(1)),
+            Some(next) if verified.seq == next => self.recv = Some(next.wrapping_add(1)),
+            Some(next) => {
+                return Err(format!(
+                    "the client's message carries sequence number {} where {} was next: a repeated \
+                     or reordered wrap on one connection is not a retransmission",
+                    verified.seq, next
+                ));
+            }
+        }
+        Ok(verified.message)
+    }
+}
+
+impl std::fmt::Debug for Wrap {
+    /// Hand-written for the same reason [`Exchange`]'s is: the token layer holds the session key.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Wrap")
+            .field("send", &self.send)
+            .field("recv", &self.recv)
+            .field("pending", &self.pending)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for Exchange {
@@ -113,6 +264,13 @@ impl std::fmt::Debug for Exchange {
 /// `GSSAPI` is what `ldapsearch -Y GSSAPI` asks for; `GSS-SPNEGO` is the same conversation with a
 /// different wrapper, and accepting both costs nothing because the framing is detected anyway.
 pub const MECHANISMS: [&str; 2] = ["GSSAPI", "GSS-SPNEGO"];
+
+/// The mechanism a Samba client names, and the one that speaks server-first.
+///
+/// Spelled here, in one place, because it is compared against what arrives in a bind: a second
+/// spelling in the branch that offers would be a server that advertises one name and recognises
+/// another.
+const SPNEGO_MECHANISM: &str = "GSS-SPNEGO";
 
 /// The NTLMSSP OID, DER-encoded: `1.3.6.1.4.1.311.2.2.10`.
 ///
@@ -227,25 +385,47 @@ pub fn handle_gssapi(
         );
     }
 
-    let token = match &request.authentication {
-        AuthenticationChoice::Sasl(credentials) => credentials
-            .credentials
-            .as_ref()
-            .map(|value| value.as_ref().to_vec())
-            .unwrap_or_default(),
-        _ => Vec::new(),
+    let (mechanism, token) = match &request.authentication {
+        AuthenticationChoice::Sasl(credentials) => (
+            credentials.mechanism.0.to_string(),
+            credentials
+                .credentials
+                .as_ref()
+                .map(|value| value.as_ref().to_vec())
+                .unwrap_or_default(),
+        ),
+        _ => (String::new(), Vec::new()),
     };
 
     // A fresh SASL bind starts by making the connection anonymous, per RFC 4513 - but only a
     // fresh one: the rounds of an exchange in progress must not clear what they depend on.
-    if session.sasl_stage().is_none() {
+    if session.sasl_stage().is_none() && !session.spnego_offered() {
         session.reset();
     }
 
     let outcome = match session.sasl_stage() {
-        None => begin(session, directory, &gssapi, token, security),
         Some(Stage::OfferSent) => offer_layer(session, token),
         Some(Stage::ChoiceExpected) => accept_choice(session, token),
+        Some(Stage::SpnegoAccepted) => spnego_finish(session, token),
+        // No exchange and no offer yet. A `GSS-SPNEGO` bind that carries no token is not a
+        // client with nothing to say - it is a client waiting for the server to name the
+        // mechanisms, which is what Samba's `ads_sasl_bind` does. See `super::spnego_offer`.
+        // An offer that is outstanding is answered by the next bind, unless the client changed
+        // mechanism: a bind that is not a continuation of the same conversation starts over, which
+        // is RFC 4513's rule and also the only reading under which a client that abandons SPNEGO
+        // for plain `GSSAPI` is not sent down the wrong path.
+        None if session.spnego_offered() => {
+            if mechanism.eq_ignore_ascii_case(SPNEGO_MECHANISM) {
+                spnego_accept(session, directory, &gssapi, token, security)
+            } else {
+                session.reset();
+                begin(session, directory, &gssapi, token, security)
+            }
+        }
+        None if token.is_empty() && mechanism.eq_ignore_ascii_case(SPNEGO_MECHANISM) => {
+            offer_spnego(session)
+        }
+        None => begin(session, directory, &gssapi, token, security),
     };
 
     match outcome {
@@ -254,10 +434,16 @@ pub fn handle_gssapi(
             credentials,
             identity,
             diagnostic,
+            wrap,
         }) => {
             if let Some(identity) = identity {
                 session.set_identity(identity);
                 session.clear_sasl();
+            }
+            // Installed after the identity, because `reset` (inside a successful bind's own path
+            // nowhere) would drop it; and it stays "pending" until the response below is written.
+            if let Some(wrap) = wrap {
+                session.set_wrap(wrap);
             }
             sasl_response(message_id, code, &diagnostic, credentials)
         }
@@ -276,6 +462,12 @@ struct Round {
     credentials: Option<Vec<u8>>,
     identity: Option<Identity>,
     diagnostic: String,
+    /// The security layer this round puts in place, when it is the last one.
+    ///
+    /// Set only by `spnego_finish`: a client on `gensec` has no RFC 4752 mask to negotiate and
+    /// starts sealing the moment it reads `success`, so the server has to be ready with the key and
+    /// with sequence number zero on both directions.
+    wrap: Option<Wrap>,
 }
 
 /// The acceptor's options, as one function rather than three statements in `begin`.
@@ -305,77 +497,41 @@ fn accept_options(
     options
 }
 
-/// The first round: accept the ticket, answer with the server's half.
-fn begin(
-    session: &mut Session,
-    directory: &Directory,
-    gssapi: &crate::sasl::Gssapi,
-    token: Vec<u8>,
-    security: &Security,
-) -> Result<Round, SaslError> {
-    if token.is_empty() {
-        return Err(SaslError::Sequence(
-            "the first token of a GSSAPI bind must carry the ticket".to_string(),
-        ));
-    }
-
+/// Refuses a ticket over a connection that cannot bind it to anything.
+///
+/// One rule, one place: the client that sends its ticket first and the client that waits to be
+/// offered a mechanism are refused on the same terms, and a second copy of this paragraph would be
+/// a second chance for them to differ.
+fn require_encrypted(session: &Session, security: &Security) -> Result<(), SaslError> {
     // A ticket accepted over a plaintext connection can be replayed by anyone who watched it
     // go by: without channel binding the server cannot tell the original from the copy. Refused
     // here, before the ticket is even decrypted, so the answer says nothing about the ticket.
-    if !session.is_encrypted() && !security.allow_unencrypted_bind {
-        return Err(SaslError::Layer(
-            "a Kerberos ticket is accepted only over TLS or StartTLS on this server: without \
-             channel binding a captured ticket can be replayed, and the rule is stated here \
-             rather than discovered later"
-                .to_string(),
-        ));
+    if session.is_encrypted() || security.allow_unencrypted_bind {
+        return Ok(());
     }
+    Err(SaslError::Layer(
+        "a Kerberos ticket is accepted only over TLS or StartTLS on this server: without \
+         channel binding a captured ticket can be replayed, and the rule is stated here \
+         rather than discovered later"
+            .to_string(),
+    ))
+}
 
-    // The whole token goes to the acceptor, which tells GSS-framed from bare by what it finds and
-    // answers in the same framing. This crate no longer decodes SPNEGO, the GSS-API context token or
-    // the RFC 4121 token id itself: `krb5` does, and its SPNEGO acceptor is tested against MIT's own
-    // initiator, which is the only thing that makes a framing claim worth anything.
-    //
-    // A token that opens with neither framing is refused before the acceptor parses it: its own
-    // complaint would be about DER, while the client's mistake is about what it sent.
-    if !matches!(token.first(), Some(0x60) | Some(0x6e)) {
-        return Err(SaslError::Undecodable(format!(
-            "the token starts with {:02x?}, which is not a Kerberos ticket in any framing this \
-             server knows",
-            token.first()
-        )));
-    }
-
-    // A `GSS-SPNEGO` conversation whose inner mechanism is NTLMSSP is not a Kerberos token that
-    // failed to parse - it is a client asking for a mechanism this server does not offer, and the
-    // refusal has to say which. See `NTLMSSP_OID`.
-    if offers_ntlmssp(&token) {
-        return Err(SaslError::Undecodable(
-            "the SPNEGO token offers NTLMSSP, which this server does not accept: it accepts \
-             Kerberos, so a Samba member joins with `net ads join -k` and a ticket from `kinit`"
-                .to_string(),
-        ));
-    }
-
+/// The identity a verified ticket authenticates as.
+///
+/// Shared by both doors a ticket comes through - a client that sends it first, and a client that
+/// waits for the mechanism list and then sends it in a `NegTokenInit` - because the policy applied
+/// to a ticket must not depend on which of them the client walked through.
+fn admitted_identity(
+    directory: &Directory,
+    gssapi: &crate::sasl::Gssapi,
+    context: &krb5::acceptor::KerberosContext,
+) -> Result<Identity, SaslError> {
     // Whether the PAC's signature is checked at all is the operator's setting, and the default is
     // "not at all" - see `pac_policy`. `krb5` verifies whatever PAC it finds and keeps it only if it
     // verifies, so a realm that issues none is not an error there; the setting decides what this
     // module then *requires*, which is a different question and the operator's.
     let pac = gssapi.pac();
-
-    // One cache for the whole process: a captured AP-REQ replayed on a *new* connection has to be
-    // refused, and a per-connection cache would refuse nothing.
-    let options = accept_options(security, gssapi);
-    let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(gssapi.keytab(), options);
-
-    let reply = acceptor
-        .step(&token)
-        .map_err(|err| SaslError::Ticket(err.to_string()))?
-        .ok_or_else(|| SaslError::Ticket("the acceptor produced no reply".to_string()))?;
-
-    let context = acceptor.into_context().ok_or_else(|| {
-        SaslError::Ticket("the ticket was accepted without a context".to_string())
-    })?;
 
     // The policy, applied to what the ticket claims. A refusal here is a failed bind with the
     // reason attached: the client's Kerberos credentials are genuine and the ticket is still
@@ -416,6 +572,67 @@ fn begin(
         identity = identity.with_groups(found.into_iter().map(|(dn, _)| dn).collect());
     }
 
+    Ok(identity)
+}
+
+/// The first round: accept the ticket, answer with the server's half.
+fn begin(
+    session: &mut Session,
+    directory: &Directory,
+    gssapi: &crate::sasl::Gssapi,
+    token: Vec<u8>,
+    security: &Security,
+) -> Result<Round, SaslError> {
+    if token.is_empty() {
+        return Err(SaslError::Sequence(
+            "the first token of a GSSAPI bind must carry the ticket".to_string(),
+        ));
+    }
+
+    require_encrypted(session, security)?;
+
+    // The whole token goes to the acceptor, which tells GSS-framed from bare by what it finds and
+    // answers in the same framing. This crate no longer decodes SPNEGO, the GSS-API context token or
+    // the RFC 4121 token id itself: `krb5` does, and its SPNEGO acceptor is tested against MIT's own
+    // initiator, which is the only thing that makes a framing claim worth anything.
+    //
+    // A token that opens with neither framing is refused before the acceptor parses it: its own
+    // complaint would be about DER, while the client's mistake is about what it sent.
+    if !matches!(token.first(), Some(0x60) | Some(0x6e)) {
+        return Err(SaslError::Undecodable(format!(
+            "the token starts with {:02x?}, which is not a Kerberos ticket in any framing this \
+             server knows",
+            token.first()
+        )));
+    }
+
+    // A `GSS-SPNEGO` conversation whose inner mechanism is NTLMSSP is not a Kerberos token that
+    // failed to parse - it is a client asking for a mechanism this server does not offer, and the
+    // refusal has to say which. See `NTLMSSP_OID`.
+    if offers_ntlmssp(&token) {
+        return Err(SaslError::Undecodable(
+            "the SPNEGO token offers NTLMSSP, which this server does not accept: it accepts \
+             Kerberos, so a Samba member joins with `net ads join -k` and a ticket from `kinit`"
+                .to_string(),
+        ));
+    }
+
+    // One cache for the whole process: a captured AP-REQ replayed on a *new* connection has to be
+    // refused, and a per-connection cache would refuse nothing.
+    let options = accept_options(security, gssapi);
+    let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(gssapi.keytab(), options);
+
+    let reply = acceptor
+        .step(&token)
+        .map_err(|err| SaslError::Ticket(err.to_string()))?
+        .ok_or_else(|| SaslError::Ticket("the acceptor produced no reply".to_string()))?;
+
+    let context = acceptor.into_context().ok_or_else(|| {
+        SaslError::Ticket("the ticket was accepted without a context".to_string())
+    })?;
+
+    let identity = admitted_identity(directory, gssapi, &context)?;
+
     // The context key, from the crate's own RFC 4121 §2 order: the acceptor subkey if one was
     // asserted, else the initiator's subkey, else the ticket's session key. Taking the ticket key
     // where a subkey was offered produces tokens the client cannot verify - "a token had an invalid
@@ -436,6 +653,150 @@ fn begin(
         credentials: Some(reply),
         identity: None,
         diagnostic: String::new(),
+        wrap: None,
+    })
+}
+
+/// A `GSS-SPNEGO` bind that carries no token: the server answers first, with the mechanism list.
+///
+/// This is the shape of the conversation a domain member speaks (`MS-ADTS`'s SASL, Samba's
+/// `ads_sasl_bind`): the client sends the mechanism name and nothing else, the server replies with
+/// a `NegTokenInit` naming what it has, and only then does the client send its ticket. A server
+/// that expects the ticket in the first message refuses every such client before reading one - and
+/// with a message about the authentication method, which is why this looked like a missing
+/// implementation rather than a missing first move.
+///
+/// Refused when this server has no acceptor: there is nothing to offer, and an empty mechanism list
+/// would be a client sent to look for another controller.
+fn offer_spnego(session: &mut Session) -> Result<Round, SaslError> {
+    session.set_spnego_offered(true);
+
+    Ok(Round {
+        code: ResultCode::SaslBindInProgress,
+        credentials: Some(super::spnego_offer::offer()),
+        identity: None,
+        diagnostic: String::new(),
+        wrap: None,
+    })
+}
+
+/// The client's answer to that offer: a `NegTokenInit` whose token is the AP-REQ.
+///
+/// The whole token goes to the same acceptor the client-first path uses: it parses the mechanism
+/// list, keeps the Kerberos arm and accepts the ticket carried optimistically in it. What differs
+/// is only who spoke first, and the acceptor's answer is a `NegTokenResp` either way.
+fn spnego_accept(
+    session: &mut Session,
+    directory: &Directory,
+    gssapi: &crate::sasl::Gssapi,
+    token: Vec<u8>,
+    security: &Security,
+) -> Result<Round, SaslError> {
+    if token.is_empty() {
+        return Err(SaslError::Sequence(
+            "the mechanism list was sent and the client answered with nothing: the next token must \
+             carry the ticket"
+                .to_string(),
+        ));
+    }
+
+    require_encrypted(session, security)?;
+
+    if !matches!(token.first(), Some(0x60) | Some(0x6e)) {
+        return Err(SaslError::Undecodable(format!(
+            "the token starts with {:02x?}, which is not a Kerberos ticket in any framing this \
+             server knows",
+            token.first()
+        )));
+    }
+
+    if offers_ntlmssp(&token) {
+        return Err(SaslError::Undecodable(
+            "the SPNEGO token offers NTLMSSP, which this server does not accept: it accepts \
+             Kerberos, so a Samba member joins with `net ads join -k` and a ticket from `kinit`"
+                .to_string(),
+        ));
+    }
+
+    let options = accept_options(security, gssapi);
+    let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(gssapi.keytab(), options);
+
+    let reply = acceptor
+        .step(&token)
+        .map_err(|err| SaslError::Ticket(err.to_string()))?
+        .ok_or_else(|| SaslError::Ticket("the acceptor produced no reply".to_string()))?;
+
+    // The acceptor answers `request-mic` instead of accepting when the client's Kerberos OID is
+    // not the first it offered: SPNEGO then requires a mechListMIC round, which this server does
+    // not implement. Named rather than passed through, because the answer the acceptor would give
+    // (`SaslError::Ticket` about a missing context) reads like a broken ticket, and the ticket is
+    // fine - the client's mechanism order is what this server will not take.
+    if !acceptor.is_established() {
+        return Err(SaslError::Sequence(
+            "the client offered a mechanism other than Kerberos before it, and this server answers \
+             only the order that needs no mechListMIC round: Samba and MIT both offer Kerberos \
+             first when a ticket is available (`kinit`, then `net ads join -k`)"
+                .to_string(),
+        ));
+    }
+
+    let context = acceptor.into_context().ok_or_else(|| {
+        SaslError::Ticket("the ticket was accepted without a context".to_string())
+    })?;
+    let identity = admitted_identity(directory, gssapi, &context)?;
+
+    let tokens = context
+        .per_message_tokens()
+        .map_err(|err| SaslError::Ticket(err.to_string()))?;
+
+    session.set_spnego_offered(false);
+    session.set_sasl(Exchange {
+        tokens,
+        principal: context.client_principal.clone(),
+        identity,
+        stage: Stage::SpnegoAccepted,
+    });
+
+    Ok(Round {
+        code: ResultCode::SaslBindInProgress,
+        credentials: Some(reply),
+        identity: None,
+        diagnostic: String::new(),
+        wrap: None,
+    })
+}
+
+/// The end of a `GSS-SPNEGO` bind: an empty token, and the client is who the ticket said.
+///
+/// A client that negotiates through `gensec` closes the bind with one more request carrying nothing
+/// (`ads_sasl_spnego_gensec_bind` loops until it gets `LDAP_SUCCESS` with no token back), and the
+/// answer to that is the success this returns. There is no RFC 4752 round here on purpose: that
+/// layer is libsasl's, and a Samba client has no such thing - requiring it is what leaves a join
+/// waiting for a message the client will never send.
+fn spnego_finish(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslError> {
+    if !token.is_empty() {
+        return Err(SaslError::Sequence(format!(
+            "after accept-completed this server expects an empty token to close the bind, got {} \
+             bytes: the SASL security layer is negotiated by the GSSAPI mechanism, not here",
+            token.len()
+        )));
+    }
+
+    // The exchange is taken, not read: the layer that follows the bind needs the same key, and the
+    // conversation has nothing left to say. `into_parts` moves it rather than copying, because
+    // `PerMessageTokens` is not `Clone` and should not be - two copies of a context would drift
+    // apart in their sequence numbers.
+    let (tokens, identity) = session
+        .take_sasl()
+        .ok_or_else(|| SaslError::Sequence("no GSSAPI exchange in progress".to_string()))?
+        .into_parts();
+
+    Ok(Round {
+        code: ResultCode::Success,
+        credentials: None,
+        identity: Some(identity),
+        diagnostic: String::new(),
+        wrap: Some(Wrap::pending(tokens)),
     })
 }
 
@@ -478,6 +839,7 @@ fn offer_layer(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslError
         credentials: Some(wrapped),
         identity: None,
         diagnostic: String::new(),
+        wrap: None,
     })
 }
 
@@ -529,6 +891,9 @@ fn accept_choice(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslErr
         credentials: None,
         identity: Some(identity),
         diagnostic: String::new(),
+        // The libsasl path negotiates the layer in the mask instead: this server offers "none", so
+        // there is nothing to wrap and nothing to keep.
+        wrap: None,
     })
 }
 
@@ -1505,5 +1870,370 @@ mod tests {
             rasn_ldap::AuthenticationChoice::Simple(rasn::types::OctetString::from(b"x".to_vec())),
         );
         assert!(!is_gssapi(&simple));
+    }
+
+    fn spnego_request(token: Option<Vec<u8>>) -> BindRequest {
+        BindRequest::new(
+            3,
+            rasn_ldap::LdapString::from(""),
+            rasn_ldap::AuthenticationChoice::Sasl(rasn_ldap::SaslCredentials::new(
+                rasn_ldap::LdapString::from("GSS-SPNEGO"),
+                token.map(rasn::types::OctetString::from),
+            )),
+        )
+    }
+
+    fn empty_directory() -> crate::directory::Directory {
+        crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            Vec::new(),
+        )
+    }
+
+    fn credentials_of(response: &rasn_ldap::LdapMessage) -> Vec<u8> {
+        bind_response_body(response)
+            .server_sasl_creds
+            .as_ref()
+            .expect("the server sent a token")
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn an_empty_spnego_bind_is_answered_with_the_mechanism_list() {
+        // Samba's `ads_sasl_bind` sends the mechanism name and nothing else and waits for this
+        // answer: a server that expects a ticket here refuses a domain member before it sends one,
+        // with a message about the authentication method.
+        let (security, _dir) = security_with_keytab();
+        let mut session = session();
+
+        let response = handle_gssapi(
+            &mut session,
+            &empty_directory(),
+            1,
+            &spnego_request(None),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::SaslBindInProgress);
+        assert_eq!(
+            credentials_of(&response),
+            super::super::spnego_offer::offer(),
+            "the reply is the NegTokenInit, byte for byte"
+        );
+        assert!(
+            session.spnego_offered(),
+            "the next bind on this connection is the client's answer to it"
+        );
+        assert!(
+            session.sasl_exchange().is_none(),
+            "no ticket has arrived, so there is no exchange to keep"
+        );
+        assert!(session.identity().is_none(), "and still anonymous");
+    }
+
+    #[test]
+    fn a_second_empty_spnego_bind_is_refused_rather_than_offered_again() {
+        // Offering twice would be a loop: a client that did not get the first answer must not be
+        // able to make the server talk to itself.
+        let (security, _dir) = security_with_keytab();
+        let mut session = session();
+        let directory = empty_directory();
+
+        handle_gssapi(
+            &mut session,
+            &directory,
+            1,
+            &spnego_request(None),
+            &security,
+        );
+        let response = handle_gssapi(
+            &mut session,
+            &directory,
+            2,
+            &spnego_request(None),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::InvalidCredentials);
+        assert!(
+            body.diagnostic_message.0.contains("carry the ticket"),
+            "{}",
+            body.diagnostic_message.0
+        );
+        assert!(
+            !session.spnego_offered(),
+            "a failed bind leaves nothing to resume"
+        );
+    }
+
+    #[test]
+    fn the_end_of_an_spnego_bind_is_an_empty_token_and_the_tickets_identity() {
+        // What `ads_sasl_spnego_gensec_bind` does last: one bind carrying nothing, expecting
+        // LDAP_SUCCESS and no token back. A server that waits for an RFC 4752 layer choice here
+        // waits for a message a Samba client never sends.
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::SpnegoAccepted);
+        let expected = session
+            .sasl_exchange()
+            .expect("the fixture holds one")
+            .identity()
+            .dn
+            .clone();
+
+        let response = handle_gssapi(
+            &mut session,
+            &empty_directory(),
+            1,
+            &spnego_request(Some(Vec::new())),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::Success);
+        assert!(body.server_sasl_creds.is_none(), "success carries no token");
+        assert_eq!(
+            session.identity().map(|identity| identity.dn.clone()),
+            Some(expected),
+            "the binding identity is the one the ticket resolved to"
+        );
+        assert!(
+            session.sasl_exchange().is_none(),
+            "and the conversation is over"
+        );
+    }
+
+    #[test]
+    fn the_root_dse_publishes_the_mechanisms_a_client_may_bind_with() {
+        // Samba's `ads_sasl_bind` searches the root DSE for this attribute and compares each value
+        // literally: a server that implements SASL and does not publish it is refused with
+        // `Authentication method not supported` before a token is sent. The attribute is built in
+        // `search`, and read here because this is where a Security with an acceptor can be had.
+        use rasn_ldap::{Filter, ProtocolOp, SearchRequestDerefAliases, SearchRequestScope};
+
+        let (security, _dir) = security_with_keytab();
+        let request = rasn_ldap::SearchRequest::new(
+            rasn_ldap::LdapDn::from(""),
+            SearchRequestScope::BaseObject,
+            SearchRequestDerefAliases::NeverDerefAliases,
+            0,
+            0,
+            false,
+            Filter::Present(rasn_ldap::AttributeDescription::from(
+                "objectClass".to_string(),
+            )),
+            Vec::new(),
+        );
+
+        let values = |security: &Security| -> Vec<String> {
+            let messages = crate::ldap::search::handle_search(
+                &Session::new(),
+                &empty_directory(),
+                1,
+                &request,
+                None,
+                security,
+            );
+            let ProtocolOp::SearchResEntry(entry) = &messages[0].protocol_op else {
+                panic!("the root DSE is an entry");
+            };
+            entry
+                .attributes
+                .iter()
+                .find(|attribute| attribute.r#type.0 == "supportedSASLMechanisms")
+                .map(|attribute| {
+                    attribute
+                        .vals
+                        .iter()
+                        .map(|value| String::from_utf8_lossy(value).into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            values(&security),
+            vec!["GSSAPI".to_string(), "GSS-SPNEGO".to_string()],
+            "the mechanisms this server answers to, and the spelling Samba compares against"
+        );
+
+        // And not on a server that cannot accept a ticket: naming a mechanism every attempt must
+        // refuse is the same lie as not naming one that works.
+        assert!(
+            values(&Security::default()).is_empty(),
+            "no acceptor, nothing to advertise"
+        );
+    }
+
+    #[test]
+    fn data_after_accept_completed_is_refused_with_the_reason() {
+        let (security, _dir) = security_with_keytab();
+        let mut session = exchanging(Stage::SpnegoAccepted);
+
+        let response = handle_gssapi(
+            &mut session,
+            &empty_directory(),
+            1,
+            &spnego_request(Some(vec![0x01, 0x00, 0x00, 0x00])),
+            &security,
+        );
+
+        let body = bind_response_body(&response);
+        assert_eq!(body.result_code, ResultCode::InvalidCredentials);
+        assert!(
+            body.diagnostic_message.0.contains("empty token"),
+            "{}",
+            body.diagnostic_message.0
+        );
+        assert!(session.identity().is_none());
+    }
+
+    /// A message with no meaning beyond its bytes: the layer moves octets, and which operation they
+    /// encode is not what these tests measure.
+    fn sample_message(message_id: u32) -> rasn_ldap::LdapMessage {
+        crate::ldap::responses::search_done(message_id, ResultCode::Success, "")
+    }
+
+    /// The client's half of the layer, standing where Samba's `gensec` stands.
+    ///
+    /// Same key, `Role::Initiator`: a wrap made here is what the server has to open, and one it
+    /// makes is what this verifies. Anything less would test the server against itself.
+    fn sealed_by_client(
+        tokens: &krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+        seq: u64,
+        message: &[u8],
+    ) -> Vec<u8> {
+        let token = tokens.emit_wrap(seq, message).expect("a client wrap");
+        let mut framed = (token.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&token);
+        framed
+    }
+
+    #[tokio::test]
+    async fn a_sealed_request_is_opened_and_the_reply_is_sealed_back() {
+        // The whole layer in one message each way: four-octet length, RFC 4121 Wrap, LDAP inside.
+        // A server that only unseals, or only seals, fails one half of this.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let wrap = Wrap::active_for_test(krb5::token::PerMessageTokens::new(
+            test_key(),
+            krb5::token::Role::Acceptor,
+            false,
+        ));
+        let client = initiator_tokens();
+        let (mut wire, mut loop_side) = tokio::io::duplex(4096);
+
+        // The client's search request, sealed: what Samba sends after `success`.
+        let request = crate::ldap::codec::encode(&sample_message(1)).expect("encoded");
+        wire.write_all(&sealed_by_client(&client, 0, &request))
+            .await
+            .expect("written");
+        let mut wrap = wrap;
+        let read = crate::ldap::codec::read_message_with(&mut loop_side, Some(&mut wrap))
+            .await
+            .expect("opened");
+        assert_eq!(
+            read, request,
+            "the plaintext is the LDAP message, byte for byte"
+        );
+
+        // And the answer travels sealed, in the client's direction.
+        let done = crate::ldap::responses::search_done(9, ResultCode::Success, "");
+        crate::ldap::codec::write_message_with(&mut loop_side, &done, Some(&mut wrap))
+            .await
+            .expect("sealed");
+
+        let mut head = [0u8; 4];
+        wire.read_exact(&mut head).await.expect("the length");
+        let len = u32::from_be_bytes(head) as usize;
+        let mut token = vec![0u8; len];
+        wire.read_exact(&mut token).await.expect("the token");
+        let opened = client.unwrap(&token).expect("the client opens the reply");
+        assert_eq!(opened.seq, 0, "the server's own sequence starts at zero");
+        assert_eq!(
+            opened.message,
+            crate::ldap::codec::encode(&done).expect("encoded")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_sequence_number_is_refused_as_a_replay() {
+        // The first message may start anywhere (RFC 4121 §4.2.1: MIT's acceptor picks a random
+        // number, and the stand showed 316063208), but the second must be one more. A repeat is a
+        // replay: LDAP over TCP never retransmits, so accepting it would execute a captured message
+        // twice.
+        use tokio::io::AsyncWriteExt;
+
+        let mut wrap = Wrap::active_for_test(krb5::token::PerMessageTokens::new(
+            test_key(),
+            krb5::token::Role::Acceptor,
+            false,
+        ));
+        let client = initiator_tokens();
+        let (mut wire, mut loop_side) = tokio::io::duplex(4096);
+        let request = crate::ldap::codec::encode(&sample_message(2)).expect("encoded");
+
+        // An arbitrary starting point, then the same one again.
+        for _ in 0..2 {
+            wire.write_all(&sealed_by_client(&client, 7, &request))
+                .await
+                .expect("written");
+        }
+        crate::ldap::codec::read_message_with(&mut loop_side, Some(&mut wrap))
+            .await
+            .expect("the first message sets the base");
+
+        let err = crate::ldap::codec::read_message_with(&mut loop_side, Some(&mut wrap))
+            .await
+            .expect_err("out of order");
+
+        assert!(
+            err.to_string().contains("sequence number"),
+            "the refusal names the sequence: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_announcing_response_is_plain_and_the_next_one_is_sealed() {
+        // The client starts sealing only after it reads `success`, so a server that sealed its own
+        // success would be sending ciphertext to a peer still reading BER. That is the whole reason
+        // the layer is installed "pending".
+        use tokio::io::AsyncReadExt;
+
+        let mut wrap = Wrap::pending(krb5::token::PerMessageTokens::new(
+            test_key(),
+            krb5::token::Role::Acceptor,
+            false,
+        ));
+        let (mut wire, mut loop_side) = tokio::io::duplex(4096);
+        let done = crate::ldap::responses::search_done(1, ResultCode::Success, "");
+
+        crate::ldap::codec::write_message_with(&mut loop_side, &done, Some(&mut wrap))
+            .await
+            .expect("written");
+        // Read whole, or the rest of this message stays in the buffer and the next read sees it:
+        // that is exactly the confusion this test exists to rule out.
+        let first = crate::ldap::codec::read_message(&mut wire)
+            .await
+            .expect("a plain frame");
+        assert_eq!(first[0], 0x30, "the first message is plain BER");
+
+        crate::ldap::codec::write_message_with(&mut loop_side, &done, Some(&mut wrap))
+            .await
+            .expect("written");
+        let mut head = [0u8; 4];
+        wire.read_exact(&mut head).await.expect("readable");
+        let len = u32::from_be_bytes(head) as usize;
+        assert!(
+            len > 0 && len < 4096,
+            "the second message is a SASL buffer, length first"
+        );
+        let mut token = vec![0u8; len];
+        wire.read_exact(&mut token).await.expect("the token");
+        assert_eq!(&token[..2], &[0x05, 0x04], "an RFC 4121 Wrap token");
     }
 }

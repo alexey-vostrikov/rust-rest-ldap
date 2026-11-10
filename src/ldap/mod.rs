@@ -16,6 +16,7 @@ pub mod schema_entry;
 pub mod search;
 pub mod session;
 pub mod sort;
+pub mod spnego_offer;
 pub mod starttls;
 pub mod sync;
 pub mod write;

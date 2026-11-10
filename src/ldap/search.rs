@@ -45,7 +45,7 @@ pub fn handle_search(
     // Root DSE is served before any access check: clients need it to discover the
     // naming contexts before they can bind.
     if base_object.is_empty() {
-        return search_root_dse(message_id, request, directory.base_dn());
+        return search_root_dse(message_id, request, directory.base_dn(), security);
     }
 
     // The subschema subentry does not live under the naming context; a client addresses
@@ -878,6 +878,7 @@ fn search_root_dse(
     message_id: MessageId,
     request: &SearchRequest,
     base_dn: &str,
+    security: &Security,
 ) -> Vec<LdapMessage> {
     if scope_of(request) != crate::directory::Scope::Base {
         return vec![responses::search_done(message_id, ResultCode::Success, "")];
@@ -916,6 +917,27 @@ fn search_root_dse(
             "currentTime",
             &crate::operational::generalized_time(std::time::SystemTime::now()),
         ));
+
+    // RFC 4512 §5.1: the SASL mechanisms this server answers to, published so that a client can
+    // choose one without guessing. Samba's `ads_sasl_bind` reads exactly this attribute and
+    // compares each value literally against `GSS-SPNEGO`; a server that implements SASL and does
+    // not publish it is a domain controller that a joining machine refuses with "Authentication
+    // method not supported" - before it has sent a single token, which is what made that refusal
+    // read like a missing implementation rather than a missing line here.
+    //
+    // Published only when an acceptor exists: a server with no keytab cannot accept a ticket, and
+    // naming a mechanism in discovery that every attempt must refuse is the same lie in the other
+    // direction.
+    let attributes = match security.gssapi.is_some() {
+        true => attributes.push(crate::model::Attribute::new(
+            "supportedSASLMechanisms",
+            crate::ldap::sasl_bind::MECHANISMS
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+        )),
+        false => attributes,
+    };
 
     let selection: Vec<String> = request
         .attributes

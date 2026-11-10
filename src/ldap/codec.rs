@@ -31,6 +31,13 @@ pub enum FrameError {
     TooLong(usize),
     #[error("stream ended inside a message")]
     Truncated,
+    #[error(
+        "the client is sending SASL-wrapped data (RFC 4121 wrap, token id 0x0504): this server \
+         negotiates the \"none\" security layer only, so it cannot unwrap anything. A libsasl \
+         client asks for none with `-O maxssf=0`; Samba's `net ads join` cannot - libnet_connect_ads \
+         asks for ADS_SASL_SEAL in the source, whatever `client ldap sasl wrapping` says"
+    )]
+    SaslWrapped,
 }
 
 #[derive(Debug, Error)]
@@ -41,6 +48,13 @@ pub enum CodecError {
     Read(std::io::Error),
     #[error("error writing to client: {0}")]
     Write(std::io::Error),
+    /// The SASL security layer refused a message: it could not seal ours, could not open theirs,
+    /// or theirs arrived out of order.
+    ///
+    /// A separate variant rather than a `Frame` one because the frame was well formed: what failed
+    /// is the key, the sequence number or the peer's good faith, and the operator has to see which.
+    #[error("SASL security layer: {0}")]
+    Wrap(String),
     #[error("error decoding LDAP message: {0}")]
     Decode(String),
     #[error("error encoding LDAP message: {0}")]
@@ -118,6 +132,18 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8
     read_exact_or_eof(reader, &mut head).await?;
 
     if head[0] != SEQUENCE_TAG {
+        // Not LDAP as this server speaks it - but one shape is worth naming rather than closing on
+        // silence. A SASL security layer puts a four-octet big-endian length in front of an
+        // RFC 4121 token, so the first message of a wrapped session starts with `00 00 00 NN 05 04`
+        // and reads here as tag 0x00. Samba's `net ads join` does exactly this whatever its
+        // configuration says, and the client then waits for an answer that never comes, reporting
+        // a timeout much later and about something else entirely.
+        if head[0] == 0x00 {
+            let mut probe = [0u8; 4];
+            if reader.read_exact(&mut probe).await.is_ok() && probe[2] == 0x05 && probe[3] == 0x04 {
+                return Err(CodecError::Frame(FrameError::SaslWrapped));
+            }
+        }
         return Err(CodecError::Frame(FrameError::NotSequence(head[0])));
     }
 
@@ -169,6 +195,62 @@ async fn read_exact_or_eof<R: AsyncRead + Unpin>(
 /// Decodes a framed message.
 pub fn decode(bytes: &[u8]) -> Result<LdapMessage, CodecError> {
     rasn::ber::decode(bytes).map_err(|err| CodecError::Decode(err.to_string()))
+}
+
+/// Reads one LDAP message, sealed or plain, as the session's security layer requires.
+///
+/// RFC 4422 §3.2: in a layer that protects, each buffer starts with a four-octet big-endian length.
+/// So the decision cannot be made from the first byte - a sealed frame's first four octets are a
+/// length, and 0x30 is a length of 48 - and it comes from the session instead.
+pub async fn read_message_with<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    wrap: Option<&mut super::sasl_bind::Wrap>,
+) -> Result<Vec<u8>, CodecError> {
+    let Some(wrap) = wrap.filter(|wrap| wrap.is_active()) else {
+        return read_message(reader).await;
+    };
+
+    let mut head = [0u8; 4];
+    read_exact_or_eof(reader, &mut head).await?;
+    let len = u32::from_be_bytes(head) as usize;
+    // Zero is not a message and a buffer past the frame limit is not one either; both are refused
+    // before the allocation, because the length is the peer's.
+    if len == 0 || len > MAX_FRAME_LEN {
+        return Err(CodecError::Frame(FrameError::TooLong(len)));
+    }
+    let mut token = vec![0u8; len];
+    reader
+        .read_exact(&mut token)
+        .await
+        .map_err(|_| CodecError::Frame(FrameError::Truncated))?;
+
+    wrap.open(&token).map_err(CodecError::Wrap)
+}
+
+/// Writes one LDAP message, sealing it when the session's layer is in force.
+///
+/// The response that announces a layer is the one exception, and it is not a special case here: the
+/// layer is installed as pending and [`super::sasl_bind::Wrap::activate`] runs when such a response
+/// is written. A client starts sealing only after it has read that answer, and a server that sealed
+/// it would be sending ciphertext to a peer still reading BER.
+pub async fn write_message_with<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &LdapMessage,
+    wrap: Option<&mut super::sasl_bind::Wrap>,
+) -> Result<(), CodecError> {
+    let bytes = encode(message)?;
+
+    match wrap {
+        Some(wrap) if wrap.is_active() => {
+            let sealed = wrap.seal(&bytes).map_err(CodecError::Wrap)?;
+            writer.write_all(&sealed).await.map_err(CodecError::Write)
+        }
+        Some(wrap) => {
+            wrap.activate();
+            writer.write_all(&bytes).await.map_err(CodecError::Write)
+        }
+        None => writer.write_all(&bytes).await.map_err(CodecError::Write),
+    }
 }
 
 /// Encodes a message for the wire.
@@ -353,6 +435,43 @@ mod tests {
 
         assert!(
             matches!(err, CodecError::Frame(FrameError::Truncated)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sasl_wrapped_data_is_named_and_not_just_closed_on_tag_zero() {
+        // The octets Samba sends after a sealed GSS-SPNEGO bind: a four-octet length, then the
+        // RFC 4121 wrap token id `05 04`. Read as LDAP it is "tag 0x00", and the client waits for
+        // an answer that never comes - which is how a missing security layer looks like a timeout.
+        let wrapped = [
+            0x00, 0x00, 0x00, 0xb7, 0x05, 0x04, 0x02, 0xff, 0x00, 0x00, 0x00, 0x1c,
+        ];
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client.write_all(&wrapped).await.expect("write");
+
+        let err = read_message(&mut server).await.expect_err("not LDAP");
+
+        assert!(
+            matches!(err, CodecError::Frame(FrameError::SaslWrapped)),
+            "unexpected error: {err:?}"
+        );
+        // The message names what the operator has to do, rather than the octet it tripped on.
+        assert!(err.to_string().contains("maxssf=0"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_tag_that_is_not_a_wrap_token_stays_a_framing_error() {
+        // The probe must not turn every malformed stream into a claim about SASL: only an RFC 4121
+        // Wrap token at the offset the layer puts it is named.
+        let other = [0x00, 0x00, 0x00, 0x10, 0x01, 0x02, 0x03, 0x04];
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client.write_all(&other).await.expect("write");
+
+        let err = read_message(&mut server).await.expect_err("must fail");
+
+        assert!(
+            matches!(err, CodecError::Frame(FrameError::NotSequence(0))),
             "unexpected error: {err:?}"
         );
     }

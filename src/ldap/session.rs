@@ -54,6 +54,21 @@ pub struct Session {
     /// belongs to the exchange, not to the directory. Dropped by any new bind and by [`Session::reset`],
     /// so a failed attempt cannot be resumed.
     sasl: Option<super::sasl_bind::Exchange>,
+    /// Whether the server has sent the first SPNEGO token and is waiting for the client's.
+    ///
+    /// Outside [`Session::sasl`] because there is nothing to keep there yet: no ticket has been
+    /// accepted, so there is no session key, no principal and no identity - an `Exchange` built
+    /// before the ticket would be three empty fields pretending to be a conversation. This is the
+    /// one fact that has to survive the round, and it is gone the moment the ticket arrives or the
+    /// bind fails.
+    spnego_offered: bool,
+    /// The SASL security layer, once the bind established one.
+    ///
+    /// Held here rather than in the exchange because it outlives the conversation: every message
+    /// after the bind is sealed, and the key that seals them is the one the ticket carried. Dropped
+    /// with the identity, which is what [`Session::reset`] does - a connection that loses its
+    /// identity must not keep a channel the other side still believes in.
+    wrap: Option<super::sasl_bind::Wrap>,
 }
 
 impl Session {
@@ -98,6 +113,8 @@ impl Session {
     pub fn reset(&mut self) {
         self.identity = None;
         self.sasl = None;
+        self.spnego_offered = false;
+        self.wrap = None;
     }
 
     /// The SASL exchange in progress, if any.
@@ -125,6 +142,31 @@ impl Session {
     /// Ends the exchange, keeping the identity it produced.
     pub fn clear_sasl(&mut self) {
         self.sasl = None;
+    }
+
+    /// Takes the exchange out of the session: the last round consumes it.
+    pub fn take_sasl(&mut self) -> Option<super::sasl_bind::Exchange> {
+        self.sasl.take()
+    }
+
+    /// The security layer of this connection, for the framing code.
+    pub fn wrap(&mut self) -> Option<&mut super::sasl_bind::Wrap> {
+        self.wrap.as_mut()
+    }
+
+    /// Installs the layer a successful bind established.
+    pub fn set_wrap(&mut self, wrap: super::sasl_bind::Wrap) {
+        self.wrap = Some(wrap);
+    }
+
+    /// Whether the first SPNEGO token was sent and the client's answer is expected.
+    pub fn spnego_offered(&self) -> bool {
+        self.spnego_offered
+    }
+
+    /// Records that it was sent. The next bind is read as the client's answer to it.
+    pub fn set_spnego_offered(&mut self, offered: bool) {
+        self.spnego_offered = offered;
     }
 
     pub fn is_admin(&self) -> bool {
