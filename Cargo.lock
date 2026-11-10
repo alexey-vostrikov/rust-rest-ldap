@@ -1985,7 +1985,7 @@ dependencies = [
 [[package]]
 name = "rust-kdc"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rust-kdc?branch=main#092bf8d6e1faf58a131aa18eba7c2ebffb34fb8f"
+source = "git+https://github.com/alexey-vostrikov/rust-kdc?branch=main#2aa48d5fa77ce4e7285acdb08ced821e109d24be"
 dependencies = [
  "hmac 0.13.0",
  "md-5 0.11.0",

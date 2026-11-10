@@ -330,8 +330,18 @@ fn entry_for(spec: &Spec, policy: &PasswordPolicy) -> Result<Entry, Error> {
         // the SAM and Netlogon paths use, the principal name `kinit` sends, and the flag that says
         // the account is enabled. 512 is `NORMAL_ACCOUNT`, the value AD gives an account that has
         // just been created and not disabled.
+        // `krb5PrincipalName` and `krb5PrincipalRealm` are what the realm's own projection reads,
+        // and what puts the entry at the DN a KDC looks up first. Without them the account is
+        // reachable only through the fallback scan, and only for an attribute the client happened
+        // to send: `kinit admin@REALM` found the entry and then failed to read it, which reached
+        // the client as "a service is not available".
         attributes = attributes
             .push(Attribute::single("sAMAccountName", &value))
+            .push(Attribute::single(
+                "krb5PrincipalName",
+                &format!("{value}@{realm}"),
+            ))
+            .push(Attribute::single("krb5PrincipalRealm", realm))
             .push(Attribute::single(
                 "userPrincipalName",
                 &format!("{value}@{realm}"),

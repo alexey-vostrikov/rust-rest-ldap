@@ -106,12 +106,64 @@ impl RealmView {
     }
 }
 
+impl RealmView {
+    /// The entry's attributes, with a principal name added when the entry has none.
+    ///
+    /// A directory in AD shape names an account by `sAMAccountName` and `userPrincipalName`, and
+    /// knows nothing about `krb5PrincipalName` - that is Heimdal's attribute, written by a realm
+    /// bootstrap. `from_attributes` refuses an entry without it ("this is not a principal"), so a
+    /// machine account created by `net ads join`, or a user created by an administrator in an AD
+    /// console, would be readable by every path except the one that issues tickets for it.
+    ///
+    /// `asked` is the principal the client sent, which is the name the entry must answer to: for a
+    /// lookup by name it is exactly what the entry matched on, and for a lookup by service
+    /// principal name the account's own name is used instead.
+    fn published(&self, entry: &Entry, asked: &Principal) -> Attributes {
+        let mut attributes = to_realm_attributes(entry.attributes());
+        if !attributes.has(attrs::PRINCIPAL_NAME) {
+            attributes.add(attrs::PRINCIPAL_NAME, asked.to_string());
+        }
+        if !attributes.has(attrs::PRINCIPAL_REALM) {
+            attributes.add(attrs::PRINCIPAL_REALM, asked.realm.clone());
+        }
+        attributes
+    }
+
+    /// The account name of an entry, as a principal of this realm.
+    ///
+    /// `sAMAccountName` first, because that is the name a machine is written under, then
+    /// `userPrincipalName`, then `krb5PrincipalName` - the name a realm bootstrap writes, and the
+    /// only one a non-AD entry has. Anything the entry offers is better than refusing a ticket for
+    /// an account that exists.
+    fn name_of(&self, entry: &Entry) -> Option<Principal> {
+        for name in ["sAMAccountName", "userPrincipalName", attrs::PRINCIPAL_NAME] {
+            if let Some(value) = entry
+                .attributes()
+                .get(name)
+                .and_then(|attribute| attribute.values.first())
+            {
+                let candidate = if value.contains('@') {
+                    value.clone()
+                } else {
+                    format!("{value}@{}", self.realm)
+                };
+                if let Ok(principal) = Principal::parse(&candidate)
+                    && principal.realm.eq_ignore_ascii_case(&self.realm)
+                {
+                    return Some(principal);
+                }
+            }
+        }
+        None
+    }
+}
+
 impl Realm for RealmView {
     fn get(&self, principal: &Principal) -> rust_kdc::Result<Option<Attributes>> {
         let Some(entry) = self.entry_for(principal) else {
             return Ok(None);
         };
-        let attributes = to_realm_attributes(entry.attributes());
+        let attributes = self.published(&entry, principal);
         // Decoded here rather than returned as found: a mapping that hands back attributes it has
         // not read is a mapping that cannot tell "no keys" from "keys this build cannot parse", and
         // the KDC's answer to those two is the same only by accident.
@@ -151,10 +203,20 @@ impl Realm for RealmView {
             return Ok(None);
         };
 
+        // The principal this entry answers to, when the entry does not name itself: a machine
+        // account is `HOST$`, and the ticket the client asked for is for `cifs/host...`.
+        let Some(account) = self.name_of(entry) else {
+            return Err(Error::Hdb(format!(
+                "entry '{}' publishes '{spn}' and no account name, so there is no principal to \
+                 seal a ticket for",
+                entry.dn()
+            )));
+        };
+
         // Not decoded here, unlike `get`: the caller checks that the entry really publishes this
         // name, and an entry that fails to read back should be refused with that in hand rather than
         // with a decode error about a mapping.
-        let attributes = to_realm_attributes(entry.attributes());
+        let attributes = self.published(entry, &account);
         Ok(Some(attributes))
     }
 

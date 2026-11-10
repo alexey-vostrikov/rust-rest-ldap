@@ -230,7 +230,8 @@ objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTUR
     MAY ( userPrincipalName $ sAMAccountName $ userAccountControl $ objectGUID $ objectSid $
           servicePrincipalName $ primaryGroupID $ accountExpires $ pwdLastSet $ mail $
           displayName $ telephoneNumber $ title $ description $ memberOf $ unicodePwd $
-          supplementalCredentials $ msDS-KeyVersionNumber $ krb5Key $ krb5KeyVersionNumber ) )
+          supplementalCredentials $ msDS-KeyVersionNumber $ krb5Key $ krb5KeyVersionNumber $
+          krb5PrincipalName $ krb5PrincipalRealm ) )
 ";
 
 /// The schema with the AD definitions added.
