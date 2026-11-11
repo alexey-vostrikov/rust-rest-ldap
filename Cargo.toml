@@ -118,6 +118,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 kdc = ["dep:rrl-kdc"]
 # Port 445 and the `IPC$` share a join talks to.
 smb = ["dep:smb-server"]
+# Port 53 and the zone a domain lives in: the `dnsRecord` values under `CN=RRLDNS`.
+dns = []
 
 [dev-dependencies]
 rrl-kdc = { git = "https://github.com/alexey-vostrikov/rrl-kdc", branch = "main" }

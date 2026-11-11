@@ -27,6 +27,13 @@ pub mod config_store;
 pub mod danger;
 pub mod directory;
 pub mod dn;
+/// The domain's own DNS: the zone a member's SRV lookups resolve against.
+///
+/// Behind a feature for the same reason the KDC and SMB are: a directory that does not claim the
+/// domain's name should not answer on port 53 for it. Off, `dnsmasq` or the deployment's own
+/// resolver serves the name; on, the zone lives in this server's own tree as AD stores it.
+#[cfg(feature = "dns")]
+pub mod dns;
 pub mod http;
 pub mod i18n;
 pub mod import;
