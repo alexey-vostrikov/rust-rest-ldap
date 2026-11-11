@@ -315,10 +315,14 @@ impl Settings {
     /// Every default is derived from something that already exists - the naming context, the host
     /// name, the listening address - so that an operator who turns the listener on gets a coherent
     /// answer without having to repeat what the server already knows.
+    /// `kdc` says whether this process issues tickets for the realm; it reaches the answer as
+    /// `DS_KDC_FLAG`, which a Windows client filters on when it looks for a controller to join
+    /// with. See [`netlogon::Advertised::flags`].
     pub fn resolve(
         config: &CldapConfig,
         base_dn: &str,
         bound: std::net::SocketAddr,
+        kdc: bool,
     ) -> Result<Self, String> {
         let from_base = domain_of_base(base_dn).ok_or_else(|| {
             format!("the naming context '{base_dn}' has no dc= components to make a DNS name from")
@@ -398,6 +402,7 @@ impl Settings {
                 dns_host,
                 netbios_domain,
                 netbios_host,
+                kdc,
                 address,
                 site: String::new(),
             },
@@ -541,6 +546,7 @@ mod tests {
 
     fn advertised() -> netlogon::Advertised {
         netlogon::Advertised {
+            kdc: false,
             dns_domain: "example.com".to_string(),
             dns_forest: "example.com".to_string(),
             dns_host: "dc1.example.com".to_string(),
@@ -801,8 +807,9 @@ mod tests {
     #[test]
     fn the_settings_are_derived_from_what_the_server_already_knows() {
         let bound: std::net::SocketAddr = "192.0.2.10:389".parse().expect("parses");
-        let settings = Settings::resolve(&CldapConfig::default(), "dc=example,dc=com", bound)
-            .expect("resolves");
+        let settings =
+            Settings::resolve(&CldapConfig::default(), "dc=example,dc=com", bound, false)
+                .expect("resolves");
 
         assert_eq!(settings.advertised.dns_domain, "example.com");
         assert_eq!(settings.advertised.dns_forest, "example.com");
@@ -815,7 +822,7 @@ mod tests {
         );
         // The same domain always yields the same GUID, which is what a client caching a controller
         // relies on.
-        let again = Settings::resolve(&CldapConfig::default(), "dc=example,dc=com", bound)
+        let again = Settings::resolve(&CldapConfig::default(), "dc=example,dc=com", bound, false)
             .expect("resolves");
         assert_eq!(
             settings.advertised.domain_guid,
@@ -826,8 +833,9 @@ mod tests {
     #[test]
     fn a_wildcard_bind_advertises_the_loopback_address_rather_than_nothing() {
         let bound: std::net::SocketAddr = "0.0.0.0:389".parse().expect("parses");
-        let settings = Settings::resolve(&CldapConfig::default(), "dc=example,dc=com", bound)
-            .expect("resolves");
+        let settings =
+            Settings::resolve(&CldapConfig::default(), "dc=example,dc=com", bound, false)
+                .expect("resolves");
 
         assert_eq!(settings.advertised.address, Ipv4Addr::LOCALHOST);
     }
@@ -841,7 +849,7 @@ mod tests {
             ..CldapConfig::default()
         };
 
-        let refused = Settings::resolve(&config, "dc=example,dc=com", bound)
+        let refused = Settings::resolve(&config, "dc=example,dc=com", bound, false)
             .expect_err("a controller answers for the naming context it holds");
 
         assert!(refused.contains("other.example"), "{refused}");
@@ -865,7 +873,7 @@ mod tests {
                 ..CldapConfig::default()
             },
         ] {
-            assert!(Settings::resolve(&config, "dc=example,dc=com", bound).is_err());
+            assert!(Settings::resolve(&config, "dc=example,dc=com", bound, false).is_err());
         }
     }
 
@@ -876,7 +884,8 @@ mod tests {
             netbios_host: Some("A-VERY-LONG-NAME-INDEED".to_string()),
             ..CldapConfig::default()
         };
-        let settings = Settings::resolve(&config, "dc=example,dc=com", bound).expect("resolves");
+        let settings =
+            Settings::resolve(&config, "dc=example,dc=com", bound, false).expect("resolves");
 
         // Configured names are taken as written; the truncation is what a *derived* name gets, and
         // this test pins that the configured one is not silently cut.

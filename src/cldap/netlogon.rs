@@ -123,21 +123,34 @@ pub struct Advertised {
     /// Inventing `Default-First-Site-Name` would tell a client its site is known when nothing here
     /// knows about sites at all.
     pub site: String,
+    /// Whether this process issues tickets for the realm - that is, whether a KDC is serving here.
+    ///
+    /// Not a property of the ping: the same crate answers it in a deployment with no KDC at all,
+    /// and there `DS_KDC_FLAG` would be a promise nothing keeps.
+    pub kdc: bool,
 }
 
 impl Advertised {
     /// The `DS_FLAG` word for this server.
     ///
-    /// `DS_KDC_FLAG` is absent on purpose, and this is the one bit that makes the response honest:
-    /// a client that filters on it learns that this server cannot issue it a ticket, instead of
-    /// discovering it after a successful lookup and a failed `AS-REQ`.
+    /// `DS_KDC_FLAG` follows whether a KDC actually serves the realm here. A Windows client asks the
+    /// locator for a controller with `DS_KDC_REQUIRED` - a machine joining a domain needs a ticket
+    /// next - and a response without this bit is filtered out as "no such domain", which reads as a
+    /// DNS or a firewall problem. The bit is set only where the KDC is real: a deployment that
+    /// answers pings and issues no tickets says so instead of being found and then failing at
+    /// `AS-REQ`.
     pub fn flags(&self) -> u32 {
-        flags::DS_LDAP_FLAG
+        let base = flags::DS_LDAP_FLAG
             | flags::DS_DS_FLAG
             | flags::DS_WRITABLE_FLAG
             | flags::DS_DNS_CONTROLLER_FLAG
             | flags::DS_DNS_DOMAIN_FLAG
-            | flags::DS_DNS_FOREST_FLAG
+            | flags::DS_DNS_FOREST_FLAG;
+        if self.kdc {
+            base | flags::DS_KDC_FLAG
+        } else {
+            base
+        }
     }
 }
 
@@ -432,6 +445,7 @@ mod tests {
 
     fn advertised() -> Advertised {
         Advertised {
+            kdc: false,
             dns_domain: "example.com".to_string(),
             dns_forest: "example.com".to_string(),
             dns_host: "dc1.example.com".to_string(),
@@ -683,5 +697,33 @@ mod tests {
         assert_eq!(out[0], 63);
         let (name, _) = read_name(&out).expect("readable");
         assert_eq!(name.len(), 63);
+    }
+
+    /// `DS_KDC_FLAG` follows whether a KDC serves the realm, not whether this crate answers pings.
+    ///
+    /// A Windows client that looks for a controller to join with asks for `DS_KDC_REQUIRED`, and a
+    /// response without this bit is discarded as "no such domain" - which reads like DNS or a
+    /// firewall, not like a missing flag.
+    #[test]
+    fn the_kdc_flag_says_whether_a_kdc_answers_here() {
+        let mut server = advertised();
+        server.kdc = false;
+        assert_eq!(
+            server.flags() & flags::DS_KDC_FLAG,
+            0,
+            "a deployment with no KDC must not claim one"
+        );
+
+        server.kdc = true;
+        assert_eq!(
+            server.flags() & flags::DS_KDC_FLAG,
+            flags::DS_KDC_FLAG,
+            "and one that issues tickets says so"
+        );
+        assert_eq!(
+            server.flags() & flags::DS_LDAP_FLAG,
+            flags::DS_LDAP_FLAG,
+            "the other bits do not depend on it"
+        );
     }
 }

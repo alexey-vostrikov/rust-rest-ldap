@@ -792,13 +792,23 @@ async fn serve() {
             Err(_) => std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
         };
 
-        match rust_rest_ldap::cldap::Settings::resolve(&config.cldap, &config.base_dn, bind) {
+        // Whether a KDC answers here decides `DS_KDC_FLAG`, and a Windows client filters on it
+        // when it looks for a controller to join with.
+        let kdc_here = config.kerberos.enabled;
+        match rust_rest_ldap::cldap::Settings::resolve(
+            &config.cldap,
+            &config.base_dn,
+            bind,
+            kdc_here,
+        ) {
             Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
             Ok(settings) => match tokio::net::UdpSocket::bind(bind).await {
                 Ok(socket) => {
                     println!(
-                        "cldap: answering pings on {bind} as {} ({}), kdc flag not set",
-                        settings.advertised.dns_host, settings.advertised.netbios_host
+                        "cldap: answering pings on {bind} as {} ({}), kdc flag {}",
+                        settings.advertised.dns_host,
+                        settings.advertised.netbios_host,
+                        if kdc_here { "set" } else { "not set" }
                     );
                     Some(tokio::spawn(rust_rest_ldap::cldap::serve(
                         socket,
