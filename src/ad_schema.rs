@@ -333,54 +333,65 @@ mod tests {
             crate::kerberos::schema::extend(&mut schema).expect("the realm vocabulary parses");
             schema
         };
-        let entry = crate::model::Entry::new(
-            "cn=samba,cn=computers,dc=ad,dc=example,dc=com",
-            crate::model::Attributes::new()
-                .push(crate::model::Attribute::new(
-                    "objectClass",
-                    vec![
-                        "top".to_string(),
-                        "person".to_string(),
-                        "organizationalPerson".to_string(),
-                        "user".to_string(),
-                        "computer".to_string(),
-                    ],
-                ))
-                .push(crate::model::Attribute::single("cn", "samba"))
-                // No `sn`: `net ads join` does not send one for a computer, and AD's `person`
-                // does not require it (MS-ADSC: `systemMustContain: cn`).
-                .push(crate::model::Attribute::single("sAMAccountName", "samba$"))
-                .push(crate::model::Attribute::single(
-                    "dNSHostName",
-                    "samba.ad.example.com",
-                ))
-                .push(crate::model::Attribute::new(
-                    "servicePrincipalName",
-                    vec![
-                        "HOST/samba".to_string(),
-                        "HOST/samba.ad.example.com".to_string(),
-                        "RestrictedKrbHost/samba".to_string(),
-                        "RestrictedKrbHost/samba.ad.example.com".to_string(),
-                    ],
-                ))
-                .push(crate::model::Attribute::single(
-                    "userAccountControl",
-                    "4128",
-                ))
-                .push(crate::model::Attribute::single(
-                    "msDS-SupportedEncryptionTypes",
-                    "24",
-                ))
-                // The keys this server derives from `unicodePwd` in the same change. Without them
-                // the account exists and the KDC answers `S_PRINCIPAL_UNKNOWN` to every request;
-                // with them and no schema allowance, strict validation refuses the whole `add`.
+        #[allow(unused_mut)]
+        let mut attributes = crate::model::Attributes::new()
+            .push(crate::model::Attribute::new(
+                "objectClass",
+                vec![
+                    "top".to_string(),
+                    "person".to_string(),
+                    "organizationalPerson".to_string(),
+                    "user".to_string(),
+                    "computer".to_string(),
+                ],
+            ))
+            .push(crate::model::Attribute::single("cn", "samba"))
+            // No `sn`: `net ads join` does not send one for a computer, and AD's `person`
+            // does not require it (MS-ADSC: `systemMustContain: cn`).
+            .push(crate::model::Attribute::single("sAMAccountName", "samba$"))
+            .push(crate::model::Attribute::single(
+                "dNSHostName",
+                "samba.ad.example.com",
+            ))
+            .push(crate::model::Attribute::new(
+                "servicePrincipalName",
+                vec![
+                    "HOST/samba".to_string(),
+                    "HOST/samba.ad.example.com".to_string(),
+                    "RestrictedKrbHost/samba".to_string(),
+                    "RestrictedKrbHost/samba.ad.example.com".to_string(),
+                ],
+            ))
+            .push(crate::model::Attribute::single(
+                "userAccountControl",
+                "4128",
+            ))
+            .push(crate::model::Attribute::single(
+                "msDS-SupportedEncryptionTypes",
+                "24",
+            ));
+
+        // The keys this server derives from `unicodePwd` in the same change. Without them the
+        // account exists and the KDC answers `S_PRINCIPAL_UNKNOWN` to every request; with them and
+        // no schema allowance, strict validation refuses the whole `add`.
+        //
+        // Behind the same feature as the vocabulary that defines them: `krb5Key` is Heimdal's
+        // spelling and comes from the realm schema, so a build without `kdc` has neither the
+        // attributes nor their definitions - and asserting them there failed the gate on a build
+        // that cannot write them anyway.
+        #[cfg(feature = "kdc")]
+        {
+            attributes = attributes
                 .push(crate::model::Attribute::single("krb5Key", "\u{01}"))
                 .push(crate::model::Attribute::single("krb5KeyVersionNumber", "1"))
                 .push(crate::model::Attribute::single(
                     "msDS-KeyVersionNumber",
                     "1",
-                )),
-        );
+                ));
+        }
+
+        let entry =
+            crate::model::Entry::new("cn=samba,cn=computers,dc=ad,dc=example,dc=com", attributes);
 
         if let Err(violations) = schema.check(&entry) {
             panic!("a computer account as a member writes it must validate: {violations:?}");
