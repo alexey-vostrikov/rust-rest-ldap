@@ -185,6 +185,13 @@ fn derive(password: &Password, principal: &str, realm: &str) -> Result<Attribute
     // reads. The hash is what a secure channel is checked against; the keys are what a ticket is
     // sealed in, and a machine account needs both.
     let nt_hash = nt_hash(&password.utf16)?;
+    if std::env::var_os("RRD_PW_DIAG").is_some() {
+        let hex: String = nt_hash.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "pw-diag: derived for '{principal}' from {} octets, nt_hash={hex}",
+            password.utf16.len()
+        );
+    }
     let mut derived = crate::kerberos::bootstrap::attributes_of(&entry);
     // Base64 because the store is text and the blob is octets: the same spelling `krb5Key` uses,
     // and the one `to_realm_attributes` decodes.

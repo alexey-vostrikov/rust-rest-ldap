@@ -1282,12 +1282,13 @@ dependencies = [
 [[package]]
 name = "krb5"
 version = "1.0.0"
-source = "git+https://github.com/alexey-vostrikov/krb5?branch=main#4ada776241ed24a4befe5f87b8c4163c003db39f"
+source = "git+https://github.com/alexey-vostrikov/krb5?branch=main#2a14200c917cbcf6ea40ced6806d14c33b6a6868"
 dependencies = [
  "aes 0.9.4",
  "chrono",
  "hmac 0.13.0",
  "rand",
+ "rrl-crypto",
  "rrl-krb-common",
  "sha1",
  "sha2 0.11.1",
@@ -2394,7 +2395,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 [[package]]
 name = "smb-server"
 version = "0.9.1"
-source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#57eb1a98290aa90643561958bba53328d4d64755"
+source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#ab07f3da06f23d5b751cabb610c7cca612266674"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",

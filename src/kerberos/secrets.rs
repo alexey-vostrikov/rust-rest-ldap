@@ -115,6 +115,10 @@ impl smb_server::MachineSecrets for DirectorySecrets {
         let entry = entry?;
 
         let nt_hash = nt_hash_of(entry.attributes())?;
+        if std::env::var_os("RRD_PW_DIAG").is_some() {
+            let hex: String = nt_hash.iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!("pw-diag: checked '{account}' with nt_hash={hex} at {}", entry.dn());
+        }
         let rid = rid_of(entry.attributes())?;
         Some(MachineAccount { nt_hash, rid })
     }
