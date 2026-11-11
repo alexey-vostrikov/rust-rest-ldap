@@ -100,6 +100,7 @@ impl DirectorySecrets {
 impl smb_server::MachineSecrets for DirectorySecrets {
     fn machine(&self, account: &str) -> Option<MachineAccount> {
         let directory = self.current();
+        let diag = std::env::var_os("RRD_KEY_DIAG").is_some();
         let entry = directory.all().iter().find(|entry| {
             entry
                 .attributes()
@@ -110,8 +111,30 @@ impl smb_server::MachineSecrets for DirectorySecrets {
                         .iter()
                         .any(|value| value.eq_ignore_ascii_case(account))
                 })
-        })?;
+        });
 
+        let Some(entry) = entry else {
+            if diag {
+                let known: Vec<&str> = directory
+                    .all()
+                    .iter()
+                    .filter_map(|entry| entry.attributes().get("sAMAccountName"))
+                    .flat_map(|attribute| attribute.values.iter().map(|v| &**v))
+                    .collect();
+                eprintln!("secrets-diag: no entry named {account}; sAMAccountName seen: {known:?}");
+            }
+            return None;
+        };
+
+        if diag {
+            let names: Vec<&str> = entry
+                .attributes()
+                .values()
+                .iter()
+                .map(|attribute| &*attribute.name)
+                .collect();
+            eprintln!("secrets-diag: {account} -> {} names={names:?}", entry.dn());
+        }
         let nt_hash = nt_hash_of(entry.attributes())?;
         let rid = rid_of(entry.attributes())?;
         Some(MachineAccount { nt_hash, rid })

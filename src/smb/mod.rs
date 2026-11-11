@@ -70,6 +70,14 @@ pub struct SmbConfig {
     /// password and a Windows member will refuse. Read at start and never re-read: a keytab that
     /// changes under a running server is a keytab an operator meant to restart for.
     pub keytab: Option<PathBuf>,
+    /// Serve the secure channel of a client that offers no AES, which means DES.
+    ///
+    /// Off by default. The credential on that channel is two DES passes over a 56-bit key, and
+    /// every current member offers `NETLOGON_NEG_SUPPORTS_AES` instead; a deployment that has to
+    /// accept an old one turns this on knowing what it is. With it off, such a client is refused
+    /// with a line naming this setting rather than with "the password is wrong".
+    #[serde(default)]
+    pub netlogon_des: bool,
 }
 
 /// One account SMB accepts a password for.
@@ -112,6 +120,8 @@ pub struct Settings {
     /// name and not this server's. Derived from the realm when the configuration does not state
     /// one, by AD's own rule: the realm's first label, upper case.
     pub domain_netbios: Option<String>,
+    /// Serve the secure channel of a client that offers no AES.
+    pub netlogon_des: bool,
 }
 
 impl Settings {
@@ -196,6 +206,7 @@ impl Settings {
                     .and_then(|domain| domain.split('.').next())
                     .map(|label| label.to_ascii_uppercase())
             }),
+            netlogon_des: config.netlogon_des,
         })
     }
 }

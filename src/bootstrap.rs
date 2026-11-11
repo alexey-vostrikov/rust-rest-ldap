@@ -362,13 +362,15 @@ fn entry_for(spec: &Spec, policy: &PasswordPolicy) -> Result<Entry, Error> {
                             derived.get(key).is_some(),
                             derived.get("unicodePwd").is_some()
                         );
-                        attributes = crate::kerberos::unicode_pwd::merge_keys(&attributes, &derived);
+                        attributes =
+                            crate::kerberos::unicode_pwd::merge_keys(&attributes, &derived);
                         eprintln!(
                             "key-diag: entry now carries the key attr: {}",
                             attributes.get(key).is_some()
                         );
                     } else {
-                        attributes = crate::kerberos::unicode_pwd::merge_keys(&attributes, &derived);
+                        attributes =
+                            crate::kerberos::unicode_pwd::merge_keys(&attributes, &derived);
                     }
                 }
                 Err(err) => {

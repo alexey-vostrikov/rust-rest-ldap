@@ -78,6 +78,9 @@ pub async fn start(
     if let Some(secrets) = machine_secrets {
         builder = builder.machine_secrets(secrets);
     }
+    // The DES secure channel, when the deployment asks for it: off unless `smb.netlogon_des` says
+    // otherwise, because that channel's credential is two passes of a 56-bit cipher.
+    builder = builder.netlogon_des(settings.netlogon_des);
 
     // Passwords, when any are configured. Taken from the resolved settings rather than from the
     // environment here, so that a missing variable was already a startup error.

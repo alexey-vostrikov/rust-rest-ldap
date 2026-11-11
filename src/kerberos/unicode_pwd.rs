@@ -25,8 +25,33 @@ use crate::model::{Attribute, Attributes};
 /// The attribute a client writes a password into.
 pub const UNICODE_PWD: &str = "unicodePwd";
 
+/// A password as the two things derivation needs from it.
+///
+/// `text` is what string-to-key is computed over; `utf16` is the same password as the octets an NT
+/// hash is computed over. They are two spellings of one value, and they are kept apart because a
+/// machine account's password is not text: Samba draws it from 120 random bytes and sends them as
+/// UTF-16LE, so the octets may contain unpaired surrogates that no string can hold, while the hash
+/// AD computes is still over exactly those octets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Password {
+    /// The password a string-to-key function sees.
+    pub text: String,
+    /// The password's UTF-16LE octets, for the NT hash.
+    pub utf16: Vec<u8>,
+}
+
+impl Password {
+    /// A password this caller already holds as text - what a bootstrap writes.
+    pub fn from_text(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            utf16: text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        }
+    }
+}
+
 /// The passwords this module derives from, when a write carries one.
-pub fn password_of(attributes: &Attributes) -> Option<String> {
+pub fn password_of(attributes: &Attributes) -> Option<Password> {
     let attribute = attributes.get(UNICODE_PWD)?;
     attribute.values.iter().find_map(|value| decode(value))
 }
@@ -38,42 +63,67 @@ pub fn password_of(attributes: &Attributes) -> Option<String> {
 /// what some tools send after stripping the quotes, and UTF-8 what a test or an import writes
 /// because it is a text attribute in every other directory. A value that is none of those is not a
 /// password and is skipped rather than guessed at.
-fn decode(value: &str) -> Option<String> {
-    // The store holds text, so a binary value arrives base64: the writer that puts octets in a
+fn decode(value: &str) -> Option<Password> {
+    if value.is_empty() {
+        return None;
+    }
+    // A quoted value is the wire form kept as text: the quotes are part of it, the password is not.
+    if let Some(quoted) = value.strip_prefix('"') {
+        let text = quoted.strip_suffix('"').unwrap_or(quoted);
+        return Some(Password::from_text(text)).filter(|password| !password.text.is_empty());
+    }
+
+    // Otherwise the store holds the octets as base64 - the writer that puts octets in a
     // string-valued attribute uses that spelling (`kerberos::bootstrap` records the same rule for
-    // keys).
-    let octets = match base64_decode(value) {
-        Some(bytes) if looks_utf16(&bytes) => bytes,
-        Some(bytes) if !bytes.is_empty() && bytes[0] == b'"' => bytes,
-        _ => return Some(value.to_string()).filter(|text| !text.is_empty()),
+    // keys) - in one of two encodings, and which one it is decides how to read them.
+    let Some(octets) = base64_decode(value) else {
+        return Some(Password::from_text(value)).filter(|password| !password.text.is_empty());
     };
 
-    let mut units: Vec<u16> = octets
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    // The quotes are part of the wire form and not of the password.
-    if units.first() == Some(&u16::from(b'"')) {
-        units.remove(0);
+    if looks_utf16(&octets) {
+        // The quotes are code units here, and taking them off the octets is the only way the hash
+        // input stays byte-for-byte what the client sent.
+        let body = octets
+            .strip_prefix(&[b'"', 0])
+            .and_then(|rest| rest.strip_suffix(&[b'"', 0]))
+            .unwrap_or(&octets);
+        let units: Vec<u16> = body
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        // `from_utf16` refuses unpaired surrogates, and a machine account's password has them: the
+        // client draws it from random octets rather than from text. The lossy spelling exists only
+        // for string-to-key; the hash uses `body` itself, so nothing that arrived is altered.
+        let text = match String::from_utf16(&units) {
+            Ok(text) => text,
+            Err(_) => String::from_utf16_lossy(&units),
+        };
+        return Some(Password {
+            text,
+            utf16: body.to_vec(),
+        })
+        .filter(|password| !password.text.is_empty());
     }
-    if units.last() == Some(&u16::from(b'"')) {
-        units.pop();
-    }
-    String::from_utf16(&units)
-        .ok()
-        .filter(|password| !password.is_empty())
+
+    // Not UTF-16: the octets are the password in an 8-bit encoding, quoted the same way.
+    let text = std::str::from_utf8(&octets).ok()?;
+    let text = text.strip_prefix('"').unwrap_or(text);
+    let text = text.strip_suffix('"').unwrap_or(text);
+    Some(Password::from_text(text)).filter(|password| !password.text.is_empty())
 }
 
-/// Whether these octets plausibly are UTF-16LE text: a quote first, or every other octet zero.
+/// Whether these octets are UTF-16LE text: a quoted value, or one whose every other octet is zero.
+///
+/// The quote is what decides it, and it has to be read as a *code unit* - `22 00`, not a bare `22`:
+/// an 8-bit password also starts with a quote, and that is exactly the value this used to misread.
+/// The all-zero-high-octet test stays for the unquoted spelling some tools write.
 fn looks_utf16(octets: &[u8]) -> bool {
-    if octets.first() == Some(&b'"') {
-        return true;
-    }
-    octets.len().is_multiple_of(2)
-        && octets.len() >= 4
-        && octets.iter().skip(1).step_by(2).all(|&high| high == 0)
+    octets.len() >= 4
+        && octets.len().is_multiple_of(2)
+        && (octets.starts_with(&[b'"', 0])
+            || octets.iter().skip(1).step_by(2).all(|&high| high == 0))
 }
 
 /// Base64, when the text is a value that `base64` wrote.
@@ -99,7 +149,7 @@ pub fn keys(
     Some(derive(&password, principal, realm))
 }
 
-fn derive(password: &str, principal: &str, realm: &str) -> Result<Attributes, String> {
+fn derive(password: &Password, principal: &str, realm: &str) -> Result<Attributes, String> {
     use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
 
     let name = rrl_kdc::name::Principal::parse(&format!("{principal}@{realm}"))
@@ -125,7 +175,7 @@ fn derive(password: &str, principal: &str, realm: &str) -> Result<Attributes, St
     let salt = ad_salt(realm, principal);
     for enctype in ENCTYPES {
         let key = OwnCipher
-            .s2k(enctype, password.as_bytes(), salt.as_bytes(), None)
+            .s2k(enctype, password.text.as_bytes(), salt.as_bytes(), None)
             .map_err(|err| format!("a key for {enctype:?}: {err}"))?;
         entry.add_key(key, 1, Some(salt.as_bytes().to_vec()));
     }
@@ -134,7 +184,15 @@ fn derive(password: &str, principal: &str, realm: &str) -> Result<Attributes, St
     // is one attribute, and a second write would replace the first - which is the blob the KDC
     // reads. The hash is what a secure channel is checked against; the keys are what a ticket is
     // sealed in, and a machine account needs both.
-    let nt_hash = nt_hash(password);
+    let nt_hash = nt_hash(&password.utf16);
+    if std::env::var_os("RRD_KEY_DIAG").is_some() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        eprintln!(
+            "hash-diag: {principal} password={:?} nt_hash={}",
+            hex(&nt_hash),
+            password.text
+        );
+    }
     let mut derived = crate::kerberos::bootstrap::attributes_of(&entry);
     // Base64 because the store is text and the blob is octets: the same spelling `krb5Key` uses,
     // and the one `to_realm_attributes` decodes.
@@ -143,10 +201,16 @@ fn derive(password: &str, principal: &str, realm: &str) -> Result<Attributes, St
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(&blob)
     };
-    derived = derived.replace(Attribute::new(
-        rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS,
-        vec![text],
-    ));
+    derived = derived.replace(
+        Attribute::new(
+            rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS,
+            vec![text],
+        )
+        // Marked the way the realm's own key attributes are: out of `*`, so a search does not
+        // hand every reader the material a logon is checked against. `Attributes::get` still
+        // reaches it, which is how this server reads it back.
+        .sensitive(),
+    );
     // Only what the KDC reads from a stored account: the principal name is the entry's own
     // (`sAMAccountName`, `userPrincipalName`), not a second one written over it.
     let mut out = Attributes::new();
@@ -176,12 +240,10 @@ fn ad_salt(realm: &str, account: &str) -> String {
 /// This is the value a logon is checked against, and the one `netr_ServerAuthenticate3` derives its
 /// session key from. AD keeps it in `supplementalCredentials` under `Primary:NT`, in the
 /// hexadecimal text of the sixteen octets.
-pub fn nt_hash(password: &str) -> [u8; 16] {
+pub fn nt_hash(utf16: &[u8]) -> [u8; 16] {
     use md4::{Digest, Md4};
     let mut hasher = Md4::new();
-    for unit in password.encode_utf16() {
-        hasher.update(unit.to_le_bytes());
-    }
+    hasher.update(utf16);
     let digest = hasher.finalize();
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest);
@@ -190,13 +252,19 @@ pub fn nt_hash(password: &str) -> [u8; 16] {
 
 /// The derived attributes that belong on an account entry.
 ///
-/// `krb5Key` and the key version are the answer to "what are this account's keys"; the principal
+/// `krb5Key`, the key version and the credential blob are the answer to "what are this account's
+/// keys"; the principal
 /// name and realm describe a *realm* entry, and writing them over an account would rename the
 /// account in the realm's eyes to whatever this derivation happened to pass in.
-const KEPT: [&str; 3] = [
+const KEPT: [&str; 4] = [
     rrl_kdc::hdb::ldap::attrs::KEY,
     rrl_kdc::hdb::ldap::attrs::KEY_VERSION_NUMBER,
     "msDS-KeyVersionNumber",
+    // The NT hash, in the same blob as the keys. Without it a machine account has keys and no
+    // password: the KDC can seal a ticket for it, and `netr_ServerAuthenticate3` has nothing to
+    // check a secure channel against, so the channel is refused as "no such machine account"
+    // for an account that exists.
+    rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS,
 ];
 
 /// The keys of a password this caller holds in the clear, for an account it is about to create.
@@ -205,7 +273,7 @@ const KEPT: [&str; 3] = [
 /// `unicodePwd` there would mean writing the clear password into the entry first and deleting it
 /// afterwards, which is a window nobody needs.
 pub fn keys_for(password: &str, principal: &str, realm: &str) -> Result<Attributes, String> {
-    derive(password, principal, realm)
+    derive(&Password::from_text(password), principal, realm)
 }
 
 /// The attributes of `derived` merged into `into`, and `unicodePwd` dropped.
@@ -236,16 +304,27 @@ pub fn seal(
     entry: &crate::model::Entry,
     security: &crate::security::Security,
 ) -> crate::model::Entry {
+    // TEMP-DIAG: which of the five preconditions a write with a password failed, when it failed.
+    let diag = std::env::var_os("RRD_KEY_DIAG").is_some();
+    let say = |what: &str| {
+        if diag {
+            eprintln!("seal-diag: {what} for {}", entry.dn());
+        }
+    };
     let Some(gssapi) = security.gssapi.as_ref() else {
+        say("no gssapi security");
         return entry.clone();
     };
     let Some(realm) = gssapi.realms().next() else {
+        say("no realm in the ticket");
         return entry.clone();
     };
     let Some(principal) = account_name(entry.attributes()) else {
+        say(&format!("no account name in attributes [realm {realm}]"));
         return entry.clone();
     };
     let Some(derived) = keys(entry.attributes(), &principal, realm) else {
+        say(&format!("no unicodePwd for '{principal}' [{realm}]"));
         return entry.clone();
     };
     let derived = match derived {
@@ -302,7 +381,7 @@ mod tests {
         };
 
         assert_eq!(
-            password_of(&with_password(&encoded)),
+            password_of(&with_password(&encoded)).map(|password| password.text),
             Some("secret".to_string())
         );
     }
@@ -312,7 +391,7 @@ mod tests {
         // An import or a test writes the value as text; refusing it would make the derivation work
         // only for the clients that happen to speak the binary form.
         assert_eq!(
-            password_of(&with_password("secret")),
+            password_of(&with_password("secret")).map(|password| password.text),
             Some("secret".to_string())
         );
     }
@@ -320,5 +399,54 @@ mod tests {
     #[test]
     fn an_entry_without_a_password_derives_nothing() {
         assert_eq!(password_of(&Attributes::new()), None);
+    }
+
+    #[test]
+    fn an_account_gets_the_nt_hash_beside_its_keys() {
+        // The blob and the keys are one attribute family, and a machine account needs both: the
+        // keys for the ticket, the hash for the secure channel. A derivation that kept the keys
+        // and dropped the blob left the channel unverifiable, which read as "no such machine
+        // account" for an account that existed.
+        let realm = "AD.EXAMPLE.COM";
+        let principal = "SAMBA$";
+        let derived = keys_for("mach1ne-Passw0rd", principal, realm).expect("keys");
+
+        assert!(
+            derived.get(rrl_kdc::hdb::ldap::attrs::KEY).is_some(),
+            "the keys must be there"
+        );
+        let blob = derived
+            .get(rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS)
+            .expect("the hash travels in supplementalCredentials");
+        assert!(
+            blob.flags.sensitive,
+            "the blob is material a logon is checked against, not something `*` returns"
+        );
+        assert!(
+            derived.get("unicodePwd").is_none(),
+            "and the clear password is not stored"
+        );
+    }
+
+    #[test]
+    fn a_quoted_eight_bit_password_is_read_as_text_not_as_utf16() {
+        // What Samba 4.17 sends for a machine: a quoted password in an 8-bit encoding, base64 in
+        // the store. Every other octet is not zero, so it is not UTF-16, and reading it as such
+        // produced a password of unrelated characters.
+        let password = "th4p-Qk8vLm2Zr9xW";
+        let quoted = format!("\"{password}\"");
+        let encoded = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(quoted.as_bytes())
+        };
+        assert_eq!(decode(&encoded).map(|p| p.text).as_deref(), Some(password));
+
+        // And the UTF-16 spelling of the same password still reads the same way.
+        let utf16: Vec<u8> = quoted.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&utf16)
+        };
+        assert_eq!(decode(&encoded).map(|p| p.text).as_deref(), Some(password));
     }
 }
