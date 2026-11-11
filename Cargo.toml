@@ -15,6 +15,10 @@ path = "src/main.rs"
 
 [dependencies]
 argon2 = { version = "0.6.0", features = ["password-hash"] }
+# The one trait this crate implements for another, whose method is `async`: the SMB layer asks for a
+# machine password write across an await, and a hand-written `Pin<Box<...>>` here would be a second
+# spelling of the same thing in the place least worth spending clarity on.
+async-trait = "0.1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23.1"
 bcrypt = "0.19.3"

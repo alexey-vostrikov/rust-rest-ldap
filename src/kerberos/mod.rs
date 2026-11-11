@@ -24,6 +24,7 @@
 //! second door.
 
 pub mod bootstrap;
+pub mod machine_password;
 pub mod realm;
 pub mod schema;
 pub mod secrets;

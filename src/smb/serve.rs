@@ -55,6 +55,7 @@ impl Running {
 pub async fn start(
     settings: &Settings,
     machine_secrets: Option<std::sync::Arc<dyn smb_server::MachineSecrets>>,
+    machine_passwords: Option<std::sync::Arc<dyn smb_server::MachinePasswords>>,
 ) -> Result<Running, String> {
     let mut builder = smb_server::SmbServer::builder()
         .listen(settings.bind)
@@ -77,6 +78,9 @@ pub async fn start(
     // checks the machine password against this and nothing else.
     if let Some(secrets) = machine_secrets {
         builder = builder.machine_secrets(secrets);
+    }
+    if let Some(passwords) = machine_passwords {
+        builder = builder.machine_passwords(passwords);
     }
     // The DES secure channel, when the deployment asks for it: off unless `smb.netlogon_des` says
     // otherwise, because that channel's credential is two passes of a 56-bit cipher.

@@ -1282,7 +1282,7 @@ dependencies = [
 [[package]]
 name = "krb5"
 version = "1.0.0"
-source = "git+https://github.com/alexey-vostrikov/krb5?branch=main#2a14200c917cbcf6ea40ced6806d14c33b6a6868"
+source = "git+https://github.com/alexey-vostrikov/krb5?branch=main#1268e84f9bf309a13faff23785fb318311c70774"
 dependencies = [
  "aes 0.9.4",
  "chrono",
@@ -1990,7 +1990,7 @@ dependencies = [
 [[package]]
 name = "rrl-krb-common"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#1f01d0ddbd747e9a7f4ac4318896fe34d562f0a3"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#645f62c70f80014e533adc8771588c59ce173887"
 dependencies = [
  "hmac 0.13.0",
  "rrl-crypto",
@@ -2024,6 +2024,7 @@ name = "rust-rest-ldap"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "axum",
  "base64",
  "bcrypt",
@@ -2395,7 +2396,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 [[package]]
 name = "smb-server"
 version = "0.9.1"
-source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#44d1529e17e23aafe44433c9908465c8191680ab"
+source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#e6349500389464fabe181f849eab766f4172ff23"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",

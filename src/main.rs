@@ -946,7 +946,31 @@ async fn serve() {
                     std::sync::Arc<dyn smb_server::MachineSecrets>,
                 > = None;
 
-                match rust_rest_ldap::smb::serve::start(&settings, machine_secrets).await {
+                #[cfg(feature = "kdc")]
+                let machine_passwords: Option<
+                    std::sync::Arc<dyn smb_server::MachinePasswords>,
+                > = if config.kerberos.enabled {
+                    Some(std::sync::Arc::new(
+                        rust_rest_ldap::kerberos::machine_password::DirectoryPasswords::new(
+                            std::sync::Arc::clone(&source),
+                            security.clone(),
+                        ),
+                    ))
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "kdc"))]
+                let machine_passwords: Option<
+                    std::sync::Arc<dyn smb_server::MachinePasswords>,
+                > = None;
+
+                match rust_rest_ldap::smb::serve::start(
+                    &settings,
+                    machine_secrets,
+                    machine_passwords,
+                )
+                .await
+                {
                     Ok(running) => {
                         println!(
                             "smb: serving IPC$ as {} on {}",
