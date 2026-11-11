@@ -146,10 +146,30 @@ pub fn keys(
     realm: &str,
 ) -> Option<Result<Attributes, String>> {
     let password = password_of(attributes)?;
-    Some(derive(&password, principal, realm))
+    Some(derive(&password, principal, realm, host_name(attributes)))
 }
 
-fn derive(password: &Password, principal: &str, realm: &str) -> Result<Attributes, String> {
+/// The account's DNS host name, which is what its keys are salted with.
+///
+/// `dNSHostName`, and not the NetBIOS name in `sAMAccountName`: AD salts a machine's keys with
+/// `REALM` + `host` + the lower-cased **DNS** name, a member writes its keytab with that salt, and a
+/// key derived from the short name is a key nobody can reproduce. Measured on the stand after a
+/// successful join: the member's keytab held keys salted `AD.EXAMPLE.COMhostsamba.ad.example.com`
+/// while the directory held `AD.EXAMPLE.COMhostsamba`, and `kinit -k SAMBA$` answered
+/// "Preauthentication failed" for an account whose password both sides agreed on.
+fn host_name(attributes: &Attributes) -> Option<String> {
+    attributes
+        .get("dNSHostName")
+        .and_then(|attribute| attribute.values.first())
+        .map(|value| value.trim().to_owned())
+}
+
+fn derive(
+    password: &Password,
+    principal: &str,
+    realm: &str,
+    host: Option<String>,
+) -> Result<Attributes, String> {
     use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
 
     let name = rrl_kdc::name::Principal::parse(&format!("{principal}@{realm}"))
@@ -172,7 +192,7 @@ fn derive(password: &Password, principal: &str, realm: &str) -> Result<Attribute
     //
     // The salt is written into the entry, so the KDC publishes it in `ETYPE-INFO2` and a client
     // that reads the reply derives the same key rather than assuming one.
-    let salt = ad_salt(realm, principal);
+    let salt = ad_salt(realm, principal, host.as_deref());
     for enctype in ENCTYPES {
         let key = OwnCipher
             .s2k(enctype, password.text.as_bytes(), salt.as_bytes(), None)
@@ -225,13 +245,16 @@ fn derive(password: &Password, principal: &str, realm: &str) -> Result<Attribute
 ///
 /// The trailing `$` of a machine account is not part of it - the name AD salts with is the one a
 /// person would say out loud, and the mark is there to keep a machine from colliding with a user.
-fn ad_salt(realm: &str, account: &str) -> String {
-    format!(
-        "{}{}{}",
-        realm.to_ascii_uppercase(),
-        "host",
-        account.trim_end_matches('$').to_ascii_lowercase()
-    )
+fn ad_salt(realm: &str, account: &str, host: Option<&str>) -> String {
+    let name = match host {
+        Some(host) if !host.is_empty() => host.to_ascii_lowercase(),
+        // A machine account is written before its `dNSHostName` is known in some flows, and a user
+        // account never has one: the short name is what is left, and every client that reads the
+        // salt from `ETYPE-INFO2` follows it, which is why this fallback works for a password bind
+        // and not for a keytab.
+        _ => account.trim_end_matches('$').to_ascii_lowercase(),
+    };
+    format!("{}{}{}", realm.to_ascii_uppercase(), "host", name)
 }
 
 /// The account's NT hash: MD4 over the password as UTF-16LE, little endian (MS-NLMP 3.3.1).
@@ -270,7 +293,7 @@ const KEPT: [&str; 4] = [
 /// `unicodePwd` there would mean writing the clear password into the entry first and deleting it
 /// afterwards, which is a window nobody needs.
 pub fn keys_for(password: &str, principal: &str, realm: &str) -> Result<Attributes, String> {
-    derive(&Password::from_text(password), principal, realm)
+    derive(&Password::from_text(password), principal, realm, None)
 }
 
 /// The attributes of `derived` merged into `into`, and `unicodePwd` dropped.
@@ -434,5 +457,66 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(&utf16)
         };
         assert_eq!(decode(&encoded).map(|p| p.text).as_deref(), Some(password));
+    }
+
+    /// A machine's keys are salted with its **DNS** host name, which is the value the member uses
+    /// when it writes its own keytab.
+    ///
+    /// The salt string is asserted byte for byte against what a live join put in the member's
+    /// keytab (`salt_data` in the client's own log, and the `krb5_salt` of the ticket request).
+    /// With the NetBIOS name instead - which is what this used to do - the directory and the keytab
+    /// hold keys derived from one password and two salts, and `kinit -k` answers
+    /// "Preauthentication failed" while every other step of the join has already succeeded.
+    #[test]
+    fn a_machines_keys_are_salted_with_its_dns_host_name() {
+        assert_eq!(
+            ad_salt("AD.EXAMPLE.COM", "SAMBA$", Some("samba.ad.example.com")),
+            "AD.EXAMPLE.COMhostsamba.ad.example.com",
+            "what the member wrote into its keytab"
+        );
+        assert_eq!(
+            ad_salt("AD.EXAMPLE.COM", "SAMBA$", None),
+            "AD.EXAMPLE.COMhostsamba",
+            "the fallback: a short name, which a password bind follows through ETYPE-INFO2"
+        );
+        assert_eq!(
+            ad_salt("ad.example.com", "SAMBA$", Some("Samba.AD.Example.COM")),
+            "AD.EXAMPLE.COMhostsamba.ad.example.com",
+            "the realm is upper-cased and the host name lower-cased, whatever the entry says"
+        );
+    }
+
+    /// The salt a derivation uses comes from the entry, not from its name.
+    #[test]
+    fn a_computer_entry_supplies_the_host_name_for_its_own_salt() {
+        let attributes = Attributes::new()
+            .push(Attribute::single(UNICODE_PWD, "a-machine-password"))
+            .push(Attribute::single("sAMAccountName", "SAMBA$"))
+            .push(Attribute::single("dNSHostName", "samba.ad.example.com"));
+
+        let derived = keys(&attributes, "SAMBA$", "AD.EXAMPLE.COM")
+            .expect("the entry holds a password")
+            .expect("derived");
+
+        // Every `krb5Key` blob carries the salt it was made with, in the clear: that is how a KDC
+        // publishes it and how a client knows what to derive with.
+        let salt = b"AD.EXAMPLE.COMhostsamba.ad.example.com";
+        let mut seen = 0;
+        for blob in derived
+            .get("krb5Key")
+            .map(|attribute| attribute.values.clone())
+            .expect("the keys are written")
+        {
+            use base64::Engine as _;
+            let octets = base64::engine::general_purpose::STANDARD
+                .decode(&blob)
+                .expect("base64");
+            assert!(
+                octets.windows(salt.len()).any(|window| window == salt),
+                "each blob names the DNS host in its salt"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 4, "one blob per enctype, and each one salted alike");
     }
 }
