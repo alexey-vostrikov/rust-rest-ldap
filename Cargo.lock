@@ -1959,12 +1959,13 @@ dependencies = [
 [[package]]
 name = "rrl-crypto"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#20c04eb6212a22149cf7e49e1fe21850a3af042c"
+source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#c7347a2309e2bff3e4ba8bdf6c967694f1f3f2b8"
 dependencies = [
  "aes 0.9.4",
  "getrandom 0.4.3",
  "hmac 0.13.0",
  "md-5 0.11.0",
+ "md4",
  "sha1",
  "sha2 0.11.1",
  "thiserror 2.0.21",
@@ -2035,7 +2036,6 @@ dependencies = [
  "hyper-util",
  "krb5",
  "md-5 0.11.0",
- "md4",
  "memmap2",
  "pbkdf2",
  "rasn",
@@ -2043,6 +2043,7 @@ dependencies = [
  "rcgen",
  "redb",
  "roaring",
+ "rrl-crypto",
  "rrl-kdc",
  "rustls",
  "rustls-pemfile",

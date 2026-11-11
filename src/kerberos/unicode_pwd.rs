@@ -184,15 +184,7 @@ fn derive(password: &Password, principal: &str, realm: &str) -> Result<Attribute
     // is one attribute, and a second write would replace the first - which is the blob the KDC
     // reads. The hash is what a secure channel is checked against; the keys are what a ticket is
     // sealed in, and a machine account needs both.
-    let nt_hash = nt_hash(&password.utf16);
-    if std::env::var_os("RRD_KEY_DIAG").is_some() {
-        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        eprintln!(
-            "hash-diag: {principal} password={:?} nt_hash={}",
-            hex(&nt_hash),
-            password.text
-        );
-    }
+    let nt_hash = nt_hash(&password.utf16)?;
     let mut derived = crate::kerberos::bootstrap::attributes_of(&entry);
     // Base64 because the store is text and the blob is octets: the same spelling `krb5Key` uses,
     // and the one `to_realm_attributes` decodes.
@@ -240,14 +232,12 @@ fn ad_salt(realm: &str, account: &str) -> String {
 /// This is the value a logon is checked against, and the one `netr_ServerAuthenticate3` derives its
 /// session key from. AD keeps it in `supplementalCredentials` under `Primary:NT`, in the
 /// hexadecimal text of the sixteen octets.
-pub fn nt_hash(utf16: &[u8]) -> [u8; 16] {
-    use md4::{Digest, Md4};
-    let mut hasher = Md4::new();
-    hasher.update(utf16);
-    let digest = hasher.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest);
-    out
+pub fn nt_hash(utf16: &[u8]) -> Result<[u8; 16], String> {
+    // The computation lives in the crypto layer (RRL-7.1): the SMB server derives the same value
+    // for the same account, and two implementations of one primitive is two answers waiting to
+    // disagree. Only the spelling of the error belongs here.
+    rrl_crypto::nt::hash(utf16)
+        .map_err(|err| format!("the NT hash of the account's password: {err}"))
 }
 
 /// The derived attributes that belong on an account entry.
@@ -304,27 +294,16 @@ pub fn seal(
     entry: &crate::model::Entry,
     security: &crate::security::Security,
 ) -> crate::model::Entry {
-    // TEMP-DIAG: which of the five preconditions a write with a password failed, when it failed.
-    let diag = std::env::var_os("RRD_KEY_DIAG").is_some();
-    let say = |what: &str| {
-        if diag {
-            eprintln!("seal-diag: {what} for {}", entry.dn());
-        }
-    };
     let Some(gssapi) = security.gssapi.as_ref() else {
-        say("no gssapi security");
         return entry.clone();
     };
     let Some(realm) = gssapi.realms().next() else {
-        say("no realm in the ticket");
         return entry.clone();
     };
     let Some(principal) = account_name(entry.attributes()) else {
-        say(&format!("no account name in attributes [realm {realm}]"));
         return entry.clone();
     };
     let Some(derived) = keys(entry.attributes(), &principal, realm) else {
-        say(&format!("no unicodePwd for '{principal}' [{realm}]"));
         return entry.clone();
     };
     let derived = match derived {

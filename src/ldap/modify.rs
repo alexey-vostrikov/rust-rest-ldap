@@ -208,21 +208,7 @@ pub fn handle_modify(
     // A password written here becomes the keys the KDC reads, in the same change: an account that
     // exists without keys answers `S_PRINCIPAL_UNKNOWN` to every ticket request.
     #[cfg(feature = "kdc")]
-    let modified = {
-        if std::env::var_os("RRD_KEY_DIAG").is_some() {
-            eprintln!(
-                "modify-diag: {} unicodePwd={} krb5Key={} supplementalCredentials={}",
-                modified.dn(),
-                modified.attributes().get("unicodePwd").is_some(),
-                modified.attributes().get("krb5Key").is_some(),
-                modified
-                    .attributes()
-                    .get("supplementalCredentials")
-                    .is_some(),
-            );
-        }
-        crate::kerberos::unicode_pwd::seal(&modified, security)
-    };
+    let modified = crate::kerberos::unicode_pwd::seal(&modified, security);
 
     Outcome::Persist {
         entry: modified,

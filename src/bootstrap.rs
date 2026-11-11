@@ -355,23 +355,7 @@ fn entry_for(spec: &Spec, policy: &PasswordPolicy) -> Result<Entry, Error> {
         {
             match crate::kerberos::unicode_pwd::keys_for(spec.password.expose(), &value, realm) {
                 Ok(derived) => {
-                    if std::env::var_os("RRD_KEY_DIAG").is_some() {
-                        let key = rrl_kdc::hdb::ldap::attrs::KEY;
-                        eprintln!(
-                            "key-diag: derived key attr present: {}, unicodePwd kept: {}",
-                            derived.get(key).is_some(),
-                            derived.get("unicodePwd").is_some()
-                        );
-                        attributes =
-                            crate::kerberos::unicode_pwd::merge_keys(&attributes, &derived);
-                        eprintln!(
-                            "key-diag: entry now carries the key attr: {}",
-                            attributes.get(key).is_some()
-                        );
-                    } else {
-                        attributes =
-                            crate::kerberos::unicode_pwd::merge_keys(&attributes, &derived);
-                    }
+                    attributes = crate::kerberos::unicode_pwd::merge_keys(&attributes, &derived);
                 }
                 Err(err) => {
                     return Err(Error::Keys(err));

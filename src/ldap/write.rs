@@ -232,25 +232,6 @@ pub fn handle_add(
         return reject(response(ResultCode::InsufficientAccessRights, ""));
     }
 
-    // TEMP-DIAG: what a client's `add` actually carries, name by name.
-    if std::env::var_os("RRD_KEY_DIAG").is_some() {
-        let names: Vec<&str> = request
-            .attributes
-            .iter()
-            .map(|attribute| attribute.r#type.0.as_ref())
-            .collect();
-        eprintln!("add-diag: {entry_dn} attributes={names:?}");
-        for attribute in &request.attributes {
-            if attribute.r#type.0.eq_ignore_ascii_case("unicodePwd") {
-                for value in attribute.vals.iter() {
-                    let raw: &[u8] = value.as_ref();
-                    let _ = std::fs::write("/tmp/unicodepwd.bin", raw);
-                    eprintln!("add-diag: unicodePwd raw[{}] written", raw.len());
-                }
-            }
-        }
-    }
-
     let mut attributes = Attributes::new();
     for attribute in &request.attributes {
         let name = attribute.r#type.0.to_string();
