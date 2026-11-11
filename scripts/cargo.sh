@@ -34,43 +34,17 @@ case "$rustup_cache" in
 /* | .*) mkdir -p "$rustup_cache" ;;
 esac
 
-# The KDC is a sibling checkout, not a published crate, so the container has to see it at the path
-# the manifest names: `/w/../rust-kdc` resolves to `/rust-kdc`. Mounted read-only - this repository
-# only ever consumes it, and a build that could write into a neighbouring project is a build that
-# can corrupt one. Where it lives is a checkout detail (`RR_LDAP_KDC` overrides it), so a missing
-# one is not fatal: `cargo` then reports the missing package itself, which is the honest failure
-# rather than a mount that quietly succeeds nowhere.
-for candidate in "${RR_LDAP_KDC:-}" "$repo/../rust-kdc" "$repo/../../rust-kdc" "$repo/../rust-heimdal-kdc"; do
-  if [ -n "$candidate" ] && [ -d "$candidate" ]; then
-    kdc=$(cd "$candidate" && pwd)
-    break
-  fi
-done
-mounts=""
-if [ -n "${kdc:-}" ]; then
-  mounts="-v $kdc:/rust-kdc:ro"
-fi
-
-# The SMB server is a sibling checkout for the same reason and with the same rules: mounted
-# read-only at the path the manifest names, and a missing one is `cargo`'s error to report.
-# `RR_LDAP_SMB` overrides where it lives.
-for candidate in "${RR_LDAP_SMB:-}" "$repo/../rust-smb-server" "$repo/../../rust-smb-server"; do
-  if [ -n "$candidate" ] && [ -d "$candidate" ]; then
-    smb=$(cd "$candidate" && pwd)
-    break
-  fi
-done
-if [ -n "${smb:-}" ]; then
-  mounts="$mounts -v $smb:/rust-smb-server:ro"
-fi
-
+# Both Kerberos dependencies are git dependencies, so there is no sibling checkout to mount: cargo
+# fetches `rrl-kdc` and `smb-server` into `$CARGO_HOME/git` and the container needs only that cache,
+# which every run already has. The mounts this replaced pointed at paths the manifest no longer
+# names, and one of them named a directory that had since been renamed - a mount that resolves to
+# nothing is invisible, which is why they are gone rather than left in place.
 
 # MIRIFLAGS is passed through because otherwise `-Zmiri-disable-isolation` is dropped silently, and
 # a test that needs the filesystem fails with "mkdir not available when isolation is enabled" - which
 # reads as a defect in the code under test rather than in the harness.
 exec docker run --rm \
   -v "$repo:/w" \
-  $mounts \
   -v "$cargo_cache:/cargo" \
   -v "$target_cache:/target" \
   -w /w \

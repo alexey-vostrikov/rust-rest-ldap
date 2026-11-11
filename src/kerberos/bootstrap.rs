@@ -23,10 +23,10 @@
 
 use std::path::Path;
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
-use rust_kdc::hdb::HdbEntry;
-use rust_kdc::hdb::ldap::{attrs, dn_for, to_attributes};
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::{Enctype, OwnCipher};
+use rrl_kdc::hdb::HdbEntry;
+use rrl_kdc::hdb::ldap::{attrs, dn_for, to_attributes};
+use rrl_kdc::name::Principal;
 
 use crate::backend::EntryChange;
 use crate::model::{Attribute, AttributeFlags, Attributes, Entry};
@@ -135,7 +135,7 @@ pub async fn ensure_keytab_principals(
     base_dn: &str,
     keytab: &Path,
 ) -> Result<Vec<String>, String> {
-    use rust_kdc::crypto::{Enctype, Key};
+    use rrl_kdc::crypto::{Enctype, Key};
 
     let keytab = krb5::Keytab::load(keytab)
         .map_err(|err| format!("keytab '{}': {err}", keytab.display()))?;
@@ -219,7 +219,7 @@ pub fn attributes_of(entry: &HdbEntry) -> Attributes {
     to_directory_attributes(&to_attributes(entry))
 }
 
-fn to_directory_attributes(attributes: &rust_kdc::hdb::ldap::Attributes) -> Attributes {
+fn to_directory_attributes(attributes: &rrl_kdc::hdb::ldap::Attributes) -> Attributes {
     use base64::Engine as _;
 
     let mut out = Attributes::new();

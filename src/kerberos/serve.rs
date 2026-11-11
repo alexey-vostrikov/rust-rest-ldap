@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rust_kdc::kdc::Kdc;
+use rrl_kdc::kdc::Kdc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
@@ -163,9 +163,9 @@ pub async fn start(
     keytab: Option<&std::path::Path>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Running, String> {
-    use rust_kdc::crypto::OwnCipher;
-    use rust_kdc::hdb::ldap::LdapHdb;
-    use rust_kdc::kdc::KdcConfig;
+    use rrl_kdc::crypto::OwnCipher;
+    use rrl_kdc::hdb::ldap::LdapHdb;
+    use rrl_kdc::kdc::KdcConfig;
 
     super::bootstrap::ensure_krbtgt(&source, &settings.realm, &base_dn, master_key_file).await?;
 
@@ -191,7 +191,7 @@ pub async fn start(
     let kdc = Arc::new(Kdc::new(
         config,
         Arc::new(LdapHdb::new(
-            Arc::clone(&view) as Arc<dyn rust_kdc::hdb::ldap::Directory>
+            Arc::clone(&view) as Arc<dyn rrl_kdc::hdb::ldap::Directory>
         )),
         Arc::new(OwnCipher),
     ));

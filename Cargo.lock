@@ -1273,13 +1273,13 @@ dependencies = [
 [[package]]
 name = "krb5"
 version = "1.0.0"
-source = "git+https://github.com/alexey-vostrikov/krb5?branch=main#a609d6d9324ede26b34bf5eac9faecce614bdd36"
+source = "git+https://github.com/alexey-vostrikov/krb5?branch=main#4ada776241ed24a4befe5f87b8c4163c003db39f"
 dependencies = [
  "aes 0.9.4",
  "chrono",
  "hmac 0.13.0",
  "rand",
- "rrl-krb",
+ "rrl-krb-common",
  "sha1",
  "sha2 0.11.1",
  "thiserror 1.0.69",
@@ -1950,7 +1950,7 @@ dependencies = [
 [[package]]
 name = "rrl-crypto"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#7a416e202270224755cfa0884271435ea1fe33b6"
+source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#20c04eb6212a22149cf7e49e1fe21850a3af042c"
 dependencies = [
  "aes 0.9.4",
  "getrandom 0.4.3",
@@ -1963,12 +1963,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "rrl-krb"
+name = "rrl-kdc"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-krb?branch=main#724ed08e6cfe8f07388959da8f2860a96df13095"
+source = "git+https://github.com/alexey-vostrikov/rrl-kdc?branch=main#bbf0f7298670afdfc5db5daf67a2a7bfc330d961"
 dependencies = [
  "hmac 0.13.0",
- "md-5 0.11.0",
+ "rrl-crypto",
+ "rrl-krb-common",
+ "sha1",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "rrl-krb-common"
+version = "0.1.0"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#12ae2bcd0c9263c768e6fd0c952e7cf317ab8d2b"
+dependencies = [
+ "hmac 0.13.0",
  "rrl-crypto",
  "sha1",
  "sha2 0.11.1",
@@ -1992,21 +2005,6 @@ dependencies = [
  "signature",
  "spki",
  "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "rust-kdc"
-version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rust-kdc?branch=main#ef9d9adf79b9b30651cb8605aa2bfdb18eaa3fc9"
-dependencies = [
- "hmac 0.13.0",
- "md-5 0.11.0",
- "rrl-crypto",
- "rrl-krb",
- "sha1",
- "sha2 0.11.1",
- "thiserror 2.0.21",
  "zeroize",
 ]
 
@@ -2035,7 +2033,7 @@ dependencies = [
  "rcgen",
  "redb",
  "roaring",
- "rust-kdc",
+ "rrl-kdc",
  "rustls",
  "rustls-pemfile",
  "rustls-rustcrypto",
@@ -2385,7 +2383,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 [[package]]
 name = "smb-server"
 version = "0.9.1"
-source = "git+https://github.com/alexey-vostrikov/rust-smb-server?branch=krb5-support#b3210f154d649164abfa88783d1a2b021d2721e4"
+source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#22bf9cf095e1a42a5bf2904640f89519f96794fc"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",

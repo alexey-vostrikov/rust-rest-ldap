@@ -100,11 +100,11 @@ pub fn keys(
 }
 
 fn derive(password: &str, principal: &str, realm: &str) -> Result<Attributes, String> {
-    use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
+    use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
 
-    let name = rust_kdc::name::Principal::parse(&format!("{principal}@{realm}"))
+    let name = rrl_kdc::name::Principal::parse(&format!("{principal}@{realm}"))
         .map_err(|err| format!("'{principal}@{realm}' is not a principal: {err}"))?;
-    let mut entry = rust_kdc::hdb::HdbEntry::user(name);
+    let mut entry = rrl_kdc::hdb::HdbEntry::user(name);
     // The enctypes a modern client asks for, and the two every KDC still answers with: a machine
     // that cannot get AES gets nothing at all from a realm that publishes only AES.
     const ENCTYPES: [Enctype; 4] = [
@@ -161,8 +161,8 @@ fn ad_salt(realm: &str, account: &str) -> String {
 /// name and realm describe a *realm* entry, and writing them over an account would rename the
 /// account in the realm's eyes to whatever this derivation happened to pass in.
 const KEPT: [&str; 3] = [
-    rust_kdc::hdb::ldap::attrs::KEY,
-    rust_kdc::hdb::ldap::attrs::KEY_VERSION_NUMBER,
+    rrl_kdc::hdb::ldap::attrs::KEY,
+    rrl_kdc::hdb::ldap::attrs::KEY_VERSION_NUMBER,
     "msDS-KeyVersionNumber",
 ];
 

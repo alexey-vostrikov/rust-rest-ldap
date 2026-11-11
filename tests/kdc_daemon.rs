@@ -13,10 +13,10 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
-use rust_kdc::hdb::HdbEntry;
-use rust_kdc::hdb::ldap::dn_for;
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::{Enctype, OwnCipher};
+use rrl_kdc::hdb::HdbEntry;
+use rrl_kdc::hdb::ldap::dn_for;
+use rrl_kdc::name::Principal;
 
 use rust_rest_ldap::backend::{Backend, EntryChange};
 use rust_rest_ldap::kerberos::{KerberosConfig, Settings, bootstrap, serve};
@@ -57,7 +57,7 @@ async fn source_with_account(dir: &std::path::Path, account: &str) -> Arc<Source
         if service {
             // Without SERVER the TGS refuses a ticket for it - see `TODO.md` in the KDC: the answer
             // is `S_PRINCIPAL_UNKNOWN`, and it reads as a policy refusal in the message.
-            entry.flags = rust_kdc::hdb::flags::SERVER | rust_kdc::hdb::flags::FORWARDABLE;
+            entry.flags = rrl_kdc::hdb::flags::SERVER | rrl_kdc::hdb::flags::FORWARDABLE;
         }
         for enctype in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
             entry
@@ -127,7 +127,7 @@ async fn a_service_in_the_keytab_can_be_asked_for() {
     let source = source_with_account(dir.path(), "alice").await;
     let service = format!("{SERVICE}@{REALM}");
     let service_dn = dn_for(
-        &rust_kdc::name::Principal::parse(&service).expect("a principal"),
+        &rrl_kdc::name::Principal::parse(&service).expect("a principal"),
         BASE_DN,
     );
     source
