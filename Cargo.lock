@@ -1974,7 +1974,7 @@ dependencies = [
 [[package]]
 name = "rrl-kdc"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-kdc?branch=main#944bd0cea58bc75c03f80a54c1c9d729fa859c93"
+source = "git+https://github.com/alexey-vostrikov/rrl-kdc?branch=main#dfd4836cbe306da9fdc250073d07bfc1eef081fa"
 dependencies = [
  "hmac 0.13.0",
  "rrl-crypto",
@@ -1988,7 +1988,7 @@ dependencies = [
 [[package]]
 name = "rrl-krb-common"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#12ae2bcd0c9263c768e6fd0c952e7cf317ab8d2b"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#1f01d0ddbd747e9a7f4ac4318896fe34d562f0a3"
 dependencies = [
  "hmac 0.13.0",
  "rrl-crypto",
