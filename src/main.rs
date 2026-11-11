@@ -793,8 +793,13 @@ async fn serve() {
         };
 
         // Whether a KDC answers here decides `DS_KDC_FLAG`, and a Windows client filters on it
-        // when it looks for a controller to join with.
+        // when it looks for a controller to join with. A build without the `kdc` feature has no
+        // realm to answer on 88, and the field itself does not exist there: saying "no KDC" is the
+        // honest answer, and the alternative is a flag that promises tickets nobody issues.
+        #[cfg(feature = "kdc")]
         let kdc_here = config.kerberos.enabled;
+        #[cfg(not(feature = "kdc"))]
+        let kdc_here = false;
         match rust_rest_ldap::cldap::Settings::resolve(
             &config.cldap,
             &config.base_dn,
