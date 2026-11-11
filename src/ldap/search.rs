@@ -40,8 +40,10 @@ pub fn handle_search(
     controls: Option<&Controls>,
     security: &Security,
 ) -> Vec<LdapMessage> {
+    // As the client spelled it: the root DSE, the subschema subentry and `cn=config` answer with
+    // the name they were asked by, and a client that reads its own spelling back is how a server
+    // says "yes, that is the entry you meant".
     let mut base_object = request.base_object.0.to_string();
-
     // Root DSE is served before any access check: clients need it to discover the
     // naming contexts before they can bind.
     if base_object.is_empty() {
@@ -207,6 +209,16 @@ pub fn handle_search(
             &base_object,
         );
     }
+
+    // Normalised from here on, because the comparisons below are DN comparisons and
+    // `distinguishedNameMatch` is case-insensitive (RFC 4517 §4.2.15). Measured on the join stand:
+    // Samba searches `cn=Computers,dc=AD,dc=EXAMPLE,dc=COM`, and an answer without that reply made
+    // `ads_search_dn` report `No such object`, which turned the machine account creation into the
+    // `samr` fallback.
+    //
+    // Three comparisons depend on it - the access rules, the scope check in the walk, and the
+    // subscription a persistent search keeps - so it happens once here rather than three times.
+    let base_object = crate::dn::normalize(&base_object);
 
     // Access is decided by the rules, per entry and per attribute.
     let requester = session.requester();
@@ -1184,6 +1196,56 @@ mod tests {
         assert!(
             at >= before && at <= after,
             "the timestamp falls between the two reads of the clock: {value:?}"
+        );
+    }
+
+    #[test]
+    fn a_base_in_another_case_finds_the_entry() {
+        // `distinguishedNameMatch` is case-insensitive (RFC 4517 §4.2.15), and Samba relies on it:
+        // `ads_search_dn` searches `cn=Computers,dc=AD,dc=EXAMPLE,dc=COM` and needs exactly one
+        // reply. Measured on the join stand: an empty answer here became `No such object`, the
+        // machine account was not created over LDAP, and the join fell back to `samr`.
+        let session = admin_session();
+        for base in [
+            "DC=EXAMPLE,DC=COM",
+            "dc=Example,dc=Com",
+            "  dc=example,dc=com  ",
+        ] {
+            let messages = search(
+                &session,
+                &request(
+                    base,
+                    SearchRequestScope::BaseObject,
+                    present("objectClass"),
+                    0,
+                    &[],
+                ),
+                None,
+            );
+            assert_eq!(
+                dns(&messages),
+                vec!["dc=example,dc=com".to_string()],
+                "base-scope on {base:?} finds the naming context"
+            );
+        }
+
+        // And the subtree walk, which takes a different path when an index narrows the answer:
+        // that arm filters by scope with the base as given, which is where the mismatch lived.
+        let messages = search(
+            &session,
+            &request(
+                "DC=EXAMPLE,DC=COM",
+                SearchRequestScope::WholeSubtree,
+                present("objectClass"),
+                0,
+                &[],
+            ),
+            None,
+        );
+        assert!(
+            dns(&messages).len() > 1,
+            "a subtree search on an upper-case base returns the entries below it: {:?}",
+            dns(&messages)
         );
     }
 

@@ -372,6 +372,44 @@ impl Schema {
         Ok(())
     }
 
+    /// Replaces definitions whose object identifier is already known, and adds the rest.
+    ///
+    /// `extend` refuses a duplicate, because a silent overwrite is how two vocabularies come to
+    /// disagree without anyone noticing. This is that refusal with one named exception: the caller
+    /// states definitions that are *the same OID with different rules*, which is what a standard
+    /// class becomes in a world that redefined it. AD's `person` (2.5.6.6) requires `cn` and only
+    /// permits `sn`, while X.500 - and so the built-in vocabulary - requires both; a server that
+    /// serves AD clients has to publish the AD reading of the same OID.
+    ///
+    /// Everything the old definition was reachable by is dropped before the new one is inserted,
+    /// including names the new definition no longer declares: an alias left behind would resolve
+    /// to a definition that is no longer in force.
+    pub fn replace(&mut self, definitions: &str) -> Result<(), SchemaError> {
+        for definition in split_definitions(definitions)? {
+            let tokens = tokenize(&definition)?;
+            match tokens.first().map(String::as_str) {
+                Some("attributetype") | Some("attributeType") => {
+                    let parsed = parse_attribute_type(&tokens)?;
+                    self.attributes.retain(|_, kept| kept.oid != parsed.oid);
+                    self.insert_attribute(parsed)?;
+                }
+                Some("objectclass") | Some("objectClass") => {
+                    let parsed = parse_object_class(&tokens)?;
+                    self.classes.retain(|_, kept| kept.oid != parsed.oid);
+                    self.insert_class(parsed)?;
+                }
+                Some(other) => {
+                    return Err(SchemaError::UnknownKeyword {
+                        keyword: other.to_string(),
+                        kind: "definition",
+                    });
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Builds the schema a server runs with: the built-in core, then files, then what the
     /// protocol added.
     ///

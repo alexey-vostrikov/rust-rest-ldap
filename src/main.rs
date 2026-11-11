@@ -400,6 +400,29 @@ async fn serve() {
         return;
     }
 
+    // The realm this directory is the domain of, when it is one. Resolved here rather than at the
+    // listener below because the first administrator is created before it, and that account has to
+    // be an account of the realm it will authenticate: `kinit administrator@REALM` looks it up by
+    // user principal name, an attribute only `user` permits.
+    #[cfg(feature = "kdc")]
+    let domain_realm: Option<String> = if config.kerberos.enabled {
+        match rust_rest_ldap::kerberos::Settings::resolve(
+            &config.kerberos,
+            &config.base_dn,
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+        ) {
+            Ok(settings) => Some(settings.realm),
+            // Reported where it is reported for the listener too, with the same words: a realm
+            // that cannot be resolved is a configuration the server refuses, not one it works
+            // around by creating a person instead of an account.
+            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "kdc"))]
+    let domain_realm: Option<String> = None;
+
     // The first administrator, for a store no client can write to yet: `add` needs a bind,
     // and a bind needs an entry. Runs before the listener, so the directory is
     // administrable from the first connection rather than after a manual edit.
@@ -417,6 +440,13 @@ async fn serve() {
         ) {
             Ok(spec) => spec,
             Err(err) => fatal(&i18n::t("error.bootstrap", &[("detail", &err.to_string())])),
+        };
+        // A directory that issues tickets needs its first administrator to be an account the KDC
+        // knows: `kinit <name>@<realm>` looks the entry up by user principal name, and a `person`
+        // created for a plain directory permits none of the attributes that would make it one.
+        let spec = match &domain_realm {
+            Some(realm) => spec.as_domain_account(realm.clone()),
+            None => spec,
         };
 
         match rust_rest_ldap::bootstrap::seed_with(&backend, &spec, &config.passwords).await {
@@ -811,6 +841,7 @@ async fn serve() {
             Arc::clone(&source),
             config.base_dn.clone(),
             config.kerberos.master_key_file.as_deref(),
+            config.sasl.keytab.as_deref(),
             shutdown_rx.clone(),
         )
         .await
@@ -890,7 +921,32 @@ async fn serve() {
                 {
                     settings.domain_netbios = Some(first.to_ascii_uppercase());
                 }
-                match rust_rest_ldap::smb::serve::start(&settings).await {
+                // The machine accounts, for the secure channel a join establishes last. A live
+                // view and not a snapshot: the account is created and used a moment later.
+                #[cfg(feature = "kdc")]
+                let machine_secrets: Option<
+                    std::sync::Arc<dyn smb_server::MachineSecrets>,
+                > = if config.kerberos.enabled {
+                    let secrets = std::sync::Arc::new(
+                        rust_rest_ldap::kerberos::secrets::DirectorySecrets::new(
+                            source.directory().await,
+                        ),
+                    );
+                    let _follow = rust_rest_ldap::kerberos::secrets::DirectorySecrets::follow(
+                        std::sync::Arc::clone(&secrets),
+                        std::sync::Arc::clone(&source),
+                        shutdown_rx.clone(),
+                    );
+                    Some(secrets)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "kdc"))]
+                let machine_secrets: Option<
+                    std::sync::Arc<dyn smb_server::MachineSecrets>,
+                > = None;
+
+                match rust_rest_ldap::smb::serve::start(&settings, machine_secrets).await {
                     Ok(running) => {
                         println!(
                             "smb: serving IPC$ as {} on {}",

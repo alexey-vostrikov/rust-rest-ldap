@@ -536,6 +536,42 @@ pub struct Group {
     pub member_uid: Vec<String>,
 }
 
+/// The text a store holds for one attribute value a client sent as octets.
+///
+/// LDAP values are octets and this store holds text, so something has to decide the spelling. It is
+/// base64 for the attributes whose values are not text at all, and for any value that is not valid
+/// UTF-8 at all. A lossy UTF-8 conversion is the one choice that cannot be undone: measured on the
+/// AD-join stand, `unicodePwd` arrived as UTF-16LE and was stored as `"` followed by replacement
+/// characters, so the keys derived from it belonged to a password nobody had ever set and
+/// `kinit` answered `Preauthentication failed` for an account whose password was exactly right.
+pub fn value_text(name: &str, octets: &[u8]) -> String {
+    let base = name
+        .split(';')
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .to_ascii_lowercase();
+    let binary = matches!(
+        base.as_str(),
+        "unicodepwd"
+            | "krb5key"
+            | "supplementalcredentials"
+            | "objectguid"
+            | "objectsid"
+            | "usersid"
+            | "usercertificate"
+            | "ntsecuritydescriptor"
+            | "jpegphoto"
+            | "thumbnailphoto"
+            | "userparameters"
+    );
+    if binary || std::str::from_utf8(octets).is_err() {
+        use base64::Engine as _;
+        return base64::engine::general_purpose::STANDARD.encode(octets);
+    }
+    String::from_utf8_lossy(octets).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,7 +26,9 @@
 pub mod bootstrap;
 pub mod realm;
 pub mod schema;
+pub mod secrets;
 pub mod serve;
+pub mod unicode_pwd;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;

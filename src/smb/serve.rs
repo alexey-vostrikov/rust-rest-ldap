@@ -52,7 +52,10 @@ impl Running {
 ///
 /// An empty user list is deliberate: this server is reached with a Kerberos ticket from a machine
 /// account, and SMB's own password list is for the shares this deployment does not serve.
-pub async fn start(settings: &Settings) -> Result<Running, String> {
+pub async fn start(
+    settings: &Settings,
+    machine_secrets: Option<std::sync::Arc<dyn smb_server::MachineSecrets>>,
+) -> Result<Running, String> {
     let mut builder = smb_server::SmbServer::builder()
         .listen(settings.bind)
         .netbios_name(settings.netbios_name.clone())
@@ -70,6 +73,14 @@ pub async fn start(settings: &Settings) -> Result<Running, String> {
     if let Some(name) = &settings.domain_netbios {
         builder = builder.domain_netbios(name.clone());
     }
+    // The secure channel a member establishes after its account exists: `netr_ServerAuthenticate3`
+    // checks the machine password against this and nothing else.
+    if let Some(secrets) = machine_secrets {
+        builder = builder.machine_secrets(secrets);
+    }
+    // The DES secure channel, when the deployment asks for it: off unless `smb.netlogon_des` says
+    // otherwise, because that channel's credential is two passes of a 56-bit cipher.
+    builder = builder.netlogon_des(settings.netlogon_des);
 
     // Passwords, when any are configured. Taken from the resolved settings rather than from the
     // environment here, so that a missing variable was already a startup error.

@@ -204,13 +204,44 @@ impl UserAccountControl {
     }
 }
 
+/// Where AD's reading of a standard class differs from X.500's, the AD reading wins.
+///
+/// Measured against the AD schema Microsoft publishes (`MS-AD_Schema_2K8_R2_Classes.txt`, shipped
+/// with Samba's `source4/setup/ad-schema`):
+///
+/// * `person` (2.5.6.6) has `systemMustContain: cn` and `sn` in `systemMayContain`. X.500 requires
+///   both. The difference is not academic: `net ads join` adds the computer account as
+///   `top, person, organizationalPerson, user, computer` and sends no `sn`, so a strict X.500
+///   `person` refuses the one write a join cannot do without, and the client falls back to samr.
+/// * `user` and, through it, `computer` carry the key attributes in an AD domain: the KDC reads
+///   them from the account. `krb5Key` is Heimdal's spelling rather than Microsoft's, and AD allows
+///   `msDS-KeyVersionNumber` and `supplementalCredentials` instead; this server derives `krb5Key`,
+///   so it has to be allowed on the class that holds it, or strict validation refuses an entry the
+///   server itself just made complete.
+const AD_OVERRIDES: &str = "
+# AD's person: `cn` required, `sn` permitted (MS-ADSC `Person`).
+objectclass ( 2.5.6.6 NAME 'person' SUP top STRUCTURAL
+    MUST cn
+    MAY ( sn $ userPassword $ telephoneNumber $ seeAlso $ description $ serialNumber $
+          attributeCertificateAttribute ) )
+
+# AD's user, with the keys this server derives on the same entry.
+objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTURAL
+    MAY ( userPrincipalName $ sAMAccountName $ userAccountControl $ objectGUID $ objectSid $
+          servicePrincipalName $ primaryGroupID $ accountExpires $ pwdLastSet $ mail $
+          displayName $ telephoneNumber $ title $ description $ memberOf $ unicodePwd $
+          supplementalCredentials $ msDS-KeyVersionNumber $ krb5Key $ krb5KeyVersionNumber $
+          krb5PrincipalName $ krb5PrincipalRealm ) )
+";
+
 /// The schema with the AD definitions added.
 ///
 /// Returns the schema unchanged when it cannot parse the extension, and says so: a directory that
 /// silently runs without half its published vocabulary is worse than one that starts with none,
 /// and the definitions above are constants that a test parses on every run.
 pub fn extend(schema: &mut Schema) -> Result<(), String> {
-    schema.extend(AD_EXTENSION).map_err(|err| err.to_string())
+    schema.extend(AD_EXTENSION).map_err(|err| err.to_string())?;
+    schema.replace(AD_OVERRIDES).map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -293,7 +324,15 @@ mod tests {
         // enctypes. If any of these is missing from the schema, the member's single `add` is refused
         // as a whole and the failure reads as a schema complaint rather than as a missing attribute
         // - which is the state this test was written to end.
-        let schema = with_ad();
+        // Both vocabularies, as a server that is a domain controller loads them: the AD one
+        // publishes the classes, the realm one defines the key attributes they now permit.
+        let schema = {
+            #[allow(unused_mut)]
+            let mut schema = with_ad();
+            #[cfg(feature = "kdc")]
+            crate::kerberos::schema::extend(&mut schema).expect("the realm vocabulary parses");
+            schema
+        };
         let entry = crate::model::Entry::new(
             "cn=samba,cn=computers,dc=ad,dc=example,dc=com",
             crate::model::Attributes::new()
@@ -308,7 +347,8 @@ mod tests {
                     ],
                 ))
                 .push(crate::model::Attribute::single("cn", "samba"))
-                .push(crate::model::Attribute::single("sn", "samba"))
+                // No `sn`: `net ads join` does not send one for a computer, and AD's `person`
+                // does not require it (MS-ADSC: `systemMustContain: cn`).
                 .push(crate::model::Attribute::single("sAMAccountName", "samba$"))
                 .push(crate::model::Attribute::single(
                     "dNSHostName",
@@ -330,6 +370,15 @@ mod tests {
                 .push(crate::model::Attribute::single(
                     "msDS-SupportedEncryptionTypes",
                     "24",
+                ))
+                // The keys this server derives from `unicodePwd` in the same change. Without them
+                // the account exists and the KDC answers `S_PRINCIPAL_UNKNOWN` to every request;
+                // with them and no schema allowance, strict validation refuses the whole `add`.
+                .push(crate::model::Attribute::single("krb5Key", "\u{01}"))
+                .push(crate::model::Attribute::single("krb5KeyVersionNumber", "1"))
+                .push(crate::model::Attribute::single(
+                    "msDS-KeyVersionNumber",
+                    "1",
                 )),
         );
 
@@ -429,6 +478,23 @@ mod tests {
         assert_eq!(
             UserAccountControl::parse("512").expect("parsed").refusal(),
             None
+        );
+    }
+
+    /// The other half: an entry that is still wrong is still refused, or the override would be a
+    /// licence to drop every constraint on the class it touched.
+    #[test]
+    fn a_person_without_cn_is_still_refused() {
+        let schema = with_ad();
+        let entry = crate::model::Entry::new(
+            "o=someone,dc=ad,dc=example,dc=com".to_string(),
+            crate::model::Attributes::new()
+                .push(crate::model::Attribute::single("objectClass", "person"))
+                .push(crate::model::Attribute::single("sn", "someone")),
+        );
+        assert!(
+            schema.check(&entry).is_err(),
+            "`cn` is what AD requires of a person"
         );
     }
 }

@@ -10,16 +10,16 @@
 //! agrees with nothing.
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::KdcConfig;
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::{Enctype, OwnCipher};
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::KdcConfig;
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
 
 /// A realm with `krbtgt/REALM` and one user, both keyed with `PASSWORD`.
-fn realm() -> Arc<dyn rust_kdc::hdb::Hdb> {
+fn realm() -> Arc<dyn rrl_kdc::hdb::Hdb> {
     let cipher = OwnCipher;
     let db = MemoryHdb::new();
 
@@ -45,10 +45,10 @@ fn realm() -> Arc<dyn rust_kdc::hdb::Hdb> {
 }
 
 /// The KDC on a loopback port, answering until the test ends.
-fn start() -> rust_kdc::transport::RunningKdc {
+fn start() -> rrl_kdc::transport::RunningKdc {
     let config = KdcConfig::new(REALM).expect("a realm of that name");
-    let kdc = rust_kdc::kdc::Kdc::new(config, realm(), Arc::new(OwnCipher));
-    rust_kdc::transport::serve_loopback(kdc)
+    let kdc = rrl_kdc::kdc::Kdc::new(config, realm(), Arc::new(OwnCipher));
+    rrl_kdc::transport::serve_loopback(kdc)
 }
 
 #[test]

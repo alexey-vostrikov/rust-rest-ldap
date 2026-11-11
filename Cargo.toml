@@ -34,10 +34,20 @@ pbkdf2 = "0.13.0"
 rasn = "0.30.0"
 rasn-ldap = "0.30.0"
 redb = "4.4.0"
+# The crypto layer: the NT hash and, in time, everything else this crate derives. One
+# implementation of a primitive, not one per consumer.
+rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main" }
 # Kerberos for SASL GSSAPI, in pure Rust and with no C: the accept side, the SPNEGO wrapper and the
 # per-message tokens all come from here. It replaces the vendored `rskrb5` and the hand-written
 # framing this crate used to carry.
-krb5 = "1.0"
+#
+# From the fork, because what a domain controller needs is not in the 1.0.0 release: DER and
+# `KerberosTime` come from `rrl-krb` there, so the two sides read the same encoding, and a `Key`
+# wipes its octets when it is dropped. Both are on the branch this points at and neither is on
+# crates.io. `branch` rather than `rev`, for the same reason as the dependencies below: the two
+# crates are developed together and a pinned commit turns every change into a second commit here.
+# Move it back to `krb5 = "1.0"` once those commits are in a release.
+krb5 = { git = "https://github.com/alexey-vostrikov/krb5", branch = "main" }
 roaring = "0.12.0"
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2.2.0"
@@ -70,12 +80,24 @@ yescrypt = "0.1.0"
 #
 # Optional because a directory server that does not issue tickets should not carry a KDC, and
 # `RUST_HEIMDAL_KDC`-free builds stay what they were.
-rust-kdc = { path = "../rust-kdc", optional = true, features = ["hdb-ldap"] }
+#
+# From git, not from a path: a checkout that lives beside this one is a developer's convenience,
+# and a path dependency silently becomes "no such package" on CI and on any machine that clones
+# this repository alone. `branch = "main"` rather than `rev`: the two crates are developed
+# together, and a pinned commit turns every KDC change into a second commit here before anything
+# can be compiled against it. Run `cargo update -p rrl-kdc` to take a newer revision.
+rrl-kdc = { git = "https://github.com/alexey-vostrikov/rrl-kdc", branch = "main", optional = true, features = ["hdb-ldap"] }
 
 # SMB2/3 for `IPC$`, which is where a Samba member's join actually begins: it connects to
 # `\\DC\IPC$` and opens `lsarpc` through it. Without `localfs` - this server serves no files - and
 # with `krb5`, so a machine account can authenticate with the ticket it already has.
-smb-server = { path = "../rust-smb-server", version = "0.9.1", optional = true, default-features = false, features = ["krb5"] }
+#
+# From the fork, on the branch that carries what a join needs: `lsarpc`, `samr` and Kerberos in
+# SESSION_SETUP do not exist in the upstream release, and a path dependency on a sibling checkout
+# resolves to "no such package" on any machine that cloned this repository alone. `branch` rather
+# than `rev` for the same reason as `rrl-kdc` above; `cargo update -p smb-server` takes a newer
+# revision. Move this back to `paltaio/rust-smb-server` once that branch is merged upstream.
+smb-server = { git = "https://github.com/alexey-vostrikov/rrl-smb", branch = "krb5-support", optional = true, default-features = false, features = ["krb5"] }
 
 # Logging. `tracing` without a subscriber records nothing, and the call sites look instrumented
 # either way - which is how a refusal in the RPC dispatcher came to be invisible. The subscriber
@@ -89,12 +111,12 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 
 [features]
 # Port 88: AS-REQ, TGS-REQ, and `krbtgt/<REALM>` provisioned on first start.
-kdc = ["dep:rust-kdc"]
+kdc = ["dep:rrl-kdc"]
 # Port 445 and the `IPC$` share a join talks to.
 smb = ["dep:smb-server"]
 
 [dev-dependencies]
-rust-kdc = { path = "../rust-kdc" }
+rrl-kdc = { git = "https://github.com/alexey-vostrikov/rrl-kdc", branch = "main" }
 futures = "0.3.34"
 rcgen = "0.14.10"
 serde_json = "1.0.154"

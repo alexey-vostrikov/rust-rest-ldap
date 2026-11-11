@@ -32,6 +32,15 @@ use thiserror::Error;
 pub struct Spec {
     dn: String,
     password: Secret,
+    /// The realm, when this directory is a domain controller's directory.
+    ///
+    /// An administrator of a plain directory is a `person` with a password, and nothing else looks
+    /// at it. An administrator of a *domain* is an account the KDC issues tickets for: a client
+    /// asks for `administrator@REALM` by user principal name, the realm finds it by that attribute,
+    /// and the ticket is sealed under keys derived from the password. An entry created as
+    /// `inetOrgPerson` has none of those - the class does not permit `userPrincipalName` at all -
+    /// so the account exists, binds over LDAP, and is invisible to `kinit`.
+    realm: Option<String>,
 }
 
 /// A password that does not print itself.
@@ -56,6 +65,7 @@ impl std::fmt::Debug for Spec {
         f.debug_struct("Spec")
             .field("dn", &self.dn)
             .field("password", &self.password)
+            .field("realm", &self.realm)
             .finish()
     }
 }
@@ -108,7 +118,23 @@ impl Spec {
         Ok(Self {
             dn,
             password: Secret(password.to_string()),
+            realm: None,
         })
+    }
+
+    /// The same administrator, as an account of `realm`.
+    ///
+    /// Called when the directory is a domain controller: the entry becomes a `user` with
+    /// `sAMAccountName`, `userPrincipalName` and the keys the KDC reads, so that
+    /// `kinit <name>@<realm>` finds an account rather than a person.
+    pub fn as_domain_account(mut self, realm: impl Into<String>) -> Self {
+        self.realm = Some(realm.into().to_ascii_uppercase());
+        self
+    }
+
+    /// The realm this administrator belongs to, if it belongs to one.
+    pub fn realm(&self) -> Option<&str> {
+        self.realm.as_deref()
     }
 
     /// The DN the administrator will be created under.
@@ -128,6 +154,13 @@ pub enum Outcome {
 
 #[derive(Debug, Error)]
 pub enum Error {
+    /// The keys of a domain account could not be derived from its password.
+    ///
+    /// Fatal rather than a warning: an administrator that exists without keys is an account no
+    /// client can log in as, and the next thing the operator sees is a login failure that names
+    /// the password instead of the directory.
+    #[error("the keys of the first administrator were not derived: {0}")]
+    Keys(String),
     #[error(
         "the bootstrap administrator has an empty password; a secret that does not load \
          looks exactly like this, and an administrator with no password is worse than none"
@@ -261,15 +294,26 @@ fn entry_for(spec: &Spec, policy: &PasswordPolicy) -> Result<Entry, Error> {
     // needs `uid: root`. Taken rather than assumed, because the default is `cn` but the
     // configured DN need not be.
     let (attribute, value, _) = dn::split_first_rdn(spec.dn());
+    // A domain account is a `user`: AD's `user` (1.2.840.113556.1.5.9) is the class that permits
+    // `userPrincipalName`, `sAMAccountName` and the key attributes, and `inetOrgPerson` permits
+    // none of them. Measured: an administrator created as `inetOrgPerson` bound over LDAP and then
+    // could not be found by `kinit administrator@REALM`, because the realm looks an account up by
+    // the one attribute the class forbade.
+    let classes: Vec<String> = match &spec.realm {
+        Some(_) => vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "user".to_string(),
+        ],
+        None => vec![
+            "top".to_string(),
+            "person".to_string(),
+            "inetOrgPerson".to_string(),
+        ],
+    };
     let mut attributes = Attributes::new()
-        .push(Attribute::new(
-            "objectClass",
-            vec![
-                "top".to_string(),
-                "person".to_string(),
-                "inetOrgPerson".to_string(),
-            ],
-        ))
+        .push(Attribute::new("objectClass", classes))
         .push(Attribute::single(attribute.as_str(), &value))
         // `sn` is mandatory for `person` and there is nothing better to put here than the
         // name from the DN; an administrator is not a person in the directory's own sense.
@@ -280,6 +324,45 @@ fn entry_for(spec: &Spec, policy: &PasswordPolicy) -> Result<Entry, Error> {
                 .sensitive(),
         )
         .push(Attribute::new(ATTR_LDAP_ADMIN, vec!["true".to_string()]).internal());
+
+    if let Some(realm) = &spec.realm {
+        // The three attributes that make the entry an account a client can ask for: the logon name
+        // the SAM and Netlogon paths use, the principal name `kinit` sends, and the flag that says
+        // the account is enabled. 512 is `NORMAL_ACCOUNT`, the value AD gives an account that has
+        // just been created and not disabled.
+        // `krb5PrincipalName` and `krb5PrincipalRealm` are what the realm's own projection reads,
+        // and what puts the entry at the DN a KDC looks up first. Without them the account is
+        // reachable only through the fallback scan, and only for an attribute the client happened
+        // to send: `kinit admin@REALM` found the entry and then failed to read it, which reached
+        // the client as "a service is not available".
+        attributes = attributes
+            .push(Attribute::single("sAMAccountName", &value))
+            .push(Attribute::single(
+                "krb5PrincipalName",
+                &format!("{value}@{realm}"),
+            ))
+            .push(Attribute::single("krb5PrincipalRealm", realm))
+            .push(Attribute::single(
+                "userPrincipalName",
+                &format!("{value}@{realm}"),
+            ))
+            .push(Attribute::single("userAccountControl", "512"));
+
+        // The keys, derived from the same password the hash above came from: without them the
+        // account exists, binds over LDAP, and answers `S_PRINCIPAL_UNKNOWN` to every ticket
+        // request - the KDC has nothing to seal a TGT in.
+        #[cfg(feature = "kdc")]
+        {
+            match crate::kerberos::unicode_pwd::keys_for(spec.password.expose(), &value, realm) {
+                Ok(derived) => {
+                    attributes = crate::kerberos::unicode_pwd::merge_keys(&attributes, &derived);
+                }
+                Err(err) => {
+                    return Err(Error::Keys(err));
+                }
+            }
+        }
+    }
 
     if attribute != "cn" {
         // `person` requires `cn` regardless of what the DN uses, and a schema check in
@@ -469,5 +552,75 @@ mod password_source_tests {
         .expect("read");
 
         assert_eq!(secret.expose(), "from-file");
+    }
+
+    /// The first administrator of a *domain*, which is the account `kinit` has to find.
+    ///
+    /// Measured on the AD-join stand: an administrator created as a `person` bound over LDAP and
+    /// then could not get a ticket at all, because the realm looks an account up by
+    /// `userPrincipalName` and `person`, `organizationalPerson` and `inetOrgPerson` permit no such
+    /// attribute. The account exists, the password is right, and no client can log in with it.
+    #[cfg(feature = "kdc")]
+    #[test]
+    fn a_domain_administrator_is_an_account_the_realm_can_find() {
+        let spec = Spec::new(None, "dc=example,dc=com", "users", "admin-secret")
+            .expect("spec")
+            .as_domain_account("example.com");
+        let policy = crate::password::PasswordPolicy::default();
+        let entry = entry_for(&spec, &policy).expect("entry");
+
+        let classes = entry.object_classes().to_vec();
+        assert!(classes.iter().any(|c| c == "user"), "{classes:?}");
+        assert!(
+            !classes.iter().any(|c| c == "inetOrgPerson"),
+            "`user` is what permits the account attributes; `inetOrgPerson` forbids them: {classes:?}"
+        );
+
+        let attributes = entry.attributes();
+        let value_of = |name: &str| {
+            attributes
+                .get(name)
+                .and_then(|attribute| attribute.values.first().cloned())
+        };
+        assert_eq!(value_of("sAMAccountName").as_deref(), Some("admin"));
+        assert_eq!(
+            value_of("userPrincipalName").as_deref(),
+            Some("admin@EXAMPLE.COM"),
+            "the principal a client asks for, in upper case as the realm spells it"
+        );
+        assert_eq!(value_of("userAccountControl").as_deref(), Some("512"));
+        assert!(
+            attributes.get("krb5Key").is_some(),
+            "an account without keys answers S_PRINCIPAL_UNKNOWN to every ticket request"
+        );
+        assert!(
+            attributes.get("unicodePwd").is_none(),
+            "the password is write-only in AD; storing it makes every search return it"
+        );
+
+        // The whole point: the entry the server creates is one its own schema accepts.
+        let mut schema = crate::schema::Schema::core();
+        crate::ad_schema::extend(&mut schema).expect("ad");
+        crate::kerberos::schema::extend(&mut schema).expect("realm");
+        assert_eq!(
+            schema.check(&entry).err().map(|v| format!("{v:?}")),
+            None,
+            "a domain administrator the server writes must validate under strict checking"
+        );
+    }
+
+    /// A plain directory keeps the administrator it had: no realm, no account attributes.
+    #[test]
+    fn a_plain_administrator_stays_a_person() {
+        let spec = Spec::new(None, "dc=example,dc=com", "users", "admin-secret").expect("spec");
+        let policy = crate::password::PasswordPolicy::default();
+        let entry = entry_for(&spec, &policy).expect("entry");
+        assert!(
+            entry
+                .object_classes()
+                .iter()
+                .any(|class| class == "inetOrgPerson")
+        );
+        assert!(entry.attributes().get("userPrincipalName").is_none());
     }
 }

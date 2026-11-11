@@ -238,7 +238,7 @@ pub fn handle_add(
         let values: Vec<String> = attribute
             .vals
             .iter()
-            .map(|value| String::from_utf8_lossy(value.as_ref()).into_owned())
+            .map(|value| crate::model::value_text(&name, value.as_ref()))
             .collect();
 
         if values.is_empty() {
@@ -299,6 +299,10 @@ pub fn handle_add(
         .map(|identity| identity.dn.clone())
         .unwrap_or_default();
     let stamped = crate::operational::stamp_write(&entry, &actor, std::time::SystemTime::now());
+    // A machine account arrives as one `add` carrying `unicodePwd`; the keys the KDC needs are
+    // derived here rather than left to a second pass, so the entry is complete when it first exists.
+    #[cfg(feature = "kdc")]
+    let stamped = crate::kerberos::unicode_pwd::seal(&stamped, security);
 
     // A group created with members gives each of them a `memberOf`, in the same change set. The
     // members are stamped too: their entry changed, and a change that is not stamped is one a

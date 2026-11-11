@@ -1,27 +1,46 @@
-# The toolchain image this crate builds, tests and measures in: Rust 1.99.1 on Debian 11 (bullseye).
+# The toolchain image these crates build, test and measure in: Rust 1.99.1 on Debian 11 (bullseye).
 #
 # Why a local image rather than a tag. `rust:1.99.1-bullseye` is not published: the official project
 # stopped shipping bullseye variants after 1.90, and the tag that does exist,
 # `rust:1.99.1-bookworm`, carries glibc 2.36. A binary linked there will not start on the stands
-# this server is meant to run on - Debian 11 and Astra Linux both ship glibc 2.31 - so the image
+# these crates are meant to run on - Debian 11 and Astra Linux both ship glibc 2.31 - so the image
 # has to be assembled. Assembling it by hand on one machine and calling it a tag is how a build
-# starts depending on somebody's laptop, so the assembly lives here and `scripts/cargo.sh`
-# builds from this file when the image is absent.
+# starts depending on somebody's laptop, so the assembly lives here and the project's `scripts/`
+# build from this file when the image is absent.
 #
-# The same file, byte for byte, as the one in rust-smb-server: two copies of an assembly that
-# differ are two toolchains, and a build that works in one repository and not the other for a
-# reason nobody can see.
+# THIS FILE IS IDENTICAL, BYTE FOR BYTE, IN EVERY PROJECT THAT SHARES THE IMAGE:
+#
+#   ~/DevOps/rrl-kdc/docker/toolchain.Dockerfile              (rrl-kdc)
+#   ~/DevOps/rrl-crypto/docker/toolchain.Dockerfile           (rrl-crypto)
+#   ~/DevOps/rrl-krb-common/docker/toolchain.Dockerfile       (rrl-krb-common)
+#   ~/DevOps/3part/rrl-krb5/docker/toolchain.Dockerfile       (rrl-krb5)
+#   ~/DevOps/3part/rrl-smb/docker/toolchain.Dockerfile        (rrl-smb, the rust-smb-server fork)
+#   ~/DevOps/3part/rust-rest-ldap/docker/toolchain.Dockerfile (rust-rest-ldap)
+#
+# One image name, so the assembly must be one text: whoever builds first decides what everyone
+# else gets. Two copies that differ are two toolchains and a build that works in one repository
+# and fails in another for a reason nobody can see. Check with
+#
+#   sha256sum ~/DevOps/*/docker/toolchain.Dockerfile ~/DevOps/3part/*/docker/toolchain.Dockerfile
+#
+# and keep the set in step when the file changes here.
 #
 # The toolchain is *copied* out of the official slim-bookworm image rather than installed with
 # rustup: official Rust builds link against glibc 2.17, so a bullseye base runs them unchanged, and
 # the libc that ends up in our binaries comes from the base - 2.31.
 FROM rust:1.99.1-slim-bookworm AS toolchain
 
-# The official slim image ships `cargo` and `rustc` and nothing else; `rustfmt` and `clippy` are
-# rustup components and have to be named. They are added here, in the bookworm stage, because the
-# component tarballs are what get copied and they are libc-agnostic - while any *binary* built here
-# would not be, which is why the measurement tools are built later.
-RUN rustup component add rustfmt clippy
+# The official slim image ships `cargo` and `rustc` and nothing else; `rustfmt`, `clippy` and
+# `llvm-tools-preview` are rustup components and have to be named. They are added here, in the
+# bookworm stage, because the component tarballs are what get copied and they are libc-agnostic -
+# while any *binary* built here would not be, which is why the measurement tools are built later.
+#
+# `llvm-tools-preview` is not an optional extra: `cargo-llvm-cov` only drives the measurement, the
+# work is done by `llvm-profdata` and `llvm-cov`, and those two ship in this component, not in the
+# default toolchain. Without it the plugin stops at `rustup component add llvm-tools-preview` and
+# waits for the network - measured: a coverage run sat at 0% CPU for nine minutes and looked hung.
+# The gate below therefore asserts the binary, not just the plugin.
+RUN rustup component add rustfmt clippy llvm-tools-preview
 
 FROM rust:1.90-bullseye
 
@@ -58,6 +77,10 @@ RUN cargo install cargo-llvm-cov --locked --version 0.6.18 \
 # The mutator. `cargo-mutants` is a Rust binary, so measurement and build stay one image and one
 # compiler - which is the property that makes a mutation score mean anything. Pinned, so a kill
 # count does not move under us.
+#
+# Not the published release binary: it has no musl build, and the gnu one is made on a recent
+# Ubuntu and requires GLIBC_2.39 - measured with `objdump -T`. Built from source here, it lands at
+# GLIBC_2.30, the same floor as the crates themselves.
 RUN cargo install cargo-mutants --locked --version 27.1.0 \
  && cargo mutants --version
 
@@ -75,5 +98,11 @@ RUN cargo install cargo-dupes --locked --version 0.2.1 \
  && cargo dupes --version
 
 # The gates assert their tools exist rather than discovering at report time that `rustfmt` was
-# missing and the check silently did nothing.
+# missing and the check silently did nothing. `cargo llvm-cov --version` only proves the plugin is
+# installed; the measurement itself needs `llvm-cov` from the toolchain, so that file is asserted
+# too - otherwise the absence shows up as a coverage run waiting on the network.
 RUN rustc --version && cargo --version && rustfmt --version && cargo clippy --version
+RUN cargo llvm-cov --version && cargo mutants --version && cargo crap --version && cargo dupes --version \
+ && llvm_cov="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-cov" \
+ && test -x "$llvm_cov" \
+ && echo "llvm-cov: $llvm_cov"

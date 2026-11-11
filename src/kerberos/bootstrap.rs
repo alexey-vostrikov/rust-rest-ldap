@@ -23,10 +23,10 @@
 
 use std::path::Path;
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
-use rust_kdc::hdb::HdbEntry;
-use rust_kdc::hdb::ldap::{attrs, dn_for, to_attributes};
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::{Enctype, OwnCipher};
+use rrl_kdc::hdb::HdbEntry;
+use rrl_kdc::hdb::ldap::{attrs, dn_for, to_attributes};
+use rrl_kdc::name::Principal;
 
 use crate::backend::EntryChange;
 use crate::model::{Attribute, AttributeFlags, Attributes, Entry};
@@ -114,6 +114,102 @@ pub async fn ensure_krbtgt(
     Ok(Outcome::Created { dn })
 }
 
+/// Gives the realm a principal for every service the keytab holds, so that it can issue tickets
+/// for them.
+///
+/// A keytab says which keys a service holds; it says nothing to the realm, which learns a principal
+/// by reading the directory. Measured on the AD-join stand: the SMB acceptor held `cifs/samba.…`
+/// in its keytab and the KDC had no such principal, so a client asking for a `cifs/` ticket got
+/// `KDC_ERR_S_PRINCIPAL_UNKNOWN` and reached the share as `NT_STATUS_LOGON_FAILURE` - a message
+/// about a password, for a problem about a missing entry.
+///
+/// One entry per principal the keytab names, each carrying the keys the keytab holds and the
+/// service principal name a client asks for. The realm then issues a ticket sealed in a key the
+/// service can decrypt, which is the whole contract between the two.
+///
+/// `krbtgt` is skipped: it has its own provisioning, with the master password, and a keytab that
+/// happens to hold one must not overwrite it with a different key.
+pub async fn ensure_keytab_principals(
+    source: &Source,
+    realm: &str,
+    base_dn: &str,
+    keytab: &Path,
+) -> Result<Vec<String>, String> {
+    use rrl_kdc::crypto::{Enctype, Key};
+
+    let keytab = krb5::Keytab::load(keytab)
+        .map_err(|err| format!("keytab '{}': {err}", keytab.display()))?;
+
+    // Grouped by principal: a keytab holds one line per enctype, and a principal is one entry with
+    // all of its keys.
+    let mut principals: std::collections::BTreeMap<String, Vec<(Enctype, Vec<u8>, u32)>> =
+        std::collections::BTreeMap::new();
+    for key in keytab.keys() {
+        if !key.realm.eq_ignore_ascii_case(realm) {
+            continue;
+        }
+        if key.principal.starts_with("krbtgt/") || key.principal == "krbtgt" {
+            continue;
+        }
+        // Only service principals, which are the ones a keytab exists to describe. A name without
+        // a slash is an *account* - `HOST$`, `alice` - and its keys belong to the entry the account
+        // already lives in: a client that joins creates `cn=host,cn=computers,…` with a password of
+        // its own, and a second entry at the canonical DN would shadow it. Measured: `kinit HOST$`
+        // resolved to the keytab's entry and answered `KDC_ERR_POLICY`, because that entry is a
+        // service and not a client, while the account the join had just created went unread.
+        if !key.principal.contains('/') {
+            continue;
+        }
+        let Some(enctype) = Enctype::from_id(key.enctype as i32) else {
+            continue;
+        };
+        principals.entry(key.principal.clone()).or_default().push((
+            enctype,
+            key.key.clone(),
+            key.kvno,
+        ));
+    }
+
+    let mut written = Vec::new();
+    let mut changes = Vec::new();
+    for (name, keys) in principals {
+        let principal = match Principal::parse(&format!("{name}@{realm}")) {
+            Ok(principal) => principal,
+            Err(err) => {
+                return Err(format!(
+                    "keytab names '{name}', which is not a principal: {err}"
+                ));
+            }
+        };
+        // An entry already present is left alone: it may have been given a password of its own
+        // through LDAP, and overwriting its keys from a file somebody copied in months ago is a
+        // change no client asked for.
+        let dn = dn_for(&principal, base_dn);
+        if source.directory().await.find(&dn).is_some() {
+            continue;
+        }
+
+        let mut entry = HdbEntry::service(principal);
+        for (enctype, bytes, kvno) in keys {
+            let key = Key::new(enctype, bytes)
+                .map_err(|err| format!("{name}: a key the keytab holds does not parse: {err}"))?;
+            entry.add_key(key, kvno, None);
+        }
+        changes.push(EntryChange::Upsert {
+            entry: Entry::new(dn.clone(), attributes_of(&entry)),
+        });
+        written.push(dn);
+    }
+
+    if !changes.is_empty() {
+        source
+            .apply(&changes)
+            .await
+            .map_err(|err| format!("writing the realm's service principals: {err}"))?;
+    }
+    Ok(written)
+}
+
 /// The realm's attributes in this server's spelling.
 ///
 /// The one disagreement between the two is how octets sit in a string-valued store, and base64 is
@@ -123,7 +219,7 @@ pub fn attributes_of(entry: &HdbEntry) -> Attributes {
     to_directory_attributes(&to_attributes(entry))
 }
 
-fn to_directory_attributes(attributes: &rust_kdc::hdb::ldap::Attributes) -> Attributes {
+fn to_directory_attributes(attributes: &rrl_kdc::hdb::ldap::Attributes) -> Attributes {
     use base64::Engine as _;
 
     let mut out = Attributes::new();

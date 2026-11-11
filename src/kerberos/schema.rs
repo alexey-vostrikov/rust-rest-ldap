@@ -100,9 +100,13 @@ attributetype ( 1.2.840.113556.1.4.750.1 NAME 'supplementalCredentials'
     EQUALITY octetStringMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
 
-attributetype ( 1.2.840.113556.1.4.890 NAME 'msDS-SupportedEncryptionTypes'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+# `msDS-SupportedEncryptionTypes` is declared by the AD vocabulary (`ad_schema`, under AD's real
+# OID 1.2.840.113556.1.4.1963), and it was also declared here under the wrong OID
+# 1.2.840.113556.1.4.890. Two declarations of one name are refused at load - "name
+# 'msds-supportedencryptiontypes' is defined twice" - which is exactly the configuration a domain
+# controller runs (realm vocabulary and AD vocabulary together), so the duplication made that
+# configuration unstartable. The class below still names the attribute; a `MAY` that refers to
+# another document's definition is normal, and the AD vocabulary is always loaded with this one.
 
 # --- classes -------------------------------------------------------------------------------
 #
