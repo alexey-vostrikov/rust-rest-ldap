@@ -740,6 +740,17 @@ impl Directory {
         }
 
         self.ids = ids;
+        // The DN map is rebuilt, not left as `assemble` wrote it: that one numbered the ids
+        // `0..n`, which is a position and not an id, and the snapshot's numbering is neither. A map
+        // that still says `host/host@REALM → 8` where 8 now belongs to another principal answers a
+        // lookup for one entry with the record of another - a bind against the wrong account, not a
+        // miss. The check above already walked the pairs, so this is the same pass kept.
+        self.by_dn = self
+            .entries
+            .iter()
+            .zip(self.ids.iter())
+            .map(|(entry, id)| (crate::dn::normalize(entry.dn()), *id))
+            .collect();
         self.next_id = next_id.max(self.ids.iter().copied().max().unwrap_or(0) + 1);
         // The check above needed positions; the field is filled lazily, so the map just built is
         // dropped rather than stored. One pass over the ids on the next read is cheaper than keeping
@@ -838,15 +849,18 @@ impl Directory {
         };
 
         // A skeleton: the identity is here, the attributes are a read away - read under the DN the
-        // store knows, which is the one `find` resolved to. Filed afterwards, because this is the
-        // path a bind takes on every request: one account, read over and over.
-        if let Some(cached) = self.cache.as_ref().and_then(|slot| slot.0.get(&resolved)) {
+        // store knows, which is the one the skeleton carries: `dn::normalize` lower-cases the value,
+        // and a principal `host/HOST@AD.EXAMPLE.COM` is then a name the store has never heard of.
+        // Filed afterwards, because this is the path a bind takes on every request: one account,
+        // read over and over.
+        let stored = self.entries[position].dn().to_string();
+        if let Some(cached) = self.cache.as_ref().and_then(|slot| slot.0.get(&stored)) {
             return Some(std::borrow::Cow::Owned((*cached).clone()));
         }
 
-        let entry = source.get(&resolved)?;
+        let entry = source.get(&stored)?;
         if let Some(cache) = self.cache.as_ref() {
-            cache.0.insert(&resolved, entry.clone());
+            cache.0.insert(&stored, entry.clone());
         }
         Some(std::borrow::Cow::Owned(entry))
     }
@@ -2027,5 +2041,90 @@ mod tests {
                 .find("cn=unrelated,ou=people,dc=example,dc=com")
                 .is_some()
         );
+    }
+
+    /// A store keyed by the DN exactly as written, as the redb backend is.
+    ///
+    /// Deliberately not `CountingSource`, which normalizes: the defect this covers is a DN map left
+    /// on the wrong numbers, and a source that lower-cases its key hides half of it.
+    struct ExactSource(std::collections::HashMap<String, Entry>);
+
+    impl crate::directory::EntrySource for ExactSource {
+        fn get(&self, dn: &str) -> Option<Entry> {
+            self.0.get(dn).cloned()
+        }
+    }
+
+    /// A restart answers a DN with that entry's record, not a neighbour's.
+    ///
+    /// The start path numbers entries from the snapshot, and those ids are not the positions
+    /// `assemble` writes before the snapshot's numbers arrive. A DN map left on the old numbers
+    /// points an id at a position that now holds another entry, and every read by DN - a bind, the
+    /// KDC's own lookup - answers with somebody else's record. Measured on the AD-join stand: after
+    /// a restart `kinit` said "Client not found" for every principal, and `krbtgt` resolved to
+    /// `host/samba.ad.example.com`.
+    #[test]
+    fn a_restart_answers_a_dn_with_its_own_record() {
+        // Capitals in the value, because that is what a realm's principals look like and what the
+        // normalized key and the stored key disagree about.
+        let dns = [
+            "krb5PrincipalName=krbtgt/EXAMPLE.COM@EXAMPLE.COM,krb5RealmName=EXAMPLE.COM,dc=example,dc=com",
+            "krb5PrincipalName=host/HOST@EXAMPLE.COM,krb5RealmName=EXAMPLE.COM,dc=example,dc=com",
+            "krb5PrincipalName=ldap/HOST@EXAMPLE.COM,krb5RealmName=EXAMPLE.COM,dc=example,dc=com",
+            ADMIN_DN,
+        ];
+        let skeletons: Vec<(String, crate::model::Attributes)> = dns
+            .iter()
+            .map(|dn| {
+                (
+                    dn.to_string(),
+                    crate::model::Attributes::new()
+                        .push(crate::model::Attribute::single("objectClass", "top")),
+                )
+            })
+            .collect();
+        // The containers come from `from_entries`, and the numbering has to cover every entry the
+        // directory ends up holding - a snapshot that lost one is refused, and rightly.
+        let all: Vec<String> = [
+            BASE.to_string(),
+            "ou=users,dc=example,dc=com".to_string(),
+            "ou=groups,dc=example,dc=com".to_string(),
+        ]
+        .into_iter()
+        .chain(dns.iter().map(|dn| dn.to_string()))
+        .collect();
+        // Numbers that are neither the positions nor in the same order, which is what a snapshot
+        // carries after entries have been added and removed.
+        let numbering: std::collections::HashMap<String, u32> = all
+            .iter()
+            .enumerate()
+            .map(|(position, dn)| (dn.clone(), 1000 - position as u32))
+            .collect();
+        let store: std::collections::HashMap<String, Entry> = all
+            .iter()
+            .map(|dn| {
+                (
+                    dn.clone(),
+                    Entry::new(dn.clone(), crate::model::Attributes::new()),
+                )
+            })
+            .collect();
+
+        let directory = Directory::from_skeletons(
+            BASE,
+            "users",
+            "groups",
+            skeletons,
+            crate::index::Index::default(),
+            &numbering,
+            2000,
+        )
+        .expect("the numbering covers every entry")
+        .with_source(std::sync::Arc::new(ExactSource(store)));
+
+        for dn in dns {
+            let record = directory.record(dn).expect("the store holds this DN");
+            assert_eq!(record.dn(), dn, "the record under this DN is its own");
+        }
     }
 }
