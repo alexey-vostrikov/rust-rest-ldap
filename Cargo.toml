@@ -30,6 +30,9 @@ humantime = "2.4.0"
 # `src/index_file.rs`. Everything else - protocol parsing, TLS, HTTP, storage - is safe code.
 memmap2 = "0.9"
 md-5 = "0.11.0"
+# The NT hash of an account's password: MD4 over its UTF-16LE form, which is the value a secure
+# channel is checked against and the only form of the password a directory keeps.
+md4 = "0.10"
 pbkdf2 = "0.13.0"
 rasn = "0.30.0"
 rasn-ldap = "0.30.0"

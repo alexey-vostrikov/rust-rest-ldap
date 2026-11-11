@@ -730,6 +730,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
+name = "des"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "916a94e407b54f9034d71dd748234cd1e516ced6284009906ae246f177eafe5a"
+dependencies = [
+ "cipher 0.5.2",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -859,7 +868,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1965,7 +1974,7 @@ dependencies = [
 [[package]]
 name = "rrl-kdc"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-kdc?branch=main#bbf0f7298670afdfc5db5daf67a2a7bfc330d961"
+source = "git+https://github.com/alexey-vostrikov/rrl-kdc?branch=main#7bbd41a9a5d4cb9c3049b6118b808265140443d2"
 dependencies = [
  "hmac 0.13.0",
  "rrl-crypto",
@@ -2026,6 +2035,7 @@ dependencies = [
  "hyper-util",
  "krb5",
  "md-5 0.11.0",
+ "md4",
  "memmap2",
  "pbkdf2",
  "rasn",
@@ -2086,7 +2096,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2383,7 +2393,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 [[package]]
 name = "smb-server"
 version = "0.9.1"
-source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#6ca169747fbbf594abcae9ea6ad534e5df0d1c32"
+source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#0c23b0bce2f82fb4219ed603955aa4f632119c12"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -2392,6 +2402,7 @@ dependencies = [
  "bytes",
  "ccm",
  "cmac",
+ "des",
  "getrandom 0.4.3",
  "hmac 0.12.1",
  "krb5",
@@ -2521,7 +2532,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

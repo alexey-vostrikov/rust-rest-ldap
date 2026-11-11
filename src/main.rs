@@ -921,7 +921,32 @@ async fn serve() {
                 {
                     settings.domain_netbios = Some(first.to_ascii_uppercase());
                 }
-                match rust_rest_ldap::smb::serve::start(&settings).await {
+                // The machine accounts, for the secure channel a join establishes last. A live
+                // view and not a snapshot: the account is created and used a moment later.
+                #[cfg(feature = "kdc")]
+                let machine_secrets: Option<
+                    std::sync::Arc<dyn smb_server::MachineSecrets>,
+                > = if config.kerberos.enabled {
+                    let secrets = std::sync::Arc::new(
+                        rust_rest_ldap::kerberos::secrets::DirectorySecrets::new(
+                            source.directory().await,
+                        ),
+                    );
+                    let _follow = rust_rest_ldap::kerberos::secrets::DirectorySecrets::follow(
+                        std::sync::Arc::clone(&secrets),
+                        std::sync::Arc::clone(&source),
+                        shutdown_rx.clone(),
+                    );
+                    Some(secrets)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "kdc"))]
+                let machine_secrets: Option<
+                    std::sync::Arc<dyn smb_server::MachineSecrets>,
+                > = None;
+
+                match rust_rest_ldap::smb::serve::start(&settings, machine_secrets).await {
                     Ok(running) => {
                         println!(
                             "smb: serving IPC$ as {} on {}",

@@ -20,7 +20,7 @@
 //! hash this server computes and stores is a hash it must also be able to verify with the same
 //! algorithm, and the two halves belong to one task (RRL-2.23) rather than to half of it.
 
-use crate::model::Attributes;
+use crate::model::{Attribute, Attributes};
 
 /// The attribute a client writes a password into.
 pub const UNICODE_PWD: &str = "unicodePwd";
@@ -130,7 +130,23 @@ fn derive(password: &str, principal: &str, realm: &str) -> Result<Attributes, St
         entry.add_key(key, 1, Some(salt.as_bytes().to_vec()));
     }
 
-    let derived = crate::kerberos::bootstrap::attributes_of(&entry);
+    // One blob, carrying the Kerberos keys and the NT hash side by side: `supplementalCredentials`
+    // is one attribute, and a second write would replace the first - which is the blob the KDC
+    // reads. The hash is what a secure channel is checked against; the keys are what a ticket is
+    // sealed in, and a machine account needs both.
+    let nt_hash = nt_hash(password);
+    let mut derived = crate::kerberos::bootstrap::attributes_of(&entry);
+    // Base64 because the store is text and the blob is octets: the same spelling `krb5Key` uses,
+    // and the one `to_realm_attributes` decodes.
+    let blob = rrl_kdc::hdb::ad_blob::supplemental_credentials_with_nt(&entry, &nt_hash);
+    let text = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    };
+    derived = derived.replace(Attribute::new(
+        rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS,
+        vec![text],
+    ));
     // Only what the KDC reads from a stored account: the principal name is the entry's own
     // (`sAMAccountName`, `userPrincipalName`), not a second one written over it.
     let mut out = Attributes::new();
@@ -153,6 +169,23 @@ fn ad_salt(realm: &str, account: &str) -> String {
         "host",
         account.trim_end_matches('$').to_ascii_lowercase()
     )
+}
+
+/// The account's NT hash: MD4 over the password as UTF-16LE, little endian (MS-NLMP 3.3.1).
+///
+/// This is the value a logon is checked against, and the one `netr_ServerAuthenticate3` derives its
+/// session key from. AD keeps it in `supplementalCredentials` under `Primary:NT`, in the
+/// hexadecimal text of the sixteen octets.
+pub fn nt_hash(password: &str) -> [u8; 16] {
+    use md4::{Digest, Md4};
+    let mut hasher = Md4::new();
+    for unit in password.encode_utf16() {
+        hasher.update(unit.to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest);
+    out
 }
 
 /// The derived attributes that belong on an account entry.
