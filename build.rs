@@ -14,8 +14,14 @@
 use std::process::Command;
 
 fn main() {
+    // What `describe` reads. Naming `.git/refs` alone is not enough: a tag is written *inside*
+    // `.git/refs/tags`, which leaves the parent directory's mtime untouched, so cargo would keep the
+    // previous answer and the published version would name a build that no longer exists. Measured:
+    // the tag was created, git reported `tags/0.0.1`, and the server still answered `heads/main`.
     println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
+    println!("cargo:rerun-if-changed=.git/refs/heads");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
     println!("cargo:rerun-if-env-changed=RRL_BUILD_TAG");
 
     // An explicit override, for a build that knows its own release name.
