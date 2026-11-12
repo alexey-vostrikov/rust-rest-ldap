@@ -102,7 +102,12 @@ impl DirectorySecrets {
 impl smb_server::MachineSecrets for DirectorySecrets {
     fn machine(&self, account: &str) -> Option<MachineAccount> {
         let directory = self.current();
-        let entry = directory.all().iter().find(|entry| {
+        // Read through `record`, not through the snapshot: a snapshot taken by a start holds
+        // *skeletons* - DN and indexed attributes, with the record a read away - so a scan over
+        // `all()` sees an empty attribute list for every account that existed before the restart.
+        // Measured on the AD-join stand: `machine()` answered "no such account" for a machine that
+        // was in the directory, and the secure channel was refused with `NO_SUCH_USER`.
+        let entry = first_complete(&directory, |entry| {
             entry
                 .attributes()
                 .get("sAMAccountName")
@@ -112,9 +117,7 @@ impl smb_server::MachineSecrets for DirectorySecrets {
                         .iter()
                         .any(|value| value.eq_ignore_ascii_case(account))
                 })
-        });
-
-        let entry = entry?;
+        })?;
 
         let nt_hash = nt_hash_of(entry.attributes())?;
         if std::env::var_os("RRD_PW_DIAG").is_some() {
@@ -144,7 +147,10 @@ impl smb_server::MachineSecrets for DirectorySecrets {
 impl smb_server::LogonUsers for DirectorySecrets {
     fn user(&self, account: &str) -> Option<smb_server::UserCreds> {
         let directory = self.current();
-        let entry = directory.all().iter().find(|entry| {
+        // The same skeleton rule as `machine`: a scan must read records, or every account that
+        // existed before the restart looks like an entry with no attributes - which measured as
+        // "not in the directory" for an account `ldapsearch` found without trouble.
+        let entry = first_complete(&directory, |entry| {
             ["sAMAccountName", "userPrincipalName"].iter().any(|name| {
                 entry.attributes().get(name).is_some_and(|attribute| {
                     attribute
@@ -175,6 +181,31 @@ impl smb_server::LogonUsers for DirectorySecrets {
         let nt_hash = nt_hash_of(entry.attributes())?;
         Some(smb_server::UserCreds { nt_hash })
     }
+}
+
+/// The first entry whose *complete* record matches, read one entry at a time.
+///
+/// A snapshot a start loaded from the stored index holds skeletons: the DN and the indexed
+/// attributes, with the record itself a read away. `all()` therefore answers with empty attribute
+/// lists for every entry that existed before the restart, and a scan that matches against them finds
+/// nothing - measured on the AD-join stand, where `ldapsearch` showed the account and this scan said
+/// it was not in the directory.
+///
+/// The cost is one store read per candidate, which is what a *lookup* costs and not what a search
+/// costs: these are called once per logon, not once per entry of an answer.
+fn first_complete(
+    directory: &crate::directory::Directory,
+    matches: impl Fn(&crate::model::Entry) -> bool,
+) -> Option<crate::model::Entry> {
+    for identity in directory.all() {
+        let Some(record) = directory.record(identity.dn()) else {
+            continue;
+        };
+        if matches(&record) {
+            return Some(record.into_owned());
+        }
+    }
+    None
 }
 
 /// The NT hash `supplementalCredentials` holds, or `None` when the account has none.
@@ -381,5 +412,80 @@ mod tests {
     fn a_domain_account_without_a_hash_is_not_answered_for() {
         let secrets = with(vec![person("nokey", "512", None)]);
         assert!(smb_server::LogonUsers::user(&secrets, "nokey").is_none());
+    }
+
+    /// A store keyed by the DN exactly as written, as the redb backend is.
+    struct Store(std::collections::HashMap<String, Entry>);
+
+    impl crate::directory::EntrySource for Store {
+        fn get(&self, dn: &str) -> Option<Entry> {
+            self.0.get(dn).cloned()
+        }
+    }
+
+    /// The snapshot a restart builds answers with skeletons, and both lookups must read past them.
+    ///
+    /// Measured on the AD-join stand: after a restart `ldapsearch` showed the account, and this
+    /// module answered "not in the directory" for it, because `all()` hands out DNs with empty
+    /// attribute lists. The same shape broke `machine()` for every machine account that existed
+    /// before the restart - accounts created while running are inserted whole, so the join's own
+    /// machine account never showed it.
+    #[test]
+    fn a_restart_reads_the_record_behind_a_skeleton() {
+        let admin = person("admin", "512", Some([0x42; 16]));
+        let machine = machine(Some(&[0x11; 16]), Some(&sid_with_rid(1105)));
+
+        // The containers `from_entries` adds, plus both accounts - the numbering has to cover every
+        // entry or the snapshot is refused, and rightly.
+        let all: Vec<String> = [
+            "dc=example,dc=com".to_string(),
+            "ou=users,dc=example,dc=com".to_string(),
+            "ou=groups,dc=example,dc=com".to_string(),
+            admin.dn().to_string(),
+            machine.dn().to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let skeletons: Vec<(String, crate::model::Attributes)> = all
+            .iter()
+            .map(|dn| (dn.clone(), crate::model::Attributes::new()))
+            .collect();
+        let numbering: std::collections::HashMap<String, u32> = all
+            .iter()
+            .enumerate()
+            .map(|(position, dn)| (dn.clone(), 500 - position as u32))
+            .collect();
+        let store: std::collections::HashMap<String, Entry> = [
+            (admin.dn().to_string(), admin),
+            (machine.dn().to_string(), machine),
+        ]
+        .into_iter()
+        .collect();
+
+        let directory = crate::directory::Directory::from_skeletons(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            skeletons,
+            crate::index::Index::default(),
+            &numbering,
+            900,
+        )
+        .expect("the numbering covers every entry")
+        .with_source(Arc::new(Store(store)));
+
+        let secrets = DirectorySecrets::new(Arc::new(directory));
+        assert_eq!(
+            smb_server::LogonUsers::user(&secrets, "admin")
+                .expect("the directory holds it")
+                .nt_hash,
+            [0x42; 16]
+        );
+        assert_eq!(
+            smb_server::MachineSecrets::machine(&secrets, "SAMBA$")
+                .expect("the directory holds it")
+                .rid,
+            1105
+        );
     }
 }
