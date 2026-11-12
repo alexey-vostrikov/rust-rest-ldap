@@ -310,6 +310,17 @@ mod tests {
                 .collect::<Vec<u8>>(),
         )
         .expect("a hash");
+        let mut holder = rrl_kdc::hdb::HdbEntry::user(
+            rrl_kdc::name::Principal::parse("admin@EXAMPLE.COM").expect("a name"),
+        );
+        holder.kvno = 1;
+        holder.keys.push(rrl_kdc::hdb::HdbKey {
+            kvno: 1,
+            key: rrl_kdc::crypto::Key::new(rrl_kdc::crypto::Enctype::Rc4Hmac, nt.to_vec())
+                .expect("sixteen octets"),
+            salt: None,
+            mkvno: None,
+        });
         let attributes = crate::model::Attributes::new()
             .push(Attribute::single("sAMAccountName", ACCOUNT))
             .push(Attribute::single("cn", ACCOUNT))
@@ -317,14 +328,8 @@ mod tests {
             .push(Attribute::single("userAccountControl", "512"))
             .push(Attribute::single(
                 rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS,
-                &base64::engine::general_purpose::STANDARD.encode(
-                    rrl_kdc::hdb::ad_blob::supplemental_credentials_with_nt(
-                        &rrl_kdc::hdb::HdbEntry::user(
-                            rrl_kdc::name::Principal::parse("admin@EXAMPLE.COM").expect("a name"),
-                        ),
-                        &nt,
-                    ),
-                ),
+                &base64::engine::general_purpose::STANDARD
+                    .encode(rrl_kdc::hdb::ad_blob::supplemental_credentials(&holder)),
             ));
         Directory::from_entries(
             "dc=example,dc=com",

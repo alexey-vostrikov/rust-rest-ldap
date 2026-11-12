@@ -215,7 +215,18 @@ fn derive(
     let mut derived = crate::kerberos::bootstrap::attributes_of(&entry);
     // Base64 because the store is text and the blob is octets: the same spelling `krb5Key` uses,
     // and the one `to_realm_attributes` decodes.
-    let blob = rrl_kdc::hdb::ad_blob::supplemental_credentials_with_nt(&entry, &nt_hash);
+    // The NT hash is the entry's RC4 key, and `supplementalCredentials` takes it from there: one blob
+    // carrying the Kerberos keys and the hash side by side, because the attribute is one and a second
+    // write would replace the first.
+    if let Ok(key) = rrl_kdc::crypto::Key::new(Enctype::Rc4Hmac, nt_hash.to_vec()) {
+        entry.keys.push(rrl_kdc::hdb::HdbKey {
+            kvno: 1,
+            key,
+            salt: None,
+            mkvno: None,
+        });
+    }
+    let blob = rrl_kdc::hdb::ad_blob::supplemental_credentials(&entry);
     let text = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(&blob)

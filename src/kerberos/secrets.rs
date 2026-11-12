@@ -234,7 +234,13 @@ fn nt_hash_of(attributes: &crate::model::Attributes) -> Option<[u8; 16]> {
             .decode(encoded.trim())
             .ok()?
     };
-    let hash = rrl_kdc::hdb::ad_blob::nt_hash(&blob).ok()?;
+    // The NT hash is the RC4 key: `supplementalCredentials` holds it as a `rc4-hmac` credential, and
+    // that is the only place a Windows logon's NT proof string can be checked against.
+    let credentials = rrl_kdc::hdb::ad_blob::credentials(&blob).ok()?;
+    let hash = credentials
+        .into_iter()
+        .find(|credential| credential.enctype == rrl_kdc::crypto::Enctype::Rc4Hmac)?
+        .key;
     hash.try_into().ok()
 }
 
@@ -278,17 +284,24 @@ mod tests {
         }
         if let Some(hash) = hash {
             let hash: [u8; 16] = hash.try_into().expect("sixteen octets");
+            // The NT hash is the entry's `rc4-hmac` key, so the blob is built from an entry that has
+            // one: that is what `supplementalCredentials` holds in AD, and what `nt_hash_of` reads back.
+            let mut holder = rrl_kdc::hdb::HdbEntry::user(
+                rrl_kdc::name::Principal::parse("SAMBA$@EXAMPLE.COM").expect("a name"),
+            );
+            holder.kvno = 1;
+            holder.keys.push(rrl_kdc::hdb::HdbKey {
+                kvno: 1,
+                key: rrl_kdc::crypto::Key::new(rrl_kdc::crypto::Enctype::Rc4Hmac, hash.to_vec())
+                    .expect("sixteen octets"),
+                salt: None,
+                mkvno: None,
+            });
             use base64::Engine as _;
             attributes = attributes.push(Attribute::single(
                 rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS,
-                &base64::engine::general_purpose::STANDARD.encode(
-                    rrl_kdc::hdb::ad_blob::supplemental_credentials_with_nt(
-                        &rrl_kdc::hdb::HdbEntry::user(
-                            rrl_kdc::name::Principal::parse("SAMBA$@EXAMPLE.COM").expect("a name"),
-                        ),
-                        &hash,
-                    ),
-                ),
+                &base64::engine::general_purpose::STANDARD
+                    .encode(rrl_kdc::hdb::ad_blob::supplemental_credentials(&holder)),
             ));
         }
         Entry::new("cn=samba,cn=computers,dc=example,dc=com", attributes)
@@ -363,17 +376,21 @@ mod tests {
             .push(Attribute::single("objectClass", "user"))
             .push(Attribute::single("userAccountControl", flags));
         if let Some(hash) = hash {
+            let mut holder = rrl_kdc::hdb::HdbEntry::user(
+                rrl_kdc::name::Principal::parse(&format!("{name}@EXAMPLE.COM")).expect("a name"),
+            );
+            holder.kvno = 1;
+            holder.keys.push(rrl_kdc::hdb::HdbKey {
+                kvno: 1,
+                key: rrl_kdc::crypto::Key::new(rrl_kdc::crypto::Enctype::Rc4Hmac, hash.to_vec())
+                    .expect("sixteen octets"),
+                salt: None,
+                mkvno: None,
+            });
             attributes = attributes.push(Attribute::single(
                 rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS,
-                &base64::engine::general_purpose::STANDARD.encode(
-                    rrl_kdc::hdb::ad_blob::supplemental_credentials_with_nt(
-                        &rrl_kdc::hdb::HdbEntry::user(
-                            rrl_kdc::name::Principal::parse(&format!("{name}@EXAMPLE.COM"))
-                                .expect("a name"),
-                        ),
-                        &hash,
-                    ),
-                ),
+                &base64::engine::general_purpose::STANDARD
+                    .encode(rrl_kdc::hdb::ad_blob::supplemental_credentials(&holder)),
             ));
         }
         Entry::new(format!("cn={name},ou=users,dc=example,dc=com"), attributes)
