@@ -341,6 +341,19 @@ impl std::fmt::Display for SaslError {
     }
 }
 
+/// Whether this bind begins an exchange rather than continuing one.
+///
+/// Three things can be in flight, and each of them means "not fresh": a libsasl exchange (`sasl`), an
+/// SPNEGO offer the server has sent, and an NTLM challenge. The last one is easy to forget because it
+/// keeps no `Exchange` - there is no ticket - and forgetting it wipes the challenge on the very round
+/// that has to check the answer against it. Measured on the AD-join stand: the client's answer was
+/// refused as arriving "with no challenge outstanding".
+fn starts_fresh(session: &Session) -> bool {
+    session.sasl_stage().is_none()
+        && !session.spnego_offered()
+        && session.ntlm_challenge().is_none()
+}
+
 /// Handles one round of a GSSAPI bind.
 ///
 /// Returns the response and, once the conversation has succeeded, leaves the identity on the
@@ -399,7 +412,10 @@ pub fn handle_gssapi(
 
     // A fresh SASL bind starts by making the connection anonymous, per RFC 4513 - but only a
     // fresh one: the rounds of an exchange in progress must not clear what they depend on.
-    if session.sasl_stage().is_none() && !session.spnego_offered() {
+    // An NTLM challenge in flight is a conversation too: it has no `Exchange` because there is no
+    // ticket, so without naming it here every round would wipe the challenge it is meant to check -
+    // measured, and it looked like the client sending an answer nobody had asked for.
+    if starts_fresh(session) {
         session.reset();
     }
 
@@ -409,10 +425,21 @@ pub fn handle_gssapi(
     // stand: `Add-Computer` sends exactly this and nothing else.
     #[cfg(feature = "smb")]
     let ntlm = super::ntlm_bind::is_ntlm(&token);
+    // A four-octet token after a completed NTLM bind is RFC 4752's layer choice, not an LDAP message:
+    // it arrives before any request and would otherwise be refused as a malformed one.
+    #[cfg(feature = "smb")]
+    let ntlm_layer = token.len() == 4 && session.ntlm_negotiate().is_some();
     #[cfg(not(feature = "smb"))]
     let ntlm = false;
 
-    let outcome = if ntlm {
+    let outcome = if ntlm_layer {
+        #[cfg(feature = "smb")]
+        {
+            super::ntlm_bind::layer_round(session, &token)
+        }
+        #[cfg(not(feature = "smb"))]
+        unreachable!("`ntlm_layer` is a constant false without the smb feature")
+    } else if ntlm {
         #[cfg(feature = "smb")]
         {
             super::ntlm_bind::step(session, directory, &token, security)
@@ -2253,5 +2280,31 @@ mod tests {
         let mut token = vec![0u8; len];
         wire.read_exact(&mut token).await.expect("the token");
         assert_eq!(&token[..2], &[0x05, 0x04], "an RFC 4121 Wrap token");
+    }
+
+    /// A round that has to check an NTLM answer is not a fresh bind.
+    ///
+    /// The defect this pins: `starts_fresh` deciding only on the libsasl exchange and the SPNEGO offer
+    /// wiped the challenge on the round that answers it, and the client was told its answer arrived
+    /// "with no challenge outstanding".
+    #[test]
+    fn an_ntlm_challenge_in_flight_is_not_a_fresh_bind() {
+        let mut session = Session::new();
+        assert!(
+            super::starts_fresh(&session),
+            "an untouched session starts an exchange"
+        );
+
+        session.set_ntlm_challenge(Some(([7u8; 8], 1_700_000_000)));
+        assert!(
+            !super::starts_fresh(&session),
+            "the answer to a challenge continues the exchange"
+        );
+
+        session.set_ntlm_challenge(None);
+        assert!(
+            super::starts_fresh(&session),
+            "a spent challenge leaves nothing in flight"
+        );
     }
 }

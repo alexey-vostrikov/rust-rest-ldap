@@ -104,11 +104,22 @@ pub(crate) fn step(
             getrandom::fill(&mut challenge).map_err(|err| {
                 SaslError::Sequence(format!("no randomness for the NTLM challenge: {err}"))
             })?;
-            session.set_ntlm_challenge(Some(challenge));
 
+            // The time travels with the nonce: the MIC in the client's answer is computed over the
+            // CHALLENGE message exactly as it was sent, and that message carries the time. A rebuilt
+            // challenge stamped "now" is different octets, and the answer then cannot verify.
+            let stamp = now_filetime();
             let mut server =
-                smb_server::NtlmServer::new(challenge, target(security), now_filetime());
+                smb_server::NtlmServer::without_signing(challenge, target(security), stamp);
+            // `step1_negotiate` stores the client's octets, which the MIC also covers, and
+            // intersects the flags both sides set.
+            server
+                .step1_negotiate(token)
+                .map_err(|err| SaslError::Undecodable(format!("NTLM negotiate: {err}")))?;
             let answer = server.challenge();
+
+            session.set_ntlm_negotiate(token.to_vec());
+            session.set_ntlm_challenge(Some((challenge, stamp)));
             tracing::debug!(
                 round = "negotiate",
                 challenge = ?challenge,
@@ -127,7 +138,7 @@ pub(crate) fn step(
         // AUTHENTICATE: the answer to that challenge. The verification is `smb_server`'s, and the
         // account is the directory's.
         Some(3) => {
-            let Some(challenge) = session.ntlm_challenge() else {
+            let Some((challenge, stamp)) = session.ntlm_challenge() else {
                 return Err(SaslError::Sequence(
                     "an NTLM answer arrived with no challenge outstanding: the exchange was reset, \
                      or this connection never sent one"
@@ -135,7 +146,18 @@ pub(crate) fn step(
                 ));
             };
 
-            let server = smb_server::NtlmServer::new(challenge, target(security), now_filetime());
+            let mut server =
+                smb_server::NtlmServer::without_signing(challenge, target(security), stamp);
+            // Replayed into the acceptor so the MIC can be verified: it covers the negotiate, the
+            // challenge and the answer together, and the acceptor holds none of it between rounds.
+            if let Some(negotiate) = session.ntlm_negotiate() {
+                server
+                    .step1_negotiate(negotiate)
+                    .map_err(|err| SaslError::Undecodable(format!("NTLM negotiate: {err}")))?;
+            }
+            // Rebuilt from the same nonce and the same instant, so `challenge()` produces the octets
+            // the client signed. Called for its side effect - it is what the MIC is computed over.
+            let _expected_challenge = server.challenge();
             // The lookup is the directory, and it answers as slowly for an unknown account as for a
             // wrong password because the hash it returns for the former is all zeroes.
             let account = |user: &str, domain: &str| {
@@ -198,6 +220,38 @@ pub(crate) fn step(
     }
 }
 
+/// The RFC 4752 layer round that follows a successful SASL bind.
+///
+/// Four octets: a bitmask of the layers the client supports and the largest message it will accept,
+/// answered with the layer chosen and the same size. This server offers none - an unencrypted bind
+/// already carries the password as an NTLM response, and sealing every later message would mean an
+/// RC4 stream per connection for a protection the deployment gets from TLS instead - so the answer
+/// is `none`, and a client that demands integrity is refused by name rather than sealed by accident.
+///
+/// The round is optional: a client that asks for nothing simply sends its next request.
+pub(crate) fn layer_round(session: &Session, token: &[u8]) -> Result<Round, SaslError> {
+    if session.ntlm_negotiate().is_none() {
+        return Err(SaslError::Sequence(
+            "a SASL layer choice arrived before any bind was accepted".to_string(),
+        ));
+    }
+    let offered = token.first().copied().unwrap_or(0);
+    if offered & 0x01 == 0 {
+        return Err(SaslError::Sequence(format!(
+            "the client offers SASL layers {offered:#04x} and this server implements none: a bind \
+             that needs integrity or confidentiality has to use TLS, not NTLM"
+        )));
+    }
+    tracing::debug!("ntlm: security layer 'none' chosen");
+    Ok(Round {
+        code: rasn_ldap::ResultCode::Success,
+        credentials: Some(vec![0x01, 0x00, 0x00, 0x00]),
+        identity: None,
+        diagnostic: String::new(),
+        wrap: None,
+    })
+}
+
 /// The DN of `account`, when the directory knows it and will let it log on.
 fn lookup_entry(directory: &Directory, account: &str) -> Option<((), String)> {
     crate::kerberos::secrets::logon_account(directory, account).map(|(_, dn)| ((), dn))
@@ -254,12 +308,18 @@ mod tests {
         value.to_le_bytes()
     }
 
-    /// A NEGOTIATE_MESSAGE: the signature, the type, and the flags a Windows client actually sends.
+    /// A NEGOTIATE_MESSAGE as MS-NLMP 2.2.1.1 lays it out: signature, type, the two name fields
+    /// (empty here), the flags, and the version block.
+    ///
+    /// The full 40 octets matter: the parser refuses a shorter message, which is what "NEGOTIATE too
+    /// short" means and what an abbreviated fixture gets.
     fn negotiate() -> Vec<u8> {
         let mut message = Vec::new();
         message.extend_from_slice(SIGNATURE);
         message.extend_from_slice(&word(1));
+        message.extend_from_slice(&[0u8; 16]); // domain and workstation name fields, both empty
         message.extend_from_slice(&word(0x0008_8207)); // Unicode, NTLM, always-sign, target-info
+        message.extend_from_slice(&[0u8; 8]); // version
         message
     }
 
