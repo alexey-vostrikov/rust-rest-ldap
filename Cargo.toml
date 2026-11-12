@@ -30,6 +30,12 @@ hyper = { version = "1.12.0", features = ["client", "http1"] }
 http-body-util = "0.1.5"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 humantime = "2.4.0"
+# The wire format of DNS, and the server loop that reads and writes it: a zone this crate serves
+# must answer a validator's questions about the protocol, and hand-writing RFC 1035 would be a second
+# place to be wrong about compression and message structure. `default-features = false` because the
+# resolver, sqlite store and TOML configuration are not wanted: the zone lives in this server's own
+# directory. MSRV 1.88, below the toolchain pinned here.
+hickory-server = { version = "0.26.3", default-features = false, optional = true }
 # The one place this crate steps outside safe Rust, and only to map a file it owns: see
 # `src/index_file.rs`. Everything else - protocol parsing, TLS, HTTP, storage - is safe code.
 memmap2 = "0.9"
@@ -119,7 +125,7 @@ kdc = ["dep:rrl-kdc"]
 # Port 445 and the `IPC$` share a join talks to.
 smb = ["dep:smb-server"]
 # Port 53 and the zone a domain lives in: the `dnsRecord` values under `CN=RRLDNS`.
-dns = []
+dns = ["dep:hickory-server"]
 
 [dev-dependencies]
 rrl-kdc = { git = "https://github.com/alexey-vostrikov/rrl-kdc", branch = "main" }
