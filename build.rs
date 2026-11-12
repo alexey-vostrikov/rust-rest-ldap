@@ -45,15 +45,15 @@ fn main() {
             .filter(|text| !text.is_empty())
     };
 
-    // A tag when one is reachable, and the distance and hash of a describe past it (`0.0.1-3-gab12` is
-    // a version, and it is the honest one). The distance stays because a build three commits after a
-    // release is not that release.
-    let tag = describe(&["describe", "--all", "--abbrev=4"]).and_then(|text| {
-        if let Some(name) = text.strip_prefix("tags/") {
-            return Some(name.to_string());
-        }
-        // `heads/…` means no tag was reachable, and a branch name is not a version: two builds a week
-        // apart both answer `main`. The commit hash is what identifies the build.
+    // A tag when one is reachable, with the distance and hash of a describe past it (`0.0.1-3-gab12` is
+    // a version, and it is the honest one: a build three commits after a release is not that release).
+    //
+    // `--tags`, not `--all`. `--all` also searches branch heads, and a branch that points at HEAD wins
+    // over a tag one commit back — measured: with `0.0.1` on the parent commit, `describe --all`
+    // answered `heads/main` and the published version said the branch instead of the release. A branch
+    // name identifies no build in any case: two builds a week apart both answer `main`.
+    let tag = describe(&["describe", "--tags", "--abbrev=4"]).or_else(|| {
+        // No tag reachable: the commit hash is what identifies the build.
         describe(&["rev-parse", "--short=4", "HEAD"])
     });
 
