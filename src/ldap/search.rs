@@ -1359,6 +1359,9 @@ mod tests {
         );
         let emulation = crate::emulation::EmulationConfig {
             schema_version: 91,
+            // A named tag, so the assertion does not depend on which commit built this tree; the
+            // default one is checked on its own, in `emulation`'s own tests.
+            tag: Some("0.9.9".to_string()),
             ..Default::default()
         };
         let mut with_domain = security();
@@ -1381,7 +1384,7 @@ mod tests {
                 "operatingSystem",
                 "RRL Domain «Windows Server 2022» emulation",
             ),
-            ("operatingSystemVersion", "10.0 (20348) RRL"),
+            ("operatingSystemVersion", "10.0 (20348) 0.9.9"),
         ] {
             assert_eq!(
                 attribute_values(&messages, name),

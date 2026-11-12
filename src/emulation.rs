@@ -35,8 +35,12 @@ pub struct EmulationConfig {
     #[serde(default = "default_build")]
     pub build: String,
     /// A marker of this server's own, so an emulated answer is recognisable as one.
-    #[serde(default = "default_tag")]
-    pub tag: String,
+    ///
+    /// Unset is the usual case, and then the tag is `git describe --all --abbrev=4` for the tree this
+    /// was built from: a release tag when the build sits on one, and the nearest tag with its distance
+    /// and a short hash when it does not. A release that has a name of its own sets it here.
+    #[serde(default)]
+    pub tag: Option<String>,
     /// The schema version to publish, as `objectVersion` numbers it: `sch70` through `sch91`.
     #[serde(default = "default_schema_version")]
     pub schema_version: u8,
@@ -54,8 +58,15 @@ fn default_build() -> String {
     "20348".to_string()
 }
 
-fn default_tag() -> String {
-    "RRL".to_string()
+/// The tag when the operator named none: `git describe --all --abbrev=4` of the built tree, from
+/// `build.rs`.
+///
+/// A constant would say the same thing about every build, which is exactly what a tag is for not
+/// doing. A repository with no tags answers with its branch (`heads/main`), which is what `describe`
+/// can honestly say there. The build script falls back to the crate version and then to `unknown`, so
+/// this is never empty.
+pub fn build_tag() -> &'static str {
+    option_env!("RRL_BUILD_TAG_VALUE").unwrap_or("unknown")
 }
 
 fn default_schema_version() -> u8 {
@@ -70,7 +81,7 @@ impl Default for EmulationConfig {
             product: default_product(),
             version: default_version(),
             build: default_build(),
-            tag: default_tag(),
+            tag: None,
             schema_version: default_schema_version(),
         }
     }
@@ -88,8 +99,13 @@ impl EmulationConfig {
     }
 
     /// `operatingSystemVersion`: `<WinVer> (<WinCode>) <TAG>`, the shape Windows itself writes.
+    ///
+    /// The tag names the build: a configured one when an operator gave it a release name, and the
+    /// short commit hash otherwise. "10.0 (20348) RRL" would say the same thing about every build of
+    /// this server, which is the one thing a tag must not do.
     pub fn operating_system_version(&self) -> String {
-        format!("{} ({}) {}", self.version, self.build, self.tag)
+        let tag = self.tag.as_deref().unwrap_or(build_tag());
+        format!("{} ({}) {}", self.version, self.build, tag)
     }
 
     /// `domainFunctionality` and `forestFunctionality`, as the schema version implies them.
@@ -119,7 +135,6 @@ impl EmulationConfig {
             ("product", &self.product),
             ("version", &self.version),
             ("build", &self.build),
-            ("tag", &self.tag),
         ] {
             if value.trim().is_empty() {
                 return Err(format!(
@@ -127,6 +142,14 @@ impl EmulationConfig {
                      an operator cannot tell which release this domain claims"
                 ));
             }
+        }
+        // Set-and-empty is a mistake; unset is the normal case and means "this build".
+        if self.tag.as_deref().is_some_and(|tag| tag.trim().is_empty()) {
+            return Err(
+                "emulation.tag is empty: leave it unset for this build's commit hash, or name the \
+                 release"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -189,7 +212,16 @@ mod tests {
             config.operating_system(),
             "RRL Domain «Windows Server 2022» emulation"
         );
-        assert_eq!(config.operating_system_version(), "10.0 (20348) RRL");
+        // Unset tag: the build's own commit hash, which is what tells two builds apart.
+        assert_eq!(
+            config.operating_system_version(),
+            format!("10.0 (20348) {}", build_tag())
+        );
+        assert!(
+            !build_tag().is_empty() && build_tag() != "RRL",
+            "a tag that is the same for every build names no build: {}",
+            build_tag()
+        );
         assert_eq!(config.object_version(), "88");
     }
 
@@ -209,12 +241,36 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_name_is_refused() {
+    fn a_tag_that_is_configured_is_what_a_client_reads() {
+        // A release with a name of its own says so instead of the hash.
         let config = EmulationConfig {
-            tag: String::new(),
+            tag: Some("0.0.1".to_string()),
             ..Default::default()
         };
-        let message = config.validate().expect_err("an empty tag is not a name");
+        assert_eq!(config.operating_system_version(), "10.0 (20348) 0.0.1");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn an_empty_name_is_refused() {
+        let empty_product = EmulationConfig {
+            product: String::new(),
+            ..Default::default()
+        };
+        let message = empty_product
+            .validate()
+            .expect_err("an empty product is not a name");
+        assert!(message.contains("emulation.product"), "{message}");
+
+        // Set-and-empty is a mistake; unset is the normal case.
+        let empty_tag = EmulationConfig {
+            tag: Some(String::new()),
+            ..Default::default()
+        };
+        let message = empty_tag
+            .validate()
+            .expect_err("an empty tag is not a name");
         assert!(message.contains("emulation.tag"), "{message}");
+        assert!(EmulationConfig::default().validate().is_ok());
     }
 }
