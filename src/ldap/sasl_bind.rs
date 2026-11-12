@@ -403,29 +403,47 @@ pub fn handle_gssapi(
         session.reset();
     }
 
-    let outcome = match session.sasl_stage() {
-        Some(Stage::OfferSent) => offer_layer(session, token),
-        Some(Stage::ChoiceExpected) => accept_choice(session, token),
-        Some(Stage::SpnegoAccepted) => spnego_finish(session, token),
-        // No exchange and no offer yet. A `GSS-SPNEGO` bind that carries no token is not a
-        // client with nothing to say - it is a client waiting for the server to name the
-        // mechanisms, which is what Samba's `ads_sasl_bind` does. See `super::spnego_offer`.
-        // An offer that is outstanding is answered by the next bind, unless the client changed
-        // mechanism: a bind that is not a continuation of the same conversation starts over, which
-        // is RFC 4513's rule and also the only reading under which a client that abandons SPNEGO
-        // for plain `GSSAPI` is not sent down the wrong path.
-        None if session.spnego_offered() => {
-            if mechanism.eq_ignore_ascii_case(SPNEGO_MECHANISM) {
-                spnego_accept(session, directory, &gssapi, token, security)
-            } else {
-                session.reset();
-                begin(session, directory, &gssapi, token, security)
+    // A bare NTLM message comes before every Kerberos path: it does not start with `0x60`, so the
+    // SPNEGO branches would refuse it as undecodable, and the refusal would read as a broken ticket
+    // rather than as the mechanism a Windows machine uses before it has one. Measured on the AD-join
+    // stand: `Add-Computer` sends exactly this and nothing else.
+    #[cfg(feature = "smb")]
+    let ntlm = super::ntlm_bind::is_ntlm(&token);
+    #[cfg(not(feature = "smb"))]
+    let ntlm = false;
+
+    let outcome = if ntlm {
+        #[cfg(feature = "smb")]
+        {
+            super::ntlm_bind::step(session, directory, &token, security)
+        }
+        #[cfg(not(feature = "smb"))]
+        unreachable!("`ntlm` is a constant false without the smb feature")
+    } else {
+        match session.sasl_stage() {
+            Some(Stage::OfferSent) => offer_layer(session, token),
+            Some(Stage::ChoiceExpected) => accept_choice(session, token),
+            Some(Stage::SpnegoAccepted) => spnego_finish(session, token),
+            // No exchange and no offer yet. A `GSS-SPNEGO` bind that carries no token is not a
+            // client with nothing to say - it is a client waiting for the server to name the
+            // mechanisms, which is what Samba's `ads_sasl_bind` does. See `super::spnego_offer`.
+            // An offer that is outstanding is answered by the next bind, unless the client changed
+            // mechanism: a bind that is not a continuation of the same conversation starts over, which
+            // is RFC 4513's rule and also the only reading under which a client that abandons SPNEGO
+            // for plain `GSSAPI` is not sent down the wrong path.
+            None if session.spnego_offered() => {
+                if mechanism.eq_ignore_ascii_case(SPNEGO_MECHANISM) {
+                    spnego_accept(session, directory, &gssapi, token, security)
+                } else {
+                    session.reset();
+                    begin(session, directory, &gssapi, token, security)
+                }
             }
+            None if token.is_empty() && mechanism.eq_ignore_ascii_case(SPNEGO_MECHANISM) => {
+                offer_spnego(session)
+            }
+            None => begin(session, directory, &gssapi, token, security),
         }
-        None if token.is_empty() && mechanism.eq_ignore_ascii_case(SPNEGO_MECHANISM) => {
-            offer_spnego(session)
-        }
-        None => begin(session, directory, &gssapi, token, security),
     };
 
     match outcome {
@@ -457,17 +475,17 @@ pub fn handle_gssapi(
 }
 
 /// One round's result.
-struct Round {
-    code: ResultCode,
-    credentials: Option<Vec<u8>>,
-    identity: Option<Identity>,
-    diagnostic: String,
+pub(crate) struct Round {
+    pub(crate) code: ResultCode,
+    pub(crate) credentials: Option<Vec<u8>>,
+    pub(crate) identity: Option<Identity>,
+    pub(crate) diagnostic: String,
     /// The security layer this round puts in place, when it is the last one.
     ///
     /// Set only by `spnego_finish`: a client on `gensec` has no RFC 4752 mask to negotiate and
     /// starts sealing the moment it reads `success`, so the server has to be ready with the key and
     /// with sequence number zero on both directions.
-    wrap: Option<Wrap>,
+    pub(crate) wrap: Option<Wrap>,
 }
 
 /// The acceptor's options, as one function rather than three statements in `begin`.

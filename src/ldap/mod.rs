@@ -9,6 +9,10 @@ pub mod extop;
 pub mod filter;
 pub mod filter_parse;
 pub mod modify;
+/// NTLM inside `GSS-SPNEGO`: the logon a Windows machine makes before the domain has issued it a
+/// ticket. Behind the `smb` feature because the verification is `smb_server`'s, not a second copy.
+#[cfg(feature = "smb")]
+pub mod ntlm_bind;
 pub mod paged;
 pub mod responses;
 pub mod sasl_bind;

@@ -146,41 +146,55 @@ impl smb_server::MachineSecrets for DirectorySecrets {
 #[cfg(feature = "smb")]
 impl smb_server::LogonUsers for DirectorySecrets {
     fn user(&self, account: &str) -> Option<smb_server::UserCreds> {
-        let directory = self.current();
-        // The same skeleton rule as `machine`: a scan must read records, or every account that
-        // existed before the restart looks like an entry with no attributes - which measured as
-        // "not in the directory" for an account `ldapsearch` found without trouble.
-        let entry = first_complete(&directory, |entry| {
-            ["sAMAccountName", "userPrincipalName"].iter().any(|name| {
-                entry.attributes().get(name).is_some_and(|attribute| {
-                    attribute
-                        .values
-                        .iter()
-                        .any(|value| value.eq_ignore_ascii_case(account))
-                })
-            })
-        })?;
-
-        // An account that may not authenticate answers exactly as an account that does not exist:
-        // NTLM's defence against enumeration is that both take the same time and give the same
-        // status, and a hook that said "disabled" would hand a client a list of real accounts.
-        //
-        // A flag word this build cannot read is not permission either - `parse` says `None` for
-        // anything that is not a number, and an entry whose flags cannot be read is one the KDC also
-        // refuses (see `resolve_identity` in the SASL binder), so refusing it here keeps the two
-        // paths agreeing rather than inventing a second policy.
-        let flags = entry
-            .attributes()
-            .get("userAccountControl")
-            .and_then(|attribute| attribute.values.first())
-            .and_then(|text| crate::ad_schema::UserAccountControl::parse(text))?;
-        if !flags.may_authenticate() {
-            return None;
-        }
-
-        let nt_hash = nt_hash_of(entry.attributes())?;
+        let (nt_hash, _) = logon_account(&self.current(), account)?;
         Some(smb_server::UserCreds { nt_hash })
     }
+}
+
+/// The NT hash and DN of `account`, when this directory serves it and it may log on.
+///
+/// One function for both protocols on purpose. NTLM is checked in two places - the SMB session a
+/// join opens, and the LDAP bind the join authenticates with - and a second copy of "is this account
+/// allowed" is a second answer to the same question, differing exactly where nobody looks. Measured
+/// on the AD-join stand: the LDAP bind was refused while the SMB logon beside it succeeded, and the
+/// difference was that only one of the two had a directory to ask.
+///
+/// `None` covers "no such account" and "may not log on" alike: NTLM's defence against enumeration is
+/// that both take the same time and give the same status, and an answer that distinguished them
+/// would hand a client a list of real accounts.
+pub(crate) fn logon_account(
+    directory: &crate::directory::Directory,
+    account: &str,
+) -> Option<([u8; 16], String)> {
+    // A scan must read records, not the snapshot: after a restart the snapshot holds skeletons - a
+    // DN with an empty attribute list - and an account `ldapsearch` shows reads as "not in the
+    // directory" here.
+    let entry = first_complete(directory, |entry| {
+        ["sAMAccountName", "userPrincipalName"].iter().any(|name| {
+            entry.attributes().get(name).is_some_and(|attribute| {
+                attribute
+                    .values
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(account))
+            })
+        })
+    })?;
+
+    // A flag word this build cannot read is not permission either - `parse` says `None` for anything
+    // that is not a number, and an entry whose flags cannot be read is one the KDC refuses too (see
+    // `resolve_identity` in the SASL binder), so refusing it here keeps the three paths agreeing
+    // rather than inventing a policy per protocol.
+    let flags = entry
+        .attributes()
+        .get("userAccountControl")
+        .and_then(|attribute| attribute.values.first())
+        .and_then(|text| crate::ad_schema::UserAccountControl::parse(text))?;
+    if !flags.may_authenticate() {
+        return None;
+    }
+
+    let nt_hash = nt_hash_of(entry.attributes())?;
+    Some((nt_hash, entry.dn().to_string()))
 }
 
 /// The first entry whose *complete* record matches, read one entry at a time.

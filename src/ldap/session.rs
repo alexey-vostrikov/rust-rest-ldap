@@ -62,6 +62,13 @@ pub struct Session {
     /// one fact that has to survive the round, and it is gone the moment the ticket arrives or the
     /// bind fails.
     spnego_offered: bool,
+    /// The server challenge this connection is waiting for an NTLM answer to.
+    ///
+    /// NTLM has no ticket, so the only thing the second round has to agree with the first about is
+    /// the challenge: without it the `NTProofStr` cannot be recomputed, and an empty value would
+    /// verify anything. Dropped by [`Session::reset`] like the rest of a half-finished bind, so a
+    /// client that abandons the exchange cannot resume it.
+    ntlm_challenge: Option<[u8; 8]>,
     /// The SASL security layer, once the bind established one.
     ///
     /// Held here rather than in the exchange because it outlives the conversation: every message
@@ -114,7 +121,21 @@ impl Session {
         self.identity = None;
         self.sasl = None;
         self.spnego_offered = false;
+        self.ntlm_challenge = None;
         self.wrap = None;
+    }
+
+    /// The challenge this connection must see answered, when an NTLM bind is under way.
+    pub fn ntlm_challenge(&self) -> Option<[u8; 8]> {
+        self.ntlm_challenge
+    }
+
+    /// Records the challenge the client was given, or `None` once it has been answered.
+    ///
+    /// There is no separate stage for this exchange: a challenge that is outstanding *is* the state,
+    /// and a second field saying so would be a second thing to keep in step with the first.
+    pub fn set_ntlm_challenge(&mut self, challenge: Option<[u8; 8]>) {
+        self.ntlm_challenge = challenge;
     }
 
     /// The SASL exchange in progress, if any.

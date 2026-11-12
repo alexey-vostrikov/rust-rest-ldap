@@ -130,6 +130,9 @@ dns = ["dep:hickory-server"]
 [dev-dependencies]
 rrl-kdc = { git = "https://github.com/alexey-vostrikov/rrl-kdc", branch = "main" }
 futures = "0.3.34"
+# The NTLM test builds a client's answer by hand, and HMAC-MD5 is the one primitive it needs;
+# hand-rolling it in a test would mean the test and the server could agree on a wrong answer.
+hmac = "0.13.0"
 rcgen = "0.14.10"
 serde_json = "1.0.154"
 tempfile = "3.27.0"
