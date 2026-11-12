@@ -936,11 +936,14 @@ async fn serve() {
                 {
                     settings.domain_netbios = Some(first.to_ascii_uppercase());
                 }
-                // The machine accounts, for the secure channel a join establishes last. A live
-                // view and not a snapshot: the account is created and used a moment later.
+                // The machine accounts, for the secure channel a join establishes last, and the
+                // same directory for the accounts a client logs on with before it has a ticket.
+                // One snapshot and one `follow`, because they are the same question asked twice:
+                // the account is created and used a moment later, so a snapshot taken at start
+                // would refuse a channel - or a logon - for an account that exists.
                 #[cfg(feature = "kdc")]
-                let machine_secrets: Option<
-                    std::sync::Arc<dyn smb_server::MachineSecrets>,
+                let held: Option<
+                    std::sync::Arc<rust_rest_ldap::kerberos::secrets::DirectorySecrets>,
                 > = if config.kerberos.enabled {
                     let secrets = std::sync::Arc::new(
                         rust_rest_ldap::kerberos::secrets::DirectorySecrets::new(
@@ -956,9 +959,41 @@ async fn serve() {
                 } else {
                     None
                 };
+                // Two trait objects over one snapshot. `Arc::clone` alone would keep the concrete
+                // type, so each is widened where it is named rather than at the call site.
+                #[cfg(feature = "kdc")]
+                let machine_secrets: Option<
+                    std::sync::Arc<dyn smb_server::MachineSecrets>,
+                > = match &held {
+                    Some(secrets) => {
+                        // Bound first: under a `dyn` annotation `Arc::clone` would be asked for a
+                        // `&Arc<dyn …>`, and the widening has to happen on the concrete value.
+                        let concrete = std::sync::Arc::clone(secrets);
+                        let widened: std::sync::Arc<dyn smb_server::MachineSecrets> = concrete;
+                        Some(widened)
+                    }
+                    None => None,
+                };
+                #[cfg(feature = "kdc")]
+                let logon_users: Option<
+                    std::sync::Arc<dyn smb_server::LogonUsers>,
+                > = match &held {
+                    Some(secrets) => {
+                        // Bound first: under a `dyn` annotation `Arc::clone` would be asked for a
+                        // `&Arc<dyn …>`, and the widening has to happen on the concrete value.
+                        let concrete = std::sync::Arc::clone(secrets);
+                        let widened: std::sync::Arc<dyn smb_server::LogonUsers> = concrete;
+                        Some(widened)
+                    }
+                    None => None,
+                };
                 #[cfg(not(feature = "kdc"))]
                 let machine_secrets: Option<
                     std::sync::Arc<dyn smb_server::MachineSecrets>,
+                > = None;
+                #[cfg(not(feature = "kdc"))]
+                let logon_users: Option<
+                    std::sync::Arc<dyn smb_server::LogonUsers>,
                 > = None;
 
                 #[cfg(feature = "kdc")]
@@ -983,6 +1018,7 @@ async fn serve() {
                     &settings,
                     machine_secrets,
                     machine_passwords,
+                    logon_users,
                 )
                 .await
                 {

@@ -12,6 +12,9 @@
 
 use std::sync::Arc;
 
+// The trait is only there when the SMB layer is built: `kdc` alone is a realm without port 445, and
+// a directory that answers tickets but not a join has no use for a password writer.
+#[cfg(feature = "smb")]
 use smb_server::MachinePasswords;
 
 /// The directory, as the SMB layer writes to it.
@@ -56,6 +59,7 @@ impl DirectoryPasswords {
     }
 }
 
+#[cfg(feature = "smb")]
 #[async_trait::async_trait]
 impl MachinePasswords for DirectoryPasswords {
     async fn set_password(&self, account: &str, password: &[u8]) -> bool {

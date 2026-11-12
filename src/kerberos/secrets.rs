@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "smb")]
 use smb_server::MachineAccount;
 
 /// The directory, as the SMB layer sees it.
@@ -97,6 +98,7 @@ impl DirectorySecrets {
     }
 }
 
+#[cfg(feature = "smb")]
 impl smb_server::MachineSecrets for DirectorySecrets {
     fn machine(&self, account: &str) -> Option<MachineAccount> {
         let directory = self.current();
@@ -124,6 +126,54 @@ impl smb_server::MachineSecrets for DirectorySecrets {
         }
         let rid = rid_of(entry.attributes())?;
         Some(MachineAccount { nt_hash, rid })
+    }
+}
+
+/// Where a domain account's NT hash comes from, for the NTLM logon a machine makes before it has a
+/// ticket.
+///
+/// `Add-Computer` cannot present a Kerberos ticket for a domain it has not joined - the domain has
+/// not issued it one - so its first `SESSION_SETUP` is NTLM against a real account. With an empty
+/// static user table the server answered `NT proof mismatch` for a password that was right, and the
+/// guest reported "the user name or password is incorrect".
+///
+/// Two names resolve to one account, in the order a client sends them: `sAMAccountName`, which NTLM
+/// carries (`AD\admin`), then `userPrincipalName`, which some clients and every ticket use. Both are
+/// compared case-insensitively, as the directory compares them.
+#[cfg(feature = "smb")]
+impl smb_server::LogonUsers for DirectorySecrets {
+    fn user(&self, account: &str) -> Option<smb_server::UserCreds> {
+        let directory = self.current();
+        let entry = directory.all().iter().find(|entry| {
+            ["sAMAccountName", "userPrincipalName"].iter().any(|name| {
+                entry.attributes().get(name).is_some_and(|attribute| {
+                    attribute
+                        .values
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(account))
+                })
+            })
+        })?;
+
+        // An account that may not authenticate answers exactly as an account that does not exist:
+        // NTLM's defence against enumeration is that both take the same time and give the same
+        // status, and a hook that said "disabled" would hand a client a list of real accounts.
+        //
+        // A flag word this build cannot read is not permission either - `parse` says `None` for
+        // anything that is not a number, and an entry whose flags cannot be read is one the KDC also
+        // refuses (see `resolve_identity` in the SASL binder), so refusing it here keeps the two
+        // paths agreeing rather than inventing a second policy.
+        let flags = entry
+            .attributes()
+            .get("userAccountControl")
+            .and_then(|attribute| attribute.values.first())
+            .and_then(|text| crate::ad_schema::UserAccountControl::parse(text))?;
+        if !flags.may_authenticate() {
+            return None;
+        }
+
+        let nt_hash = nt_hash_of(entry.attributes())?;
+        Some(smb_server::UserCreds { nt_hash })
     }
 }
 
@@ -256,5 +306,80 @@ mod tests {
         ));
         let secrets = DirectorySecrets::new(directory);
         assert!(smb_server::MachineSecrets::machine(&secrets, "OTHER$").is_none());
+    }
+
+    /// A person's account, as a directory in AD shape holds one: `sAMAccountName`, a UPN, flags, and
+    /// a hash in the same `supplementalCredentials` a machine's lives in.
+    fn person(name: &str, flags: &str, hash: Option<[u8; 16]>) -> Entry {
+        use base64::Engine as _;
+        let mut attributes = crate::model::Attributes::new()
+            .push(Attribute::single("sAMAccountName", name))
+            .push(Attribute::single("cn", name))
+            .push(Attribute::single("objectClass", "user"))
+            .push(Attribute::single("userAccountControl", flags));
+        if let Some(hash) = hash {
+            attributes = attributes.push(Attribute::single(
+                rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS,
+                &base64::engine::general_purpose::STANDARD.encode(
+                    rrl_kdc::hdb::ad_blob::supplemental_credentials_with_nt(
+                        &rrl_kdc::hdb::HdbEntry::user(
+                            rrl_kdc::name::Principal::parse(&format!("{name}@EXAMPLE.COM"))
+                                .expect("a name"),
+                        ),
+                        &hash,
+                    ),
+                ),
+            ));
+        }
+        Entry::new(format!("cn={name},ou=users,dc=example,dc=com"), attributes)
+    }
+
+    fn with(entries: Vec<Entry>) -> DirectorySecrets {
+        DirectorySecrets::new(Arc::new(crate::directory::Directory::from_entries(
+            "dc=example,dc=com",
+            "users",
+            "groups",
+            entries,
+        )))
+    }
+
+    /// The logon a Windows machine makes before it has a ticket: `Add-Computer` sends NTLM, and the
+    /// account it names is one only the directory knows.
+    #[test]
+    fn a_domain_account_answers_an_ntlm_logon_with_its_hash() {
+        let secrets = with(vec![person("admin", "512", Some([0x42; 16]))]);
+        let creds =
+            smb_server::LogonUsers::user(&secrets, "admin").expect("the directory holds it");
+        assert_eq!(creds.nt_hash, [0x42; 16]);
+    }
+
+    /// Case does not have to match: a Windows client sends the name the way the account is written
+    /// and the directory compares it without regard to case.
+    #[test]
+    fn the_account_name_is_matched_without_regard_to_case() {
+        let secrets = with(vec![person("Admin", "512", Some([0x42; 16]))]);
+        assert!(smb_server::LogonUsers::user(&secrets, "ADMIN").is_some());
+    }
+
+    /// A disabled account answers exactly as an account that does not exist. NTLM's defence against
+    /// enumeration is that both take the same time and give the same status; a hook that said
+    /// "disabled" would hand a client a list of real accounts.
+    #[test]
+    fn a_disabled_account_answers_as_an_absent_one() {
+        // 0x0002 is ACCOUNTDISABLE; 512 is an ordinary enabled account.
+        let secrets = with(vec![
+            person("fired", "514", Some([0x42; 16])),
+            person("missing", "512", None),
+        ]);
+        assert!(smb_server::LogonUsers::user(&secrets, "fired").is_none());
+        assert!(smb_server::LogonUsers::user(&secrets, "absent").is_none());
+    }
+
+    /// An account with no hash cannot be checked: answering with a hash nobody set would
+    /// authenticate a client against a password that does not exist.
+    #[test]
+    fn a_domain_account_without_a_hash_is_not_answered_for() {
+        let secrets = with(vec![person("nokey", "512", None)]);
+        assert!(smb_server::LogonUsers::user(&secrets, "nokey").is_none());
     }
 }

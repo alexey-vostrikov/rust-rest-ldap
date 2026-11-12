@@ -50,12 +50,14 @@ impl Running {
 /// it serve the `srvsvc` pipe. A file share here would be a second path into a process whose access
 /// rules are about tickets, not about files.
 ///
-/// An empty user list is deliberate: this server is reached with a Kerberos ticket from a machine
-/// account, and SMB's own password list is for the shares this deployment does not serve.
+/// An empty static user list is deliberate: this server is reached with a Kerberos ticket from a
+/// machine account, or with an NTLM logon against an account the directory owns (`logon_users`).
+/// SMB's own configured passwords are for the file shares this deployment does not serve.
 pub async fn start(
     settings: &Settings,
     machine_secrets: Option<std::sync::Arc<dyn smb_server::MachineSecrets>>,
     machine_passwords: Option<std::sync::Arc<dyn smb_server::MachinePasswords>>,
+    logon_users: Option<std::sync::Arc<dyn smb_server::LogonUsers>>,
 ) -> Result<Running, String> {
     let mut builder = smb_server::SmbServer::builder()
         .listen(settings.bind)
@@ -81,6 +83,11 @@ pub async fn start(
     }
     if let Some(passwords) = machine_passwords {
         builder = builder.machine_passwords(passwords);
+    }
+    // The accounts a client logs on with before it has a ticket: `Add-Computer` sends NTLM, because
+    // the domain it is joining has not issued it one yet.
+    if let Some(source) = logon_users {
+        builder = builder.logon_users(source);
     }
     // The DES secure channel, when the deployment asks for it: off unless `smb.netlogon_des` says
     // otherwise, because that channel's credential is two passes of a 56-bit cipher.

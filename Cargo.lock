@@ -868,7 +868,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1282,7 +1282,7 @@ dependencies = [
 [[package]]
 name = "krb5"
 version = "1.0.0"
-source = "git+https://github.com/alexey-vostrikov/krb5?branch=main#1268e84f9bf309a13faff23785fb318311c70774"
+source = "git+https://github.com/alexey-vostrikov/krb5?branch=main#4a7efba9f8742af67155053c29d3bff2520f70ba"
 dependencies = [
  "aes 0.9.4",
  "chrono",
@@ -1990,7 +1990,7 @@ dependencies = [
 [[package]]
 name = "rrl-krb-common"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#645f62c70f80014e533adc8771588c59ce173887"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#912dda51c1746b98b90aa4c72e7a5f49afbbd828"
 dependencies = [
  "hmac 0.13.0",
  "rrl-crypto",
@@ -2099,7 +2099,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2396,7 +2396,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 [[package]]
 name = "smb-server"
 version = "0.9.1"
-source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#e6349500389464fabe181f849eab766f4172ff23"
+source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#0f9c6395aec845b123e8a7b7184e258262ca15a3"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -2535,7 +2535,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
