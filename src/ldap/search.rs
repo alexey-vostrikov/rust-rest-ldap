@@ -30,11 +30,29 @@ const ROOT_DSE_OBJECT_CLASS: [&str; 2] = ["top", "LDAProotDSE"];
 
 /// The capabilities a Windows client recognises in `supportedCapabilities`.
 ///
-/// Deliberately one: `1.2.840.113556.1.4.800` is "this is Active Directory" and is the only claim
-/// this server can keep. Adding the level OIDs (1670, 1791, 1851, …) would tell a client it may use
-/// features of those levels - links, quotas, a schema partition - and a client that believes it asks
-/// for one and is refused reads the refusal as a broken controller.
-const DOMAIN_CAPABILITIES: [&str; 1] = ["1.2.840.113556.1.4.800"];
+/// The first is "this is Active Directory". The rest are the **functional levels** a client maps to a
+/// Windows Server version. A join does not fail without them (measured: adding the ladder changed
+/// nothing), but a controller that publishes only `4.800` tells a client nothing about the level it
+/// may use, and every real DC publishes the ladder. It stops at 2016: claiming a later level would
+/// promise features this server does not have.
+const DOMAIN_CAPABILITIES: [&str; 8] = [
+    // Active Directory, and the same OID every DC publishes.
+    "1.2.840.113556.1.4.800",
+    // Windows 2000.
+    "1.2.840.113556.1.4.1670",
+    // Windows Server 2003.
+    "1.2.840.113556.1.4.1791",
+    // Windows Server 2008.
+    "1.2.840.113556.1.4.1851",
+    // Windows Server 2008 R2.
+    "1.2.840.113556.1.4.1935",
+    // Windows Server 2012.
+    "1.2.840.113556.1.4.2012",
+    // Windows Server 2012 R2.
+    "1.2.840.113556.1.4.2080",
+    // Windows Server 2016 and later.
+    "1.2.840.113556.1.4.2197",
+];
 
 /// Handles a search request.
 ///
@@ -1292,9 +1310,18 @@ mod tests {
                 "{expected} is missing from {names:?}"
             );
         }
-        // The capability that says "this is Active Directory", and nothing that claims a level this
-        // server does not implement.
-        assert_eq!(DOMAIN_CAPABILITIES, ["1.2.840.113556.1.4.800"]);
+        // "This is Active Directory" must be first, and the functional-level ladder must be ordered:
+        // a client picks the highest level it recognises, so an unordered list would have it believe
+        // it is talking to whatever came last.
+        assert_eq!(DOMAIN_CAPABILITIES[0], "1.2.840.113556.1.4.800");
+        let levels: Vec<u32> = DOMAIN_CAPABILITIES[1..]
+            .iter()
+            .map(|oid| oid.rsplit('.').next().unwrap().parse().unwrap())
+            .collect();
+        assert!(
+            levels.windows(2).all(|pair| pair[0] < pair[1]),
+            "the levels are not in ascending order: {levels:?}"
+        );
     }
 
     #[test]

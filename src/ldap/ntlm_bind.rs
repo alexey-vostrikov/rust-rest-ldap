@@ -120,6 +120,24 @@ pub(crate) fn step(
 
             session.set_ntlm_negotiate(token.to_vec());
             session.set_ntlm_challenge(Some((challenge, stamp)));
+            // The flags the client asked for, because they decide whether a plain "success" is
+            // enough: a client that sets SIGN or SEAL expects an NTLM security layer, and a server
+            // that answers without one leaves it refused (measured on the AD-join stand, where the
+            // client reported LDAP result 53 `unwillingToPerform` for a bind that had otherwise
+            // verified).
+            if token.len() >= 16 {
+                let flags = u32::from_le_bytes([token[12], token[13], token[14], token[15]]);
+                tracing::debug!(
+                    flags = format_args!("0x{flags:08x}"),
+                    negotiate_unicode = flags & 0x0000_0001 != 0,
+                    negotiate_sign = flags & 0x0000_0010 != 0,
+                    negotiate_seal = flags & 0x0000_0020 != 0,
+                    negotiate_ntlm = flags & 0x0000_0200 != 0,
+                    negotiate_always_sign = flags & 0x0000_8000 != 0,
+                    negotiate_key_exch = flags & 0x4000_0000 != 0,
+                    "ntlm: what the client asked for"
+                );
+            }
             tracing::debug!(
                 round = "negotiate",
                 challenge = ?challenge,
@@ -204,13 +222,18 @@ pub(crate) fn step(
 
             tracing::info!(dn = %dn, "ntlm: logon accepted");
             session.set_ntlm_challenge(None);
-            // Raw success, no credentials.
+            // Raw success, no credentials - and that is exactly what a Windows client refuses.
             //
-            // Tried and measured the alternative: wrapping this round in `NegTokenResp` with
-            // `accept-completed` changes nothing (the join still stops with `0x78`), and wrapping the
-            // *challenge* makes it worse - the client answers "a directory service error has
-            // occurred", because it speaks bare NTLM and reads a SPNEGO envelope as a malformed
-            // challenge. So the answers stay raw, and the task records both experiments.
+            // Measured on the AD-join stand: `NetSetup.log` reports `NetpLdapBind: ldap_bind failed
+            // on samba.ad.example.com: 53: Unwilling To Perform` and the join ends with `0x3eb`, while
+            // this server has just answered success. The client asked for SIGN|SEAL|ALWAYS_SIGN in
+            // its NEGOTIATE and will not accept a bind that completes without the SASL security
+            // layer; a `LdapConnection` with `SessionOptions.Signing` or `Sealing` set reproduces the
+            // refusal in a second, and with neither set the same bind succeeds.
+            //
+            // The SPNEGO envelope is not the problem: wrapping the *challenge* in `NegTokenResp`
+            // makes the client answer "a directory service error has occurred", and wrapping this
+            // success changes nothing. Both experiments are recorded in the task.
             Ok(Round {
                 code: rasn_ldap::ResultCode::Success,
                 credentials: None,
