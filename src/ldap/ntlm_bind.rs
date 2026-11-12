@@ -126,6 +126,9 @@ pub(crate) fn step(
                 reply = answer.len(),
                 "ntlm: challenge sent"
             );
+            // Raw, not wrapped: measured on the AD-join stand, a `NegTokenResp` here makes the
+            // client stop with "a directory service error has occurred" - it is speaking bare NTLM
+            // and reads a SPNEGO envelope as a malformed challenge.
             Ok(Round {
                 code: rasn_ldap::ResultCode::SaslBindInProgress,
                 credentials: Some(answer),
@@ -201,6 +204,13 @@ pub(crate) fn step(
 
             tracing::info!(dn = %dn, "ntlm: logon accepted");
             session.set_ntlm_challenge(None);
+            // Raw success, no credentials.
+            //
+            // Tried and measured the alternative: wrapping this round in `NegTokenResp` with
+            // `accept-completed` changes nothing (the join still stops with `0x78`), and wrapping the
+            // *challenge* makes it worse - the client answers "a directory service error has
+            // occurred", because it speaks bare NTLM and reads a SPNEGO envelope as a malformed
+            // challenge. So the answers stay raw, and the task records both experiments.
             Ok(Round {
                 code: rasn_ldap::ResultCode::Success,
                 credentials: None,

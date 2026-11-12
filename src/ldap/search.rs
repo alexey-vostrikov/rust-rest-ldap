@@ -28,6 +28,14 @@ use crate::security::Security;
 /// Values of the root DSE that the server publishes.
 const ROOT_DSE_OBJECT_CLASS: [&str; 2] = ["top", "LDAProotDSE"];
 
+/// The capabilities a Windows client recognises in `supportedCapabilities`.
+///
+/// Deliberately one: `1.2.840.113556.1.4.800` is "this is Active Directory" and is the only claim
+/// this server can keep. Adding the level OIDs (1670, 1791, 1851, …) would tell a client it may use
+/// features of those levels - links, quotas, a schema partition - and a client that believes it asks
+/// for one and is refused reads the refusal as a broken controller.
+const DOMAIN_CAPABILITIES: [&str; 1] = ["1.2.840.113556.1.4.800"];
+
 /// Handles a search request.
 ///
 /// `controls` come from the message envelope; `respect_critical` decides whether
@@ -972,6 +980,70 @@ fn search_root_dse(
         false => attributes,
     };
 
+    // What a Windows client reads, and what nothing else does.
+    //
+    // `Add-Computer` reads this entry once, before it authenticates, and takes its idea of the domain
+    // from **`defaultNamingContext`** - not from `namingContexts`, which is the RFC 4512 name Samba's
+    // `ads_connect` uses. A server that publishes only the RFC attributes joins from Linux and is
+    // refused by Windows with `ERROR_CALL_NOT_IMPLEMENTED` (0x78, "Cannot complete this function")
+    // right after a successful bind, having asked for nothing more - measured on the AD-join stand.
+    //
+    // Published only when this server is a domain: `defaultNamingContext` on a plain directory would
+    // be a claim that a Windows machine may join something that has no realm behind it.
+    let attributes = match security.ad_names.as_ref() {
+        Some(domain) => {
+            let mut attributes = attributes
+                .push(crate::model::Attribute::single(
+                    "defaultNamingContext",
+                    base_dn,
+                ))
+                // The forest has one domain here, so the root is the same naming context; a
+                // deployment with a forest would need the real root, and until it has one this is
+                // the honest value rather than a second configured name.
+                .push(crate::model::Attribute::single(
+                    "rootDomainNamingContext",
+                    base_dn,
+                ))
+                .push(crate::model::Attribute::single(
+                    "dnsHostName",
+                    &domain.dns_host_name,
+                ))
+                .push(crate::model::Attribute::single(
+                    "ldapServiceName",
+                    &domain.ldap_service_name,
+                ))
+                // The DC's own name in AD's form: `CN=<name>,CN=Servers,...` lives in the
+                // configuration partition, which this server does not have, so this names the
+                // server and stops - a client that reads it for display gets a truthful answer.
+                .push(crate::model::Attribute::single(
+                    "serverName",
+                    &domain.server_name,
+                ))
+                .push(crate::model::Attribute::new(
+                    "supportedCapabilities",
+                    DOMAIN_CAPABILITIES
+                        .iter()
+                        .map(|oid| oid.to_string())
+                        .collect(),
+                ))
+                .push(crate::model::Attribute::single("domainFunctionality", "7"))
+                .push(crate::model::Attribute::single("forestFunctionality", "7"))
+                .push(crate::model::Attribute::single("isSynchronized", "TRUE"))
+                .push(crate::model::Attribute::single(
+                    "isGlobalCatalogReady",
+                    "FALSE",
+                ));
+            if let Some(configuration) = &domain.configuration_naming_context {
+                attributes = attributes.push(crate::model::Attribute::single(
+                    "configurationNamingContext",
+                    configuration,
+                ));
+            }
+            attributes
+        }
+        None => attributes,
+    };
+
     let selection: Vec<String> = request
         .attributes
         .iter()
@@ -1169,6 +1241,60 @@ mod tests {
             ]
         );
         assert_eq!(result_code(&messages), ResultCode::Success);
+    }
+
+    /// The attributes a domain controller publishes for a Windows client, and only when it is one.
+    ///
+    /// `Add-Computer` reads `defaultNamingContext` from this entry and takes its idea of the domain
+    /// from it - not from `namingContexts`, which is what Samba's `ads_connect` uses. Measured on the
+    /// AD-join stand: the attribute was absent and the value is exactly the naming context.
+    ///
+    /// The second half matters as much as the first: on a directory that is not a domain, claiming
+    /// `defaultNamingContext` would tell a machine it may join something with no realm behind it.
+    #[test]
+    fn the_root_dse_names_the_domain_only_when_this_server_is_one() {
+        let session = admin_session();
+        let request = request(
+            "",
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &[],
+        );
+
+        let plain = attribute_names(&search(&session, &request, None));
+        assert!(
+            !plain.contains(&"defaultNamingContext".to_string()),
+            "a plain directory must not claim a domain: {plain:?}"
+        );
+
+        let mut with_domain = security();
+        with_domain.ad_names = Some(crate::security::AdNames {
+            dns_host_name: "samba.ad.example.com".to_string(),
+            ldap_service_name: "AD.EXAMPLE.COM:host/samba.ad.example.com@AD.EXAMPLE.COM"
+                .to_string(),
+            server_name: "samba.ad.example.com".to_string(),
+            configuration_naming_context: None,
+        });
+        let messages = search_root_dse(1, &request, BASE, &with_domain);
+        let names = attribute_names(&messages);
+        for expected in [
+            "defaultNamingContext",
+            "rootDomainNamingContext",
+            "dnsHostName",
+            "ldapServiceName",
+            "serverName",
+            "supportedCapabilities",
+            "domainFunctionality",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected} is missing from {names:?}"
+            );
+        }
+        // The capability that says "this is Active Directory", and nothing that claims a level this
+        // server does not implement.
+        assert_eq!(DOMAIN_CAPABILITIES, ["1.2.840.113556.1.4.800"]);
     }
 
     #[test]

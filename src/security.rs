@@ -181,6 +181,24 @@ pub fn needs_restart(before: &Config, after: &Config) -> Vec<&'static str> {
     waiting
 }
 
+/// What a domain controller calls itself, for the root DSE alone.
+///
+/// `Add-Computer` reads these before it authenticates and takes its idea of the domain from
+/// `defaultNamingContext`. A server that publishes only the RFC 4512 attributes joins from Linux -
+/// Samba's `ads_connect` uses `namingContexts` - and is refused by Windows with `0x78`, having asked
+/// nothing more. Measured on the AD-join stand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdNames {
+    /// `dnsHostName`: the controller's DNS name, as the KDC's service principal spells it.
+    pub dns_host_name: String,
+    /// `ldapServiceName`: `REALM:host/fqdn@REALM`, which a client uses to pick the realm.
+    pub ldap_service_name: String,
+    /// `serverName`: the controller, in the form a client shows its user.
+    pub server_name: String,
+    /// `configurationNamingContext`, when this tree really has one.
+    pub configuration_naming_context: Option<String>,
+}
+
 /// Policy bundle passed to the handlers.
 ///
 /// One value instead of a growing parameter list: every new policy knob lands
@@ -245,6 +263,12 @@ pub struct Security {
     /// answer to it, and a second parameter threaded through every call site for one number is how
     /// a policy gets forgotten in one place and enforced in another.
     pub limits: crate::limits::Limits,
+    /// The names a domain controller publishes in its root DSE, when this server is one.
+    ///
+    /// Separate from `domain`, which is the SID issuer: the issuer knows the domain's identity and
+    /// nothing about how it is spelled on the network, and a client that reads `defaultNamingContext`
+    /// needs the spelling.
+    pub ad_names: Option<AdNames>,
     /// The GSSAPI acceptor, when a keytab was configured.
     ///
     /// `None` means SASL is not offered: a `GSSAPI` bind is refused with
@@ -262,6 +286,7 @@ impl Default for Security {
             domain: None,
             referrals: crate::referral::Referrals::default(),
             gssapi: None,
+            ad_names: None,
             limits: crate::limits::Limits::default(),
             passwords: PasswordPolicy::strict(),
             acl: Acl::default(),
@@ -341,7 +366,16 @@ impl Security {
             // Left empty: the keytab is read by the server that has one, not by every caller that
             // builds a policy from a configuration.
             gssapi: None,
+            // Left empty for the same reason: only the daemon knows the names it answers to.
+            ad_names: None,
         }
+    }
+
+    /// Says that this server is a domain controller answering to these names.
+    #[must_use]
+    pub fn with_ad_names(mut self, names: AdNames) -> Self {
+        self.ad_names = Some(names);
+        self
     }
 
     /// The same policy, able to accept Kerberos tickets.

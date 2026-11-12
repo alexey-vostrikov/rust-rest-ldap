@@ -429,6 +429,15 @@ pub fn handle_gssapi(
     // it arrives before any request and would otherwise be refused as a malformed one.
     #[cfg(feature = "smb")]
     let ntlm_layer = token.len() == 4 && session.ntlm_negotiate().is_some();
+
+    // Every LDAP operation a client asks for, by name and number. `Add-Computer` moves through
+    // several - a search for the domain, an add of the machine account, a modify of its attributes -
+    // and when it stops with `ERROR_CALL_NOT_IMPLEMENTED` the one thing needed is which operation it
+    // was on. Silent at `debug` for a bind that arrives every few seconds, and one line per request
+    // otherwise.
+    // The bind is the one operation this function is called for, so the interesting names are the
+    // others: a client that arrives with a search asks for something else entirely.
+    tracing::debug!(mechanism = %mechanism, "ldap: bind");
     #[cfg(not(feature = "smb"))]
     let ntlm = false;
 

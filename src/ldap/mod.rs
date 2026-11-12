@@ -291,6 +291,17 @@ pub fn handle(
         }
         ProtocolOp::AbandonRequest(_) => Action::Silent,
         ProtocolOp::SearchRequest(request) => {
+            // The name being asked for, at the level a client's own trace would show it. A join
+            // searches for the domain object before it writes anything, and when it stops with
+            // "the specified network resource or device is no longer available" the question is
+            // which name it had just asked for - a search that answers `noSuchObject` for the
+            // domain itself is indistinguishable from a broken connection unless this is logged.
+            tracing::debug!(
+                dn = %request.base_object.0,
+                scope = ?request.scope,
+                filter = ?request.filter,
+                "ldap: search"
+            );
             let messages = search::handle_search(
                 session,
                 directory,
@@ -437,6 +448,12 @@ pub fn handle(
                 return Action::StartTls(message_id);
             }
 
+            // The OID, always: an extended request this server does not implement is exactly the
+            // thing a client reports as "cannot complete this function", and the OID is what names
+            // the operation that was asked for. A refusal without it says "unsupported" to a
+            // question nobody can look up.
+            let asked = String::from_utf8_lossy(request.request_name.as_ref()).to_string();
+            tracing::debug!(oid = %asked, "ldap: extended");
             match extop::operation(request.request_name.as_ref()) {
                 extop::Operation::WhoAmI => {
                     Action::Reply(extop::handle_whoami(session, message_id))
@@ -469,16 +486,24 @@ pub fn handle(
                         }
                     }
                 }
-                extop::Operation::Unknown => Action::Reply(vec![responses::extended_response(
-                    message_id,
-                    ResultCode::UnwillingToPerform,
-                    "unsupported extended operation",
-                    None,
-                )]),
+                extop::Operation::Unknown => {
+                    tracing::info!(oid = %asked, "ldap: extended operation not implemented");
+                    Action::Reply(vec![responses::extended_response(
+                        message_id,
+                        ResultCode::UnwillingToPerform,
+                        "unsupported extended operation",
+                        None,
+                    )])
+                }
             }
         }
-        // A client must not send responses to the server.
-        _ => Action::Close,
+        // A client must not send responses to the server. Named before closing: a join that ends
+        // without an answer is otherwise invisible, and "the connection closed" is the one symptom
+        // this server can still explain.
+        other => {
+            tracing::warn!(op = ?std::mem::discriminant(&other), "ldap: operation not handled");
+            Action::Close
+        }
     }
 }
 

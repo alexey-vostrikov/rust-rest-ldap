@@ -600,6 +600,44 @@ async fn serve() {
     #[cfg(not(feature = "kdc"))]
     let security = Security::from_config(&config);
 
+    // The names a Windows client reads out of the root DSE, when this process is a domain
+    // controller. `dnsHostName` and `ldapServiceName` come from the realm and the advertised host,
+    // because a client matches them against the ticket it can ask for: a name here that no service
+    // principal answers to sends it to a controller it cannot use.
+    #[cfg(feature = "kdc")]
+    let security = match config.kerberos.realm.as_deref() {
+        Some(realm) if config.kerberos.enabled => {
+            let host = config
+                .cldap
+                .dns_host
+                .clone()
+                .or_else(|| {
+                    config.smb.dns_domain.as_ref().map(|domain| {
+                        format!(
+                            "{}.{}",
+                            config
+                                .smb
+                                .netbios_name
+                                .clone()
+                                .unwrap_or_else(|| "localhost".to_string())
+                                .to_lowercase(),
+                            domain
+                        )
+                    })
+                })
+                .unwrap_or_else(|| "localhost".to_string());
+            security.with_ad_names(rust_rest_ldap::security::AdNames {
+                dns_host_name: host.clone(),
+                ldap_service_name: format!("{realm}:host/{host}@{realm}"),
+                server_name: host,
+                // This tree has no configuration partition: a name pointing at a DN that does not
+                // exist is worse than an absent attribute, and a client that needs one asks.
+                configuration_naming_context: None,
+            })
+        }
+        _ => security,
+    };
+
     let security = security
         .with_gssapi(gssapi)
         .with_schema(source.shared_schema())
