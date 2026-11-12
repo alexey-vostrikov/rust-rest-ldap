@@ -53,6 +53,7 @@ fn raw_person(cn: &str) -> Entry {
 
 async fn serve(entries: Vec<Entry>) -> String {
     let config = Config {
+        emulation: rust_rest_ldap::emulation::EmulationConfig::default(),
         #[cfg(feature = "kdc")]
         kerberos: Default::default(),
         #[cfg(feature = "smb")]

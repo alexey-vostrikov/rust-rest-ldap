@@ -1044,8 +1044,30 @@ fn search_root_dse(
                         .map(|oid| oid.to_string())
                         .collect(),
                 ))
-                .push(crate::model::Attribute::single("domainFunctionality", "7"))
-                .push(crate::model::Attribute::single("forestFunctionality", "7"))
+                .push(crate::model::Attribute::single(
+                    "domainFunctionality",
+                    domain.emulation.functionality(),
+                ))
+                .push(crate::model::Attribute::single(
+                    "forestFunctionality",
+                    domain.emulation.functionality(),
+                ))
+                // What this domain claims to be. Windows publishes no `objectVersion` here - it lives
+                // on `CN=Schema,CN=Configuration` - but a client and an operator both look for it, and
+                // this server keeps no schema partition to put it in. Publishing it where a reader
+                // asks is better than a name that resolves to a DN that does not exist.
+                .push(crate::model::Attribute::single(
+                    "objectVersion",
+                    &domain.emulation.object_version(),
+                ))
+                .push(crate::model::Attribute::single(
+                    "operatingSystem",
+                    &domain.emulation.operating_system(),
+                ))
+                .push(crate::model::Attribute::single(
+                    "operatingSystemVersion",
+                    &domain.emulation.operating_system_version(),
+                ))
                 .push(crate::model::Attribute::single("isSynchronized", "TRUE"))
                 .push(crate::model::Attribute::single(
                     "isGlobalCatalogReady",
@@ -1293,6 +1315,7 @@ mod tests {
                 .to_string(),
             server_name: "samba.ad.example.com".to_string(),
             configuration_naming_context: None,
+            emulation: crate::emulation::EmulationConfig::default(),
         });
         let messages = search_root_dse(1, &request, BASE, &with_domain);
         let names = attribute_names(&messages);
@@ -1310,9 +1333,8 @@ mod tests {
                 "{expected} is missing from {names:?}"
             );
         }
-        // "This is Active Directory" must be first, and the functional-level ladder must be ordered:
-        // a client picks the highest level it recognises, so an unordered list would have it believe
-        // it is talking to whatever came last.
+        // The capability that says "this is Active Directory", and the ladder order that lets a
+        // client pick a level.
         assert_eq!(DOMAIN_CAPABILITIES[0], "1.2.840.113556.1.4.800");
         let levels: Vec<u32> = DOMAIN_CAPABILITIES[1..]
             .iter()
@@ -1322,6 +1344,52 @@ mod tests {
             levels.windows(2).all(|pair| pair[0] < pair[1]),
             "the levels are not in ascending order: {levels:?}"
         );
+    }
+
+    #[test]
+    fn the_root_dse_publishes_the_emulated_release_and_its_schema() {
+        // What a client reads to decide which release it is talking to, and what an operator reads to
+        // see that the answer is an emulation rather than Microsoft's own build.
+        let request = request(
+            "",
+            SearchRequestScope::BaseObject,
+            present("objectClass"),
+            0,
+            &[],
+        );
+        let emulation = crate::emulation::EmulationConfig {
+            schema_version: 91,
+            ..Default::default()
+        };
+        let mut with_domain = security();
+        with_domain.ad_names = Some(crate::security::AdNames {
+            dns_host_name: "samba.ad.example.com".to_string(),
+            ldap_service_name: "AD.EXAMPLE.COM:host/samba.ad.example.com@AD.EXAMPLE.COM"
+                .to_string(),
+            server_name: "samba.ad.example.com".to_string(),
+            configuration_naming_context: None,
+            emulation,
+        });
+        let messages = search_root_dse(1, &request, BASE, &with_domain);
+
+        for (name, expected) in [
+            ("objectVersion", "91"),
+            // sch89 and later are level 10, the first new level since 2016.
+            ("domainFunctionality", "10"),
+            ("forestFunctionality", "10"),
+            (
+                "operatingSystem",
+                "RRL Domain «Windows Server 2022» emulation",
+            ),
+            ("operatingSystemVersion", "10.0 (20348) RRL"),
+        ] {
+            assert_eq!(
+                attribute_values(&messages, name),
+                vec![expected.to_string()],
+                "{name} is published as {:?}",
+                attribute_values(&messages, name)
+            );
+        }
     }
 
     #[test]

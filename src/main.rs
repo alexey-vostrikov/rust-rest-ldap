@@ -93,6 +93,13 @@ async fn serve() {
         Err(err) => fatal(&err.message()),
     };
 
+    // A schema version outside the range this server can publish, or an empty name, is a
+    // configuration that silently lies to every client that reads the root DSE: fail here, where an
+    // operator sees it, rather than answer something that cannot be true.
+    if let Err(err) = config.emulation.validate() {
+        fatal(&err);
+    }
+
     // Before anything else that could fail: a startup error is the one an operator most needs
     // to see reported, and until the subscriber exists every `error!` in this process is a no-op.
     if let Err(err) = rust_rest_ldap::logging::install(&config) {
@@ -633,6 +640,7 @@ async fn serve() {
                 // This tree has no configuration partition: a name pointing at a DN that does not
                 // exist is worse than an absent attribute, and a client that needs one asks.
                 configuration_naming_context: None,
+                emulation: config.emulation.clone(),
             })
         }
         _ => security,

@@ -281,6 +281,8 @@ pub struct Config {
     pub http_listen_addr: Option<String>,
     pub callback_auth_token: Option<String>,
     pub passwords: PasswordPolicy,
+    /// What this directory says it is, to a client that asks the way Windows does.
+    pub emulation: crate::emulation::EmulationConfig,
     pub schema: Schema,
     pub schema_mode: SchemaMode,
     /// The files the extra definitions were read from, kept so a reload can re-read them.
@@ -494,6 +496,9 @@ struct FileConfig {
     /// CLDAP ping, off unless asked for.
     #[serde(default)]
     cldap: crate::cldap::CldapConfig,
+    /// What this directory says it is, to a client that asks the way Windows does.
+    #[serde(default)]
+    emulation: crate::emulation::EmulationConfig,
     /// The KDC, off unless asked for.
     #[cfg(feature = "kdc")]
     #[serde(default)]
@@ -873,6 +878,7 @@ pub fn resolve(
         limits: crate::limits::Limits::from_config(&file.limits),
         cache: file.cache,
         cldap: file.cldap,
+        emulation: file.emulation,
         #[cfg(feature = "kdc")]
         kerberos: file.kerberos.clone(),
         #[cfg(feature = "smb")]

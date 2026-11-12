@@ -1033,6 +1033,7 @@ mod tests {
             .expect("seed");
 
         let config = crate::config::Config {
+            emulation: crate::emulation::EmulationConfig::default(),
             #[cfg(feature = "kdc")]
             kerberos: crate::kerberos::KerberosConfig::default(),
             #[cfg(feature = "smb")]

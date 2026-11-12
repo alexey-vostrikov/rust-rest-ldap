@@ -185,6 +185,7 @@ mod tests {
         std::fs::write(&groups_path, "[]").expect("groups");
 
         let config = crate::config::Config {
+            emulation: crate::emulation::EmulationConfig::default(),
             #[cfg(feature = "kdc")]
             kerberos: crate::kerberos::KerberosConfig::default(),
             #[cfg(feature = "smb")]

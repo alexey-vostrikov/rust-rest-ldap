@@ -1738,6 +1738,7 @@ mod tests {
 
     fn config(users: &str, groups: &str) -> Config {
         let mut config = Config {
+            emulation: crate::emulation::EmulationConfig::default(),
             #[cfg(feature = "kdc")]
             kerberos: crate::kerberos::KerberosConfig::default(),
             #[cfg(feature = "smb")]

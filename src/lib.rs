@@ -34,6 +34,7 @@ pub mod dn;
 /// resolver serves the name; on, the zone lives in this server's own tree as AD stores it.
 #[cfg(feature = "dns")]
 pub mod dns;
+pub mod emulation;
 pub mod http;
 pub mod i18n;
 pub mod import;

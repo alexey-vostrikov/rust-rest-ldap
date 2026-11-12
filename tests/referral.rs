@@ -42,6 +42,7 @@ async fn serve(
     let _ = Directory::from_entries(base, "users", "groups", entries.clone());
 
     let config = Config {
+        emulation: rust_rest_ldap::emulation::EmulationConfig::default(),
         #[cfg(feature = "kdc")]
         kerberos: Default::default(),
         #[cfg(feature = "smb")]

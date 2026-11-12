@@ -910,6 +910,7 @@ mod tests {
 
     fn test_config() -> crate::config::Config {
         crate::config::Config {
+            emulation: crate::emulation::EmulationConfig::default(),
             #[cfg(feature = "kdc")]
             kerberos: crate::kerberos::KerberosConfig::default(),
             #[cfg(feature = "smb")]

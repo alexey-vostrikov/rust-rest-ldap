@@ -197,6 +197,9 @@ pub struct AdNames {
     pub server_name: String,
     /// `configurationNamingContext`, when this tree really has one.
     pub configuration_naming_context: Option<String>,
+    /// What this domain says it is when a client asks like Windows: the product name, the build, and
+    /// the schema version it publishes as `objectVersion`.
+    pub emulation: crate::emulation::EmulationConfig,
 }
 
 /// Policy bundle passed to the handlers.
