@@ -17,4 +17,5 @@
 //! this build does not read are carried through untouched - see [`record::Data::Other`] - so a zone
 //! written by a tool with a wider type set survives a round trip through this server.
 
+pub mod property;
 pub mod record;
