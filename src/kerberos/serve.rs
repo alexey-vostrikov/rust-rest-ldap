@@ -43,8 +43,112 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Answers datagrams until `shutdown` flips or the socket fails.
+/// The `e-text` of a `KRB-ERROR`, so the log carries the reason the KDC itself gave.
+///
+/// `KRB-ERROR ::= … e-text [11] KerberosString OPTIONAL`, and a refusal that names its cause is
+/// worth more than the code alone: code 50 is both "no checksum" and "the checksum does not belong
+/// to this session key", which are different defects.
+fn krb_error_text(bytes: &[u8]) -> Option<String> {
+    if bytes.first() != Some(&0x7e) {
+        return None;
+    }
+    let mut index = 1;
+    while index + 2 < bytes.len() {
+        if bytes[index] == 0xab {
+            let length = bytes[index + 1] as usize;
+            if index + 2 + length <= bytes.len() && length > 0 {
+                return Some(
+                    String::from_utf8_lossy(&bytes[index + 2..index + 2 + length]).into_owned(),
+                );
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The octets of a datagram as hex, for the log.
+///
+/// Gated by `RRD_KDC_HEX`: a realm or a name is inside an AS-REQ in a form no other log line shows,
+/// and a client that is refused for the case of its realm looks exactly like one refused for its
+/// name until the bytes are read. Off by default, because a KDC log is not a packet archive.
+fn hex_of(bytes: &[u8]) -> String {
+    if std::env::var_os("RRD_KDC_HEX").is_none() {
+        return String::from("<set RRD_KDC_HEX to log the octets>");
+    }
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for octet in bytes {
+        out.push_str(&format!("{octet:02x}"));
+    }
+    out
+}
+
+/// What a Kerberos message is, by the ASN.1 application tag of its first octet.
+///
+/// Used only for logging: a client that never reaches the KDC and one that is refused look identical
+/// in a server log without it, and the difference decides where the fault is.
+fn krb_message_kind(tag: u8) -> &'static str {
+    match tag {
+        0x6a => "AS-REQ",
+        0x6b => "AS-REP",
+        0x6c => "TGS-REQ",
+        0x6d => "TGS-REP",
+        0x6e => "AP-REQ",
+        0x6f => "AP-REP",
+        0x74 => "KRB-PRIV",
+        0x7e => "KRB-ERROR",
+        _ => "other",
+    }
+}
+
+/// The `error-code` inside a `KRB-ERROR`, so the log says why a request was refused.
+///
+/// `KRB-ERROR ::= [APPLICATION 30] SEQUENCE { pvno [0], msg-type [1], …, error-code [6] INTEGER,
+/// … }`. Everything before `[6]` is optional, so the tag is searched for rather than counted to: a
+/// position-based reader would be wrong on any message that omits `ctime`/`cusec`.
+fn krb_error_code(bytes: &[u8]) -> Option<i32> {
+    if bytes.first() != Some(&0x7e) {
+        return None;
+    }
+    let mut index = 1;
+    while index + 4 < bytes.len() {
+        if bytes[index] == 0xa6 {
+            let outer = bytes[index + 1] as usize;
+            if outer >= 3 && index + 2 + outer <= bytes.len() && bytes[index + 2] == 0x02 {
+                let inner = bytes[index + 3] as usize;
+                if (1..=4).contains(&inner) && index + 4 + inner <= bytes.len() {
+                    let mut value: i32 = 0;
+                    for octet in &bytes[index + 4..index + 4 + inner] {
+                        value = (value << 8) | i32::from(*octet);
+                    }
+                    return Some(value);
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The name of a Kerberos error code, for the log only.
+fn krb_error_name(code: i32) -> &'static str {
+    match code {
+        0 => "KDC_ERR_NONE",
+        6 => "KDC_ERR_C_PRINCIPAL_UNKNOWN",
+        7 => "KDC_ERR_S_PRINCIPAL_UNKNOWN",
+        12 => "KDC_ERR_POLICY",
+        18 => "KDC_ERR_CLIENT_REVOKED",
+        24 => "KDC_ERR_PREAUTH_FAILED",
+        25 => "KDC_ERR_PREAUTH_REQUIRED",
+        37 => "KRB_AP_ERR_SKEW",
+        52 => "KRB_AP_ERR_BAD_INTEGRITY",
+        60 => "KDC_ERR_WRONG_REALM",
+        _ => "see RFC 4120 5.2.9",
+    }
+}
+
 pub async fn serve_udp(socket: UdpSocket, kdc: Arc<Kdc>, mut shutdown: watch::Receiver<bool>) {
+    // Answers datagrams until `shutdown` flips or the socket fails.
     let mut buffer = vec![0u8; DATAGRAM];
     loop {
         tokio::select! {
@@ -66,6 +170,23 @@ pub async fn serve_udp(socket: UdpSocket, kdc: Arc<Kdc>, mut shutdown: watch::Re
                     }
                 };
                 let reply = kdc.handle_from(&buffer[..length], now(), Some(peer.ip()));
+                // What actually arrived, since nothing else in the KDC says so and "the client never
+                // asked" and "the client asked and was refused" are different problems. The first
+                // octet is the ASN.1 tag of the message: 0x6a AS-REQ, 0x6c TGS-REQ, 0x6e AP-REQ,
+                // 0x7e KRB-ERROR, 0x6b AS-REP, 0x6d TGS-REP.
+                tracing::debug!(
+                    peer = %peer,
+                    length,
+                    tag = format_args!("0x{:02x}", buffer.first().copied().unwrap_or(0)),
+                    kind = krb_message_kind(buffer.first().copied().unwrap_or(0)),
+                    reply_length = reply.len(),
+                    reply_tag = format_args!("0x{:02x}", reply.first().copied().unwrap_or(0)),
+                    error = krb_error_code(&reply)
+                        .map(|code| format!("{code} {}", krb_error_name(code))),
+                    error_text = krb_error_text(&reply),
+                    request_hex = %hex_of(&buffer[..length]),
+                    "kerberos: datagram"
+                );
                 if let Err(err) = socket.send_to(&reply, peer).await {
                     eprintln!("kerberos: sendto {peer}: {err}");
                 }
@@ -187,7 +308,13 @@ pub async fn start(
         source.directory().await,
     ));
     let config = KdcConfig::new(&settings.realm)
-        .map_err(|err| format!("realm '{}': {err}", settings.realm))?;
+        .map_err(|err| format!("realm '{}': {err}", settings.realm))?
+        // This process serves a Windows domain, and Windows sends a UPN logon as an enterprise name
+        // with the `canonicalize` bit clear (`kdc-options` 0x40800010, measured on the AD-join stand).
+        // The strict default refuses exactly that, so it is turned off here and only here: a
+        // standalone KDC keeps it, because renaming a client that did not ask is what RFC 6806 §6
+        // warns about.
+        .with_enterprise_requires_canonicalize(false);
     let kdc = Arc::new(Kdc::new(
         config,
         Arc::new(LdapHdb::new(
