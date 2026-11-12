@@ -798,8 +798,15 @@ pub async fn serve_with(
                     )
                     .await;
 
+                    // Why a connection ended, at the level a debugging session needs. A client that
+                    // stops after a successful bind leaves nothing else behind, and "we closed it" and
+                    // "it closed" are different problems: the first is a defect here, the second is a
+                    // decision on the client's side. Measured on the AD-join stand, where the join
+                    // stopped with `0x78` and the log could not say which.
                     match outcome {
-                        Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) | Ok(Hangup::Shutdown) => {}
+                        Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) | Ok(Hangup::Shutdown) => {
+                            tracing::debug!(peer = %peer, how = ?outcome.as_ref().ok(), "ldap: connection closed");
+                        }
                         Ok(Hangup::Malformed) => {
                             eprintln!(
                                 "{}",
