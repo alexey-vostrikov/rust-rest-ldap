@@ -30,15 +30,32 @@ fn main() {
         return;
     }
 
-    let tag = Command::new("git")
-        .args(["describe", "--all", "--abbrev=4"])
-        .current_dir(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()))
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty());
+    // The ref name a tag or branch has, when `describe` names one. `--all` reports the namespace, and
+    // the namespace is not part of a version: a client reading `operatingSystemVersion` wants `0.0.1`,
+    // not `tags/0.0.1`.
+    let describe = |args: &[&str]| -> Option<String> {
+        Command::new("git")
+            .args(args)
+            .current_dir(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()))
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    };
+
+    // A tag when one is reachable, and the distance and hash of a describe past it (`0.0.1-3-gab12` is
+    // a version, and it is the honest one). The distance stays because a build three commits after a
+    // release is not that release.
+    let tag = describe(&["describe", "--all", "--abbrev=4"]).and_then(|text| {
+        if let Some(name) = text.strip_prefix("tags/") {
+            return Some(name.to_string());
+        }
+        // `heads/…` means no tag was reachable, and a branch name is not a version: two builds a week
+        // apart both answer `main`. The commit hash is what identifies the build.
+        describe(&["rev-parse", "--short=4", "HEAD"])
+    });
 
     let value = tag.unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
     let value = if value.is_empty() {
