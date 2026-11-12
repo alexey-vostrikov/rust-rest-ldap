@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use rust_rest_ldap::backend::{Backend, EntryChange};
-use rust_rest_ldap::config::{Args, Config};
-use rust_rest_ldap::index::Query;
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::reload::Source;
+use rrl_directory::backend::{Backend, EntryChange};
+use rrl_directory::config::{Args, Config};
+use rrl_directory::index::Query;
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::reload::Source;
 
 const BASE: &str = "dc=example,dc=com";
 
@@ -51,7 +51,7 @@ indexes:
 ",
         path.display()
     );
-    rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
+    rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
 }
 
 fn open(path: &std::path::Path) -> Backend {

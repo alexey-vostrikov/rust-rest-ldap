@@ -10,8 +10,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::model::User;
+use rrl_directory::directory::Directory;
+use rrl_directory::model::User;
 
 struct Counting;
 

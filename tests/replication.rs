@@ -23,7 +23,7 @@ use rasn_ldap::{
     AddRequest, Attribute as PartialAttribute, AttributeDescription, AttributeValue, DelRequest,
     LdapDn, ProtocolOp,
 };
-use rust_rest_ldap::client::{Client, Options};
+use rrl_directory::client::{Client, Options};
 
 const BASE: &str = "dc=example,dc=com";
 
@@ -77,7 +77,7 @@ fn start(port: u16, server_id: u16, peer: Option<u16>) -> Node {
     file.write_all(config(port, server_id, peer, &path).as_bytes())
         .expect("write config");
 
-    let binary: PathBuf = env!("CARGO_BIN_EXE_rust-rest-ldap").into();
+    let binary: PathBuf = env!("CARGO_BIN_EXE_rrl-directory").into();
     let mut child = std::process::Command::new(binary)
         .arg("-c")
         .arg(&config_path)
@@ -110,7 +110,7 @@ fn query(base: &str, filter: &str, attributes: &[&str]) -> rasn_ldap::SearchRequ
         0,
         0,
         false,
-        rust_rest_ldap::ldap::filter_parse::parse(filter).expect("filter"),
+        rrl_directory::ldap::filter_parse::parse(filter).expect("filter"),
         attributes
             .iter()
             .map(|name| rasn_ldap::LdapString::from(*name))
@@ -224,7 +224,7 @@ async fn an_entry_written_on_one_node_appears_on_the_other() {
         .search(query(&base, "(cn=alice)", &["entryCSN"]))
         .await
         .expect("search");
-    let csn = rust_rest_ldap::client::entry_of(&messages[0])
+    let csn = rrl_directory::client::entry_of(&messages[0])
         .expect("an entry")
         .attributes()
         .get("entryCSN")
@@ -232,7 +232,7 @@ async fn an_entry_written_on_one_node_appears_on_the_other() {
         .cloned()
         .expect("a csn");
 
-    let parsed = rust_rest_ldap::replication::Csn::parse(&csn).expect("a parseable csn");
+    let parsed = rrl_directory::replication::Csn::parse(&csn).expect("a parseable csn");
     assert_eq!(
         parsed.server, 1,
         "the change belongs to the node that made it, not to the one that received it"

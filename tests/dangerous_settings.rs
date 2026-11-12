@@ -13,15 +13,15 @@
 
 use std::path::PathBuf;
 
-use rust_rest_ldap::config::{Args, Config, ConfigError};
-use rust_rest_ldap::danger::{ACKNOWLEDGEMENT, Danger};
+use rrl_directory::config::{Args, Config, ConfigError};
+use rrl_directory::danger::{ACKNOWLEDGEMENT, Danger};
 
 fn no_env(_: &str) -> Option<String> {
     None
 }
 
 fn resolve(text: &str) -> Result<Config, ConfigError> {
-    rust_rest_ldap::config::resolve(Args::default(), Some(text), no_env)
+    rrl_directory::config::resolve(Args::default(), Some(text), no_env)
 }
 
 #[test]
@@ -267,8 +267,7 @@ fn the_default_configuration_of_this_repository_is_acknowledged() {
         config: Some(PathBuf::from("config.yaml")),
         ..Args::default()
     };
-    let cfg =
-        rust_rest_ldap::config::resolve(args, Some(&text), no_env).expect("repository config");
+    let cfg = rrl_directory::config::resolve(args, Some(&text), no_env).expect("repository config");
 
     assert_eq!(
         Danger::parse(ACKNOWLEDGEMENT),
@@ -304,7 +303,7 @@ fn removing_the_master_switch_from_the_example_config_breaks_it() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let error = rust_rest_ldap::config::resolve(Args::default(), Some(&text), no_env)
+    let error = rrl_directory::config::resolve(Args::default(), Some(&text), no_env)
         .expect_err("without the master switch the config must not load");
 
     assert!(

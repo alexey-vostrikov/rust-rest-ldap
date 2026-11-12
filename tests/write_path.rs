@@ -13,13 +13,13 @@ use rasn_ldap::{
     ModifyRequest, ModifyRequestChanges, PartialAttribute, ProtocolOp, ResultCode, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::backend::{Backend, EntryChange};
-use rust_rest_ldap::config::{Args, Config};
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::ldap::{Action, handle};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::reload::Source;
-use rust_rest_ldap::security::Security;
+use rrl_directory::backend::{Backend, EntryChange};
+use rrl_directory::config::{Args, Config};
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::ldap::{Action, handle};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::reload::Source;
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ALICE_DN: &str = "cn=alice,ou=users,dc=example,dc=com";
@@ -52,7 +52,7 @@ backends:
 ",
         path.display()
     );
-    rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
+    rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
 }
 
 /// A source over an empty redb file, seeded with two users.
@@ -130,7 +130,7 @@ async fn run_search(
     // The security bundle carries the schema; the write tests need it to match the
     // one the source was loaded with.
     let security = Security {
-        schema: rust_rest_ldap::security::shared_schema(rust_rest_ldap::schema::Schema::core()),
+        schema: rrl_directory::security::shared_schema(rrl_directory::schema::Schema::core()),
         ..security
     };
 

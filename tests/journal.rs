@@ -14,9 +14,9 @@
 //!   what it was before - undoing a change is not what a replica needs, and storing every old
 //!   value would make the journal the size of the directory's whole past.
 
-use rust_rest_ldap::backend::redb_store::{ChangeKind, ChangeRecord};
-use rust_rest_ldap::backend::{Backend, EntryChange};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
+use rrl_directory::backend::redb_store::{ChangeKind, ChangeRecord};
+use rrl_directory::backend::{Backend, EntryChange};
+use rrl_directory::model::{Attribute, Attributes, Entry};
 
 fn store(dir: &std::path::Path) -> Backend {
     Backend::from_config(
@@ -39,11 +39,7 @@ fn person(cn: &str, sn: &str) -> Entry {
             .push(Attribute::single("sn", sn)),
     );
 
-    rust_rest_ldap::operational::stamp_write(
-        &entry,
-        "cn=admin,dc=example,dc=com",
-        SystemTime::now(),
-    )
+    rrl_directory::operational::stamp_write(&entry, "cn=admin,dc=example,dc=com", SystemTime::now())
 }
 
 use std::time::SystemTime;

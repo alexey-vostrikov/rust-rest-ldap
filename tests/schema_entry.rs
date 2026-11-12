@@ -9,11 +9,11 @@ use rasn_ldap::{
     AttributeDescription, LdapDn, LdapMessage, ProtocolOp, ResultCode, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::ldap::{Action, handle};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::ldap::{Action, handle};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ALICE_DN: &str = "cn=alice,ou=users,dc=example,dc=com";

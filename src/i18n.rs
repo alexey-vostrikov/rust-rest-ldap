@@ -383,7 +383,7 @@ const ENGLISH: &[(&str, &str)] = &[
     // Startup
     (
         "start.banner",
-        "rust-rest-ldap {version}: backend '{backend}', base '{base}', {users} users, {groups} groups",
+        "rrl-directory {version}: backend '{backend}', base '{base}', {users} users, {groups} groups",
     ),
     (
         "start.danger",
@@ -559,7 +559,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     (
         "error.store_path_missing",
-        "--{command} needs the store directory: pass it with -c /etc/rust-rest-ldap/config.d",
+        "--{command} needs the store directory: pass it with -c /etc/rrl-directory/config.d",
     ),
     (
         "error.store_not_a_directory",
@@ -982,7 +982,7 @@ mod tests {
         assert_eq!(
             catalog
                 .text("start.banner")
-                .map(|text| text.starts_with("rust-rest-ldap")),
+                .map(|text| text.starts_with("rrl-directory")),
             Some(true),
             "a key the file does not have falls back to English"
         );

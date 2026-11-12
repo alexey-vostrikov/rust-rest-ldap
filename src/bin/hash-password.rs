@@ -4,7 +4,7 @@
 //! hash into the data without running the server.
 
 use clap::Parser;
-use rust_rest_ldap::password::{StoreScheme, hash};
+use rrl_directory::password::{StoreScheme, hash};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,7 +33,7 @@ fn main() {
                 Err(err) => {
                     eprintln!(
                         "{}",
-                        rust_rest_ldap::i18n::t("error.write", &[("detail", &err.to_string())])
+                        rrl_directory::i18n::t("error.write", &[("detail", &err.to_string())])
                     );
                     std::process::exit(1);
                 }

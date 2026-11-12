@@ -50,7 +50,7 @@ pub struct Options {
 /// Renders `entries` as a YAML document.
 pub fn export(entries: &[Entry], options: Options) -> String {
     let mut out = String::new();
-    out.push_str("# rust-rest-ldap directory export\n");
+    out.push_str("# rrl-directory directory export\n");
     out.push_str(
         "# Every value is quoted on purpose: unquoted, YAML would turn \"no\" into false\n\
          # and \"012\" into the number 10.\n",
@@ -200,7 +200,7 @@ mod tests {
     fn a_simple_entry_is_written_as_yaml() {
         assert_eq!(
             export(&[entry()], Options::default()),
-            "# rust-rest-ldap directory export\n\
+            "# rrl-directory directory export\n\
              # Every value is quoted on purpose: unquoted, YAML would turn \"no\" into false\n\
              # and \"012\" into the number 10.\n\
              entries:\n\

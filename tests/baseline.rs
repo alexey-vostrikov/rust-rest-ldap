@@ -10,9 +10,9 @@
 use std::time::Instant;
 
 use rasn_ldap::{AttributeDescription, AttributeValueAssertion, Filter};
-use rust_rest_ldap::directory::{Directory, Scope};
-use rust_rest_ldap::ldap::filter;
-use rust_rest_ldap::model::User;
+use rrl_directory::directory::{Directory, Scope};
+use rrl_directory::ldap::filter;
+use rrl_directory::model::User;
 
 fn directory(entries: usize) -> Directory {
     let users = (0..entries)
@@ -131,7 +131,7 @@ fn baseline_memory_per_entry() {
         ..User::default()
     };
     let attributes =
-        rust_rest_ldap::mapping::gorestldap::user_entry(&user, "dc=example,dc=com", "users")
+        rrl_directory::mapping::gorestldap::user_entry(&user, "dc=example,dc=com", "users")
             .attributes()
             .clone();
 

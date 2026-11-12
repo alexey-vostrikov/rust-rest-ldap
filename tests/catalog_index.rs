@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use redb::ReadableTableMetadata;
 
-use rust_rest_ldap::catalog::Catalog;
-use rust_rest_ldap::catalog::index::{
+use rrl_directory::catalog::Catalog;
+use rrl_directory::catalog::index::{
     PAGE, Plan, fold, pattern_trigrams, read_eq, read_pres, read_sub,
 };
-use rust_rest_ldap::catalog::store::{Change, Store};
-use rust_rest_ldap::index::{Index, IndexConfig, Kind, Query};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
+use rrl_directory::catalog::store::{Change, Store};
+use rrl_directory::index::{Index, IndexConfig, Kind, Query};
+use rrl_directory::model::{Attribute, Attributes, Entry};
 
 const BASE: &str = "dc=example,dc=com";
 
@@ -197,13 +197,13 @@ fn count_rows(store: &Store, table: &str) -> u64 {
     let read = store.read().expect("read");
     match table {
         "idx_eq" => {
-            let Ok(table) = read.open_table(rust_rest_ldap::catalog::index::IDX_EQ) else {
+            let Ok(table) = read.open_table(rrl_directory::catalog::index::IDX_EQ) else {
                 return 0;
             };
             table.len().expect("len")
         }
         "idx_sub" => {
-            let Ok(table) = read.open_table(rust_rest_ldap::catalog::index::IDX_SUB) else {
+            let Ok(table) = read.open_table(rrl_directory::catalog::index::IDX_SUB) else {
                 return 0;
             };
             table.len().expect("len")

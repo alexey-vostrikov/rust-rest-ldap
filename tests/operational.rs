@@ -14,13 +14,13 @@ use rasn_ldap::{
     PartialAttribute, ProtocolOp, ResultCode, SearchRequest, SearchRequestDerefAliases,
     SearchRequestScope,
 };
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::modify::{self, Outcome};
-use rust_rest_ldap::ldap::search::handle_search;
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::operational::{self, ATTR_ENTRY_CSN, ATTR_MODIFY_TIMESTAMP};
-use rust_rest_ldap::security::Security;
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::modify::{self, Outcome};
+use rrl_directory::ldap::search::handle_search;
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::operational::{self, ATTR_ENTRY_CSN, ATTR_MODIFY_TIMESTAMP};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
@@ -168,7 +168,7 @@ fn an_explicit_request_returns_the_named_operational_attribute() {
 #[test]
 fn the_values_are_what_the_schema_expects() {
     let directory = Directory::from_entries(BASE, "users", "groups", vec![stamped()]);
-    let schema = rust_rest_ldap::schema::Schema::core();
+    let schema = rrl_directory::schema::Schema::core();
     let found = search(&directory, ALICE_DN, &["+"]);
 
     for name in ["createtimestamp", "modifytimestamp"] {

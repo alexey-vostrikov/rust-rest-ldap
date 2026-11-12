@@ -1,4 +1,4 @@
-# rust-rest-ldap
+# rrl-directory
 
 LDAP-сервер на Rust: каталог в памяти, данные из бэкенда, запись через протокол.
 
@@ -64,7 +64,7 @@ make check     # fmt --check, clippy -D warnings, все тесты
 make install   # копирует бинарь в /usr/local/bin (sudo)
 ```
 
-Артефакт появляется в `~/.cache/rrl/target/release/rust-rest-ldap`: каталог сборки вынесен из
+Артефакт появляется в `~/.cache/rrl/target/release/rrl-directory`: каталог сборки вынесен из
 репозитория, чтобы root в контейнере не оставлял мусор в дереве.
 
 ## Быстрый старт
@@ -72,7 +72,7 @@ make install   # копирует бинарь в /usr/local/bin (sudo)
 Файловый бэкенд, простой bind разрешён — только для проверки на своей машине.
 
 ```sh
-./rust-rest-ldap -c config.yaml -b file -B dc=example,dc=com -L 127.0.0.1:10389
+./rrl-directory -c config.yaml -b file -B dc=example,dc=com -L 127.0.0.1:10389
 ldapsearch -H ldap://127.0.0.1:10389 -x -b dc=example,dc=com "(objectClass=*)" dn
 ```
 
@@ -81,11 +81,11 @@ ldapsearch -H ldap://127.0.0.1:10389 -x -b dc=example,dc=com "(objectClass=*)" d
 ## Установка как сервиса
 
 ```
-sudo useradd --system --home /var/lib/rust-rest-ldap --shell /usr/sbin/nologin rust-rest-ldap
-sudo install -d -m 0750 -o rust-rest-ldap -g rust-rest-ldap /etc/rust-rest-ldap
-sudo install -m 0640 -o root -g rust-rest-ldap deploy/config.example.yaml /etc/rust-rest-ldap/config.yaml
-sudo install -m 0644 deploy/rust-rest-ldap.service /etc/systemd/system/
-sudo install -m 0755 rust-rest-ldap /usr/local/bin/
+sudo useradd --system --home /var/lib/rrl-directory --shell /usr/sbin/nologin rrl-directory
+sudo install -d -m 0750 -o rrl-directory -g rrl-directory /etc/rrl-directory
+sudo install -m 0640 -o root -g rrl-directory deploy/config.example.yaml /etc/rrl-directory/config.yaml
+sudo install -m 0644 deploy/rrl-directory.service /etc/systemd/system/
+sudo install -m 0755 rrl-directory /usr/local/bin/
 ```
 
 Дальше — сертификат, пароль первого администратора и запуск:
@@ -97,8 +97,8 @@ sudo install -m 0755 rust-rest-ldap /usr/local/bin/
 # сертификат удостоверяющим центром, а клиенты со строгой проверкой (rustls, современные
 # браузеры) отказывают такому сертификату в роли серверного: "CA used as end entity".
 sudo openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout /etc/rust-rest-ldap/server.key \
-  -out /etc/rust-rest-ldap/server.crt \
+  -keyout /etc/rrl-directory/server.key \
+  -out /etc/rrl-directory/server.crt \
   -subj "/CN=ldap.example.com" \
   -addext "subjectAltName=DNS:ldap.example.com" \
   -addext "basicConstraints=critical,CA:FALSE" \
@@ -106,12 +106,12 @@ sudo openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -addext "extendedKeyUsage=serverAuth"
 
 # Пароль первого администратора — файлом, не аргументом: аргументы видны в ps.
-sudo sh -c 'openssl rand -base64 24 > /etc/rust-rest-ldap/admin.pass'
-sudo chown root:rust-rest-ldap /etc/rust-rest-ldap/admin.pass
-sudo chmod 0640 /etc/rust-rest-ldap/admin.pass
+sudo sh -c 'openssl rand -base64 24 > /etc/rrl-directory/admin.pass'
+sudo chown root:rrl-directory /etc/rrl-directory/admin.pass
+sudo chmod 0640 /etc/rrl-directory/admin.pass
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now rust-rest-ldap
+sudo systemctl enable --now rrl-directory
 ```
 
 Первый администратор создаётся при старте, если хранилище пустое, и в лог пишется его DN.
@@ -122,7 +122,7 @@ sudo systemctl enable --now rust-rest-ldap
 ```
 ldapwhoami -H ldaps://ldap.example.com -x \
   -D "cn=admin,ou=users,dc=example,dc=com" \
-  -w "$(sudo cat /etc/rust-rest-ldap/admin.pass)"
+  -w "$(sudo cat /etc/rrl-directory/admin.pass)"
 ```
 
 ## Конфигурация
@@ -174,8 +174,8 @@ passwords:
 Собственный клиент — чтобы проверять сервер не только чужими бинарями.
 
 ```
-./ldapsearch -H ldaps://ldap.example.com --cacert /etc/rust-rest-ldap/server.crt \
-  -D "cn=admin,ou=users,dc=example,dc=com" -w "$(sudo cat /etc/rust-rest-ldap/admin.pass)" \
+./ldapsearch -H ldaps://ldap.example.com --cacert /etc/rrl-directory/server.crt \
+  -D "cn=admin,ou=users,dc=example,dc=com" -w "$(sudo cat /etc/rrl-directory/admin.pass)" \
   -b "dc=example,dc=com" -LLL "(uid=alice)" cn mail
 ```
 
@@ -233,7 +233,7 @@ ldappasswd  -H ldaps://host -D "$DN" -w ... "$TARGET"           # пароль �
 ```
 curl --silent http://127.0.0.1:8080/healthz
 curl --silent http://127.0.0.1:8080/metrics | grep ldap_
-kill -USR1 "$(pidof rust-rest-ldap)"      # перечитать данные сейчас
+kill -USR1 "$(pidof rrl-directory)"      # перечитать данные сейчас
 curl --silent -I -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/callback
 ```
 
@@ -244,9 +244,9 @@ curl --silent -I -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/callbac
 ## Выгрузка
 
 ```
-./rust-rest-ldap -c config.yaml --export-ldif - > dump.ldif
-./rust-rest-ldap -c config.yaml --export-yaml - > dump.yaml
-./rust-rest-ldap -c config.yaml --export-ldif --export-operational - > full.ldif
+./rrl-directory -c config.yaml --export-ldif - > dump.ldif
+./rrl-directory -c config.yaml --export-yaml - > dump.yaml
+./rrl-directory -c config.yaml --export-ldif --export-operational - > full.ldif
 ```
 
 LDIF — формат обмена: его читают `ldapadd` и `slapadd`. YAML — тот же набор записей для
@@ -262,9 +262,9 @@ LDIF — формат обмена: его читают `ldapadd` и `slapadd`. 
 требует bind, а bind требует записи, которой ещё нет.
 
 ```
-./rust-rest-ldap -c /etc/rust-rest-ldap/config.yaml --import-ldif dump.ldif
-./rust-rest-ldap -c config.yaml --import-ldif -            # из stdin
-./rust-rest-ldap -c config.yaml --import-ldif extra.ldif --allow-existing-entry
+./rrl-directory -c /etc/rrl-directory/config.yaml --import-ldif dump.ldif
+./rrl-directory -c config.yaml --import-ldif -            # из stdin
+./rrl-directory -c config.yaml --import-ldif extra.ldif --allow-existing-entry
 ```
 
 - **Одна транзакция**: всё проверяется и собирается до записи. Нарушение схемы в записи
@@ -280,7 +280,7 @@ LDIF — формат обмена: его читают `ldapadd` и `slapadd`. 
 скрипт развёртывания ветвится по нему.
 
 ```
-./rust-rest-ldap -c config.yaml --check-config
+./rrl-directory -c config.yaml --check-config
 # конфигурация работоспособна: бэкенд 'redb', база 'dc=example,dc=com', записей 20003,
 # с нарушениями схемы 0
 ```
@@ -288,8 +288,8 @@ LDIF — формат обмена: его читают `ldapadd` и `slapadd`. 
 ## Проверка и перестройка индексов
 
 ```
-./rust-rest-ldap -c config.yaml --check-index   # сверить индекс с перебором
-./rust-rest-ldap -c config.yaml --reindex       # перестроить и показать цену
+./rrl-directory -c config.yaml --check-index   # сверить индекс с перебором
+./rrl-directory -c config.yaml --reindex       # перестроить и показать цену
 curl -X POST -H "Authorization: Token $TOKEN" http://127.0.0.1:8080/reindex
 ```
 
@@ -305,7 +305,7 @@ curl -X POST -H "Authorization: Token $TOKEN" http://127.0.0.1:8080/reindex
 ## Перезагрузка схемы без рестарта
 
 ```
-kill -USR2 "$(pidof rust-rest-ldap)"
+kill -USR2 "$(pidof rrl-directory)"
 curl -X POST -H "Authorization: Token $TOKEN" http://127.0.0.1:8080/schema/reload
 ```
 
@@ -338,10 +338,10 @@ config.d/generations/
 при этом помнит, кто её зафиксировал, когда и почему.
 
 ```
-./rust-rest-ldap -c /etc/rust-rest-ldap/config.d --config-history
-./rust-rest-ldap -c /etc/rust-rest-ldap/config.d --config-commit --from config.yaml --note "начальная"
-./rust-rest-ldap -c /etc/rust-rest-ldap/config.d --config-commit --note "отметка перед правкой"
-./rust-rest-ldap -c /etc/rust-rest-ldap/config.d --config-rollback 3
+./rrl-directory -c /etc/rrl-directory/config.d --config-history
+./rrl-directory -c /etc/rrl-directory/config.d --config-commit --from config.yaml --note "начальная"
+./rrl-directory -c /etc/rrl-directory/config.d --config-commit --note "отметка перед правкой"
+./rrl-directory -c /etc/rrl-directory/config.d --config-rollback 3
 ```
 
 - **Коммит атомарен**: временный файл → `fsync` → `rename` в имя генерации → новый указатель

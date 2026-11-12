@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use rust_rest_ldap::backend::Backend;
-use rust_rest_ldap::{cli, config, i18n, security::Security};
+use rrl_directory::backend::Backend;
+use rrl_directory::{cli, config, i18n, security::Security};
 
 fn main() {
     // Built here rather than through `#[tokio::main]`: the attribute cannot name the threads, and a
     // thread called `tokio-rt-worker` in `ps -L` says nothing about which program it belongs to.
-    rust_rest_ldap::runtime::multi_thread().block_on(serve());
+    rrl_directory::runtime::multi_thread().block_on(serve());
 }
 
 /// Whether this process serves a domain, and so has a SID to issue.
@@ -71,7 +71,7 @@ async fn serve() {
         // mean an operator has to `mkdir` a directory whose layout is this program's business.
         // An existing *file* is refused, because that is a configuration and the operator
         // pointed at the wrong thing.
-        if store_path.exists() && !rust_rest_ldap::config_store::Store::is_store(&store_path) {
+        if store_path.exists() && !rrl_directory::config_store::Store::is_store(&store_path) {
             fatal(&i18n::t(
                 "error.store_not_a_directory",
                 &[("path", &store_path.display().to_string())],
@@ -102,7 +102,7 @@ async fn serve() {
 
     // Before anything else that could fail: a startup error is the one an operator most needs
     // to see reported, and until the subscriber exists every `error!` in this process is a no-op.
-    if let Err(err) = rust_rest_ldap::logging::install(&config) {
+    if let Err(err) = rrl_directory::logging::install(&config) {
         fatal(&format!("log file: {err}"));
     }
 
@@ -140,7 +140,7 @@ async fn serve() {
             Err(err) => fatal(&i18n::t("error.index", &[("detail", &err.to_string())])),
         };
 
-        let report = rust_rest_ldap::index_check::check(directory.all(), directory.index());
+        let report = rrl_directory::index_check::check(directory.all(), directory.index());
 
         for mismatch in report.missing.iter().chain(report.wrong.iter()) {
             eprintln!(
@@ -273,7 +273,7 @@ async fn serve() {
         // The schema is checked over the real entries, not a sample: a violation is what
         // would make the first client complain, and this run exists to find it earlier.
         let mut broken = 0;
-        if config.schema_mode != rust_rest_ldap::schema::Mode::Off {
+        if config.schema_mode != rrl_directory::schema::Mode::Off {
             for entry in directory.all() {
                 let Err(violations) = config.schema.check(entry) else {
                     continue;
@@ -307,7 +307,7 @@ async fn serve() {
 
         // The exit code is the answer, so a deployment script can branch on it without
         // parsing prose.
-        if broken > 0 && config.schema_mode == rust_rest_ldap::schema::Mode::Strict {
+        if broken > 0 && config.schema_mode == rrl_directory::schema::Mode::Strict {
             std::process::exit(1);
         }
         return;
@@ -334,7 +334,7 @@ async fn serve() {
             }
         };
 
-        match rust_rest_ldap::import::import(&backend, &config, &text, allow_existing_entry).await {
+        match rrl_directory::import::import(&backend, &config, &text, allow_existing_entry).await {
             Ok(outcome) => {
                 for warning in &outcome.warnings {
                     eprintln!("{}", i18n::t("warn.schema", &[("detail", warning)]));
@@ -368,17 +368,17 @@ async fn serve() {
         // Both formats describe the same entries; only their shape differs, so the
         // selection of operational attributes is one option for both.
         let text = if as_yaml {
-            rust_rest_ldap::yaml_export::export(
+            rrl_directory::yaml_export::export(
                 directory.all(),
-                rust_rest_ldap::yaml_export::Options {
+                rrl_directory::yaml_export::Options {
                     operational: export_operational,
                     ..Default::default()
                 },
             )
         } else {
-            rust_rest_ldap::ldif::export(
+            rrl_directory::ldif::export(
                 directory.all(),
-                rust_rest_ldap::ldif::Options {
+                rrl_directory::ldif::Options {
                     operational: export_operational,
                     ..Default::default()
                 },
@@ -413,7 +413,7 @@ async fn serve() {
     // user principal name, an attribute only `user` permits.
     #[cfg(feature = "kdc")]
     let domain_realm: Option<String> = if config.kerberos.enabled {
-        match rust_rest_ldap::kerberos::Settings::resolve(
+        match rrl_directory::kerberos::Settings::resolve(
             &config.kerberos,
             &config.base_dn,
             std::net::Ipv4Addr::UNSPECIFIED.into(),
@@ -435,11 +435,11 @@ async fn serve() {
     // administrable from the first connection rather than after a manual edit.
     if let Some(section) = config.bootstrap.clone() {
         let secret =
-            match rust_rest_ldap::bootstrap::password(&section, |name| std::env::var(name).ok()) {
+            match rrl_directory::bootstrap::password(&section, |name| std::env::var(name).ok()) {
                 Ok(secret) => secret,
                 Err(err) => fatal(&i18n::t("error.bootstrap", &[("detail", &err.to_string())])),
             };
-        let spec = match rust_rest_ldap::bootstrap::Spec::new(
+        let spec = match rrl_directory::bootstrap::Spec::new(
             section.dn.as_deref(),
             &config.base_dn,
             &config.users_ou_name,
@@ -456,8 +456,8 @@ async fn serve() {
             None => spec,
         };
 
-        match rust_rest_ldap::bootstrap::seed_with(&backend, &spec, &config.passwords).await {
-            Ok(rust_rest_ldap::bootstrap::Outcome::Created { dn }) => eprintln!(
+        match rrl_directory::bootstrap::seed_with(&backend, &spec, &config.passwords).await {
+            Ok(rrl_directory::bootstrap::Outcome::Created { dn }) => eprintln!(
                 "{}",
                 i18n::t(
                     "start.bootstrap_created",
@@ -465,7 +465,7 @@ async fn serve() {
                         ("dn", &dn),
                         (
                             "scheme",
-                            rust_rest_ldap::bootstrap::scheme_name(&config.passwords)
+                            rrl_directory::bootstrap::scheme_name(&config.passwords)
                         ),
                     ],
                 )
@@ -473,7 +473,7 @@ async fn serve() {
             // Said out loud rather than skipped in silence: a bootstrap section left in
             // the configuration of a directory in use is a question the operator will ask,
             // and "it did nothing" is the answer.
-            Ok(rust_rest_ldap::bootstrap::Outcome::NotEmpty { entries }) => eprintln!(
+            Ok(rrl_directory::bootstrap::Outcome::NotEmpty { entries }) => eprintln!(
                 "{}",
                 i18n::t(
                     "start.bootstrap_not_empty",
@@ -500,7 +500,7 @@ async fn serve() {
     let smb = false;
 
     if config.cldap.enabled || realm || smb {
-        match rust_rest_ldap::provision::ensure_containers(&backend, &config.base_dn).await {
+        match rrl_directory::provision::ensure_containers(&backend, &config.base_dn).await {
             Ok(created) if !created.is_empty() => {
                 eprintln!("provision: created {}", created.join(", "));
             }
@@ -511,7 +511,7 @@ async fn serve() {
 
     // Before the first write, because a change stamped before this point carries the id of
     // "no node" and a peer could not tell it from its own.
-    rust_rest_ldap::replication::set_server_id(config.server_id);
+    rrl_directory::replication::set_server_id(config.server_id);
 
     // Before the directory is built, so the floor the snapshot carries is the floor that is: a
     // snapshot taken before pruning would say the journal reaches further back than it does, and a
@@ -566,7 +566,7 @@ async fn serve() {
                 &[("detail", &format!("randomness: {err}"))],
             ));
         }
-        match rust_rest_ldap::sid::domain::Issuer::open(&backend, entropy) {
+        match rrl_directory::sid::domain::Issuer::open(&backend, entropy) {
             Ok(issuer) => {
                 println!("domain: {} (next RID {})", issuer.sid(), issuer.peek());
                 Some(Arc::new(issuer))
@@ -577,7 +577,7 @@ async fn serve() {
         None
     };
 
-    let (source, directory) = match rust_rest_ldap::reload::Source::load(&config, backend).await {
+    let (source, directory) = match rrl_directory::reload::Source::load(&config, backend).await {
         Ok(loaded) => loaded,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
     };
@@ -585,7 +585,7 @@ async fn serve() {
     // the write path, and a copy would make the two disagree after the first reload.
     // Read once, here: a keytab is a secret that belongs to root and to the service account, and
     // a failure to load it is a startup failure rather than a bind that mysteriously refuses.
-    let gssapi = match rust_rest_ldap::sasl::Gssapi::load(&config.sasl, &config.base_dn) {
+    let gssapi = match rrl_directory::sasl::Gssapi::load(&config.sasl, &config.base_dn) {
         Ok(gssapi) => gssapi.map(Arc::new),
         Err(err) => fatal(&i18n::t("error.sasl", &[("detail", &err.to_string())])),
     };
@@ -633,7 +633,7 @@ async fn serve() {
                     })
                 })
                 .unwrap_or_else(|| "localhost".to_string());
-            security.with_ad_names(rust_rest_ldap::security::AdNames {
+            security.with_ad_names(rrl_directory::security::AdNames {
                 dns_host_name: host.clone(),
                 ldap_service_name: format!("{realm}:host/{host}@{realm}"),
                 server_name: host,
@@ -748,7 +748,7 @@ async fn serve() {
     // A certificate is shared by LDAPS and StartTLS; its presence decides whether
     // either is offered at all.
     let acceptor = match (&config.server_cert, &config.server_key) {
-        (Some(cert), Some(key)) => match rust_rest_ldap::tls::acceptor(cert, key) {
+        (Some(cert), Some(key)) => match rrl_directory::tls::acceptor(cert, key) {
             Ok(acceptor) => Some(acceptor),
             Err(err) => fatal(&i18n::t("error.server", &[("detail", &err.to_string())])),
         },
@@ -768,11 +768,11 @@ async fn serve() {
 
     // One metrics registry and one journal for the process. The metrics are lock-free, so
     // the accept loop and every connection task can share this without contention.
-    let metrics = rust_rest_ldap::metrics::Metrics::new();
+    let metrics = rrl_directory::metrics::Metrics::new();
     metrics.set_entries(directory.entry_count());
     eprintln!(
         "PHASE directory rss={}MB entries={} index_bytes={}",
-        rust_rest_ldap::memory::resident_bytes().unwrap_or(0) / (1024 * 1024),
+        rrl_directory::memory::resident_bytes().unwrap_or(0) / (1024 * 1024),
         directory.entry_count(),
         directory.index().heap_bytes()
     );
@@ -793,14 +793,14 @@ async fn serve() {
     ) {
         (true, _) => {
             println!("{}", i18n::plain("start.journal_stdout"));
-            Arc::new(rust_rest_ldap::metrics::Journal::stdout())
+            Arc::new(rrl_directory::metrics::Journal::stdout())
         }
         (false, Some(path)) => {
             let limit = config
                 .observability
                 .journal_max_bytes
-                .unwrap_or(rust_rest_ldap::metrics::JOURNAL_MAX_BYTES);
-            match rust_rest_ldap::metrics::Journal::file_with_limit(&path, limit) {
+                .unwrap_or(rrl_directory::metrics::JOURNAL_MAX_BYTES);
+            match rrl_directory::metrics::Journal::file_with_limit(&path, limit) {
                 Ok(journal) => {
                     println!(
                         "{}",
@@ -817,10 +817,10 @@ async fn serve() {
                 )),
             }
         }
-        (false, None) => Arc::new(rust_rest_ldap::metrics::Journal::off()),
+        (false, None) => Arc::new(rrl_directory::metrics::Journal::off()),
     };
 
-    let observers = rust_rest_ldap::server::Observers {
+    let observers = rrl_directory::server::Observers {
         metrics: Arc::clone(&metrics),
         journal,
     };
@@ -846,7 +846,7 @@ async fn serve() {
         let kdc_here = config.kerberos.enabled;
         #[cfg(not(feature = "kdc"))]
         let kdc_here = false;
-        match rust_rest_ldap::cldap::Settings::resolve(
+        match rrl_directory::cldap::Settings::resolve(
             &config.cldap,
             &config.base_dn,
             bind,
@@ -861,7 +861,7 @@ async fn serve() {
                         settings.advertised.netbios_host,
                         if kdc_here { "set" } else { "not set" }
                     );
-                    Some(tokio::spawn(rust_rest_ldap::cldap::serve(
+                    Some(tokio::spawn(rrl_directory::cldap::serve(
                         socket,
                         settings,
                         Arc::clone(&source),
@@ -889,15 +889,13 @@ async fn serve() {
             Ok(ip) => ip,
             Err(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         };
-        let settings = match rust_rest_ldap::kerberos::Settings::resolve(
-            &config.kerberos,
-            &config.base_dn,
-            ip,
-        ) {
-            Ok(settings) => settings,
-            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
-        };
-        match rust_rest_ldap::kerberos::serve::start(
+        let settings =
+            match rrl_directory::kerberos::Settings::resolve(&config.kerberos, &config.base_dn, ip)
+            {
+                Ok(settings) => settings,
+                Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+            };
+        match rrl_directory::kerberos::serve::start(
             &settings,
             Arc::clone(&source),
             config.base_dn.clone(),
@@ -960,7 +958,7 @@ async fn serve() {
             )
             .filter(|domain| domain.contains('.'));
         }
-        match rust_rest_ldap::smb::Settings::resolve(&smb_config, ip, advertised) {
+        match rrl_directory::smb::Settings::resolve(&smb_config, ip, advertised) {
             Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
             Ok(mut settings) => {
                 // The domain's SID, when this process issues one. `lsarpc` reports it beside the
@@ -989,14 +987,14 @@ async fn serve() {
                 // would refuse a channel - or a logon - for an account that exists.
                 #[cfg(feature = "kdc")]
                 let held: Option<
-                    std::sync::Arc<rust_rest_ldap::kerberos::secrets::DirectorySecrets>,
+                    std::sync::Arc<rrl_directory::kerberos::secrets::DirectorySecrets>,
                 > = if config.kerberos.enabled {
                     let secrets = std::sync::Arc::new(
-                        rust_rest_ldap::kerberos::secrets::DirectorySecrets::new(
+                        rrl_directory::kerberos::secrets::DirectorySecrets::new(
                             source.directory().await,
                         ),
                     );
-                    let _follow = rust_rest_ldap::kerberos::secrets::DirectorySecrets::follow(
+                    let _follow = rrl_directory::kerberos::secrets::DirectorySecrets::follow(
                         std::sync::Arc::clone(&secrets),
                         std::sync::Arc::clone(&source),
                         shutdown_rx.clone(),
@@ -1047,7 +1045,7 @@ async fn serve() {
                     std::sync::Arc<dyn smb_server::MachinePasswords>,
                 > = if config.kerberos.enabled {
                     Some(std::sync::Arc::new(
-                        rust_rest_ldap::kerberos::machine_password::DirectoryPasswords::new(
+                        rrl_directory::kerberos::machine_password::DirectoryPasswords::new(
                             std::sync::Arc::clone(&source),
                             security.clone(),
                         ),
@@ -1060,7 +1058,7 @@ async fn serve() {
                     std::sync::Arc<dyn smb_server::MachinePasswords>,
                 > = None;
 
-                match rust_rest_ldap::smb::serve::start(
+                match rrl_directory::smb::serve::start(
                     &settings,
                     machine_secrets,
                     machine_passwords,
@@ -1083,7 +1081,7 @@ async fn serve() {
         None
     };
 
-    let reloading = tokio::spawn(rust_rest_ldap::reload::reload_on_interval_with(
+    let reloading = tokio::spawn(rrl_directory::reload::reload_on_interval_with(
         Arc::clone(&source),
         config.update_interval,
         shutdown_rx.clone(),
@@ -1096,12 +1094,12 @@ async fn serve() {
 
     let http_task = match &config.http_listen_addr {
         Some(addr) => {
-            let state = Arc::new(rust_rest_ldap::http::HttpState {
+            let state = Arc::new(rrl_directory::http::HttpState {
                 source: Arc::clone(&source),
                 metrics: Arc::clone(&metrics),
                 callback_token: config.callback_auth_token.clone(),
             });
-            let router = rust_rest_ldap::http::router(state);
+            let router = rrl_directory::http::router(state);
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
                     println!("{}", i18n::t("start.http", &[("addr", addr)]));
@@ -1123,10 +1121,10 @@ async fn serve() {
     // One task per peer, each holding its own persistent connection. Spawned before the listener
     // accepts anything, so a change made here in the first moment of serving is not missed by a
     // peer that was already listening.
-    let reporter = rust_rest_ldap::peers::Reporter::new(
+    let reporter = rrl_directory::peers::Reporter::new(
         Arc::clone(&metrics),
         match &config.conflict_log {
-            Some(path) => match rust_rest_ldap::metrics::Journal::file(path) {
+            Some(path) => match rrl_directory::metrics::Journal::file(path) {
                 Ok(journal) => Arc::new(journal),
                 Err(err) => fatal(&i18n::t(
                     "error.conflict_log",
@@ -1136,7 +1134,7 @@ async fn serve() {
                     ],
                 )),
             },
-            None => Arc::new(rust_rest_ldap::metrics::Journal::off()),
+            None => Arc::new(rrl_directory::metrics::Journal::off()),
         },
     );
 
@@ -1148,7 +1146,7 @@ async fn serve() {
         .peers
         .iter()
         .map(|peer| {
-            tokio::spawn(rust_rest_ldap::peers::follow(
+            tokio::spawn(rrl_directory::peers::follow(
                 peer.clone(),
                 Arc::clone(&source),
                 config.base_dn.clone(),
@@ -1158,9 +1156,9 @@ async fn serve() {
         })
         .collect();
 
-    let serving = tokio::spawn(rust_rest_ldap::server::serve_with(
+    let serving = tokio::spawn(rrl_directory::server::serve_with(
         listener,
-        rust_rest_ldap::server::Listener {
+        rrl_directory::server::Listener {
             acceptor,
             ldaps: config.use_tls,
             // Clients get this long to finish the operation they are in the middle of.
@@ -1169,7 +1167,7 @@ async fn serve() {
         Arc::clone(&source),
         // The live policy remembers the configuration this process started with: that is
         // what lets a later change say which of its settings still wait for a restart.
-        rust_rest_ldap::security::live(config.clone(), security),
+        rrl_directory::security::live(config.clone(), security),
         shutdown_rx,
         observers,
     ));
@@ -1198,8 +1196,8 @@ async fn serve() {
 }
 
 fn spawn_usr1_reloader(
-    source: Arc<rust_rest_ldap::reload::Source>,
-    metrics: Arc<rust_rest_ldap::metrics::Metrics>,
+    source: Arc<rrl_directory::reload::Source>,
+    metrics: Arc<rrl_directory::metrics::Metrics>,
 ) {
     #[cfg(unix)]
     {
@@ -1248,7 +1246,7 @@ fn spawn_usr1_reloader(
 /// A separate signal from SIGUSR1 on purpose: reloading the data and reloading the rules are
 /// different operations with different failure modes, and an operator debugging a schema
 /// change does not want the directory reloaded underneath at the same time.
-fn spawn_usr2_schema_reloader(source: Arc<rust_rest_ldap::reload::Source>) {
+fn spawn_usr2_schema_reloader(source: Arc<rrl_directory::reload::Source>) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -1371,8 +1369,8 @@ fn store_command(
     commit: bool,
     rollback: Option<u64>,
     history: bool,
-) -> Option<rust_rest_ldap::config_store::Command> {
-    use rust_rest_ldap::config_store::Command;
+) -> Option<rrl_directory::config_store::Command> {
+    use rrl_directory::config_store::Command;
 
     if commit {
         return Some(Command::Commit);
@@ -1388,16 +1386,16 @@ fn store_command(
 
 /// Runs a store command and exits.
 fn run_store_command(
-    command: rust_rest_ldap::config_store::Command,
+    command: rrl_directory::config_store::Command,
     path: &std::path::Path,
     keep: Option<usize>,
     note: Option<&str>,
     from: Option<&std::path::Path>,
 ) {
-    let store = rust_rest_ldap::config_store::Store::open(path);
+    let store = rrl_directory::config_store::Store::open(path);
 
     let outcome = match command {
-        rust_rest_ldap::config_store::Command::Commit => match from {
+        rrl_directory::config_store::Command::Commit => match from {
             // Seeding: the document comes from a file, and the store may be empty.
             Some(source) => std::fs::read_to_string(source)
                 .map_err(|err| format!("'{}': {err}", source.display()))
@@ -1411,11 +1409,11 @@ fn run_store_command(
                 .map_err(|err| err.to_string()),
         }
         .map(|generation| format!("generation {}", generation.number)),
-        rust_rest_ldap::config_store::Command::Rollback(number) => store
+        rrl_directory::config_store::Command::Rollback(number) => store
             .rollback(number, "cli")
             .map(|generation| format!("generation {}", generation.number))
             .map_err(|err| err.to_string()),
-        rust_rest_ldap::config_store::Command::History => match store.history() {
+        rrl_directory::config_store::Command::History => match store.history() {
             Ok(generations) => {
                 let current = store.current().ok().flatten().map(|g| g.number);
                 for generation in generations {
@@ -1439,8 +1437,8 @@ fn run_store_command(
         Ok(what) => {
             // Collect as part of the commit: a store that only ever grew would be a store
             // somebody has to clean by hand, which is the problem this replaces.
-            if let rust_rest_ldap::config_store::Command::Commit = command {
-                let keep = keep.unwrap_or(rust_rest_ldap::config_store::KEEP);
+            if let rrl_directory::config_store::Command::Commit = command {
+                let keep = keep.unwrap_or(rrl_directory::config_store::KEEP);
                 match store.collect(keep) {
                     Ok(removed) if removed.is_empty() => {}
                     Ok(removed) => println!(

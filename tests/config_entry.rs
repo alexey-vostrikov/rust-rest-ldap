@@ -11,11 +11,11 @@ use rasn_ldap::{
     ModifyRequest, ModifyRequestChanges, PartialAttribute, ProtocolOp, ResultCode, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::config::Document;
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::ldap::{Action, handle};
-use rust_rest_ldap::security::Security;
+use rrl_directory::config::Document;
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::ldap::{Action, handle};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
@@ -51,7 +51,7 @@ fn security(document: Option<&str>) -> Security {
 fn stored(text: &str) -> (tempfile::TempDir, Security) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.d");
-    let store = rust_rest_ldap::config_store::Store::open(&path);
+    let store = rrl_directory::config_store::Store::open(&path);
     store.commit(text, "test", "initial").expect("commit");
 
     let document = Document::new(text, format!("store:{}", path.display())).with_store(Some(path));
@@ -68,7 +68,7 @@ fn stored(text: &str) -> (tempfile::TempDir, Security) {
 /// The document the store holds now.
 fn in_store(security: &Security) -> String {
     let document = security.config_document.as_ref().expect("document");
-    let store = rust_rest_ldap::config_store::Store::open(
+    let store = rrl_directory::config_store::Store::open(
         document.store.clone().expect("the store the test created"),
     );
     store.read_current().expect("read").expect("generation")
@@ -76,7 +76,7 @@ fn in_store(security: &Security) -> String {
 
 fn history(security: &Security) -> usize {
     let document = security.config_document.as_ref().expect("document");
-    rust_rest_ldap::config_store::Store::open(document.store.clone().expect("store"))
+    rrl_directory::config_store::Store::open(document.store.clone().expect("store"))
         .history()
         .expect("history")
         .len()
@@ -529,12 +529,11 @@ fn an_administrator_changes_a_setting_and_it_becomes_a_generation() {
     assert!(text.contains("backend: file"), "{text}");
 
     // The committed document is a configuration: it loads, and with the new value.
-    let reloaded = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
-        Some(&text),
-        |_| None,
-    )
-    .expect("the committed document must load");
+    let reloaded =
+        rrl_directory::config::resolve(rrl_directory::config::Args::default(), Some(&text), |_| {
+            None
+        })
+        .expect("the committed document must load");
     assert_eq!(reloaded.backend, "file");
 }
 
@@ -682,7 +681,7 @@ fn the_generation_a_change_creates_names_who_made_it_and_what_changed() {
     );
 
     let document = security.config_document.as_ref().expect("document");
-    let store = rust_rest_ldap::config_store::Store::open(document.store.clone().expect("store"));
+    let store = rrl_directory::config_store::Store::open(document.store.clone().expect("store"));
     let history = store.history().expect("history");
     let last = history.last().expect("a generation");
 

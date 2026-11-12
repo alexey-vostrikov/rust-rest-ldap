@@ -22,10 +22,10 @@ use rasn_ldap::{
     ChangeOperation, LdapDn, LdapMessage, ModifyRequest, ModifyRequestChanges, PartialAttribute,
     ProtocolOp, ResultCode,
 };
-use rust_rest_ldap::cli_connection::Connection;
-use rust_rest_ldap::client::{Client, Options};
-use rust_rest_ldap::ldif_read::{self, Change, ChangeRecord, ModOp, Record};
-use rust_rest_ldap::model::Entry;
+use rrl_directory::cli_connection::Connection;
+use rrl_directory::client::{Client, Options};
+use rrl_directory::ldif_read::{self, Change, ChangeRecord, ModOp, Record};
+use rrl_directory::model::Entry;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -367,9 +367,9 @@ async fn add(client: &Client, entry: &Entry) -> Result<(), Rejected> {
 }
 
 /// Turns a client failure into a rejection that names the DN.
-fn rejected(err: rust_rest_ldap::client::Error) -> Rejected {
+fn rejected(err: rrl_directory::client::Error) -> Rejected {
     match err {
-        rust_rest_ldap::client::Error::Server { code, message } => Rejected {
+        rrl_directory::client::Error::Server { code, message } => Rejected {
             code,
             message: format!("{code:?}: {message}"),
         },
@@ -460,7 +460,7 @@ fn read_input(cli: &Cli) -> Result<String, String> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
-    use rust_rest_ldap::client::Trust;
+    use rrl_directory::client::Trust;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("ldapmodify").chain(args.iter().copied()))

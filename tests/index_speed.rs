@@ -11,12 +11,12 @@ use rasn_ldap::{
     AttributeDescription, AttributeValueAssertion, Filter, ProtocolOp, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::index::IndexConfig;
-use rust_rest_ldap::ldap::search::handle_search;
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::directory::Directory;
+use rrl_directory::index::IndexConfig;
+use rrl_directory::ldap::search::handle_search;
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ENTRIES: usize = 20_000;

@@ -999,7 +999,7 @@ not switch this on ... must be written as the sentence»; с обеими фра
 отличается, `locale: ru` в конфиге важнее `LANG`, пустой `locale` означает «спросить окружение»,
 клиентский текст остаётся английским.
 
-Живая проверка: `RUST_REST_LDAP_LOCALE=ru` → «rust-rest-ldap 0.1.0: бэкенд 'null', база …,
+Живая проверка: `RUST_REST_LDAP_LOCALE=ru` → «rrl-directory 0.1.0: бэкенд 'null', база …,
 пользователей 0, групп 0», «ldap: слушаю 127.0.0.1:11420», «диагностика: язык 'ru' (источник:
 RUST_REST_LDAP_LOCALE)»; `locale: ru` в конфиге с ошибкой → «конфигурация включает
 bind.AllowUnencryptedBind, что ослабляет сервер…»; `LANG=ru_RU.UTF-8` → русский с источником `LANG`;
@@ -1313,7 +1313,7 @@ DN, равном базе, нормализация регистра и проб
 `~/.cache/rrl/target`), unit-файла не было, а первый администратор появлялся только через секцию в
 примере конфига, которой в этом примере не было.
 
-Что: `deploy/rust-rest-ldap.service` (systemd, от `Restart=on-failure` и `StateDirectory` до
+Что: `deploy/rrl-directory.service` (systemd, от `Restart=on-failure` и `StateDirectory` до
 `ProtectSystem=strict`, `SystemCallFilter=@system-service`, `LimitNOFILE=65536`);
 `deploy/config.example.yaml` (TLS, `redb`, bootstrap, пароли, схема, целостность, индексы, ACL,
 журнал, опасные настройки — все с комментариями); README переписан: таблица возможностей, установка
@@ -1321,7 +1321,7 @@ DN, равном базе, нормализация регистра и проб
 `backend`, `base_dn` и `listen_addr` читаются из файла (третий источник после флага и переменной).
 
 Решения:
-- **Юнит без флагов.** `ExecStart=/usr/local/bin/rust-rest-ldap -c ...` и больше ничего: адрес и база
+- **Юнит без флагов.** `ExecStart=/usr/local/bin/rrl-directory -c ...` и больше ничего: адрес и база
   берутся из конфигурации. Иначе один факт живёт в двух местах и расходится — адрес правят в файле, а
   сервис слушает там, где написано в юните. Отсюда правка `config.rs`: три ключа, которые раньше
   читались только из флага/переменной, теперь имеют третий источник.
@@ -1471,8 +1471,8 @@ rootDSE одним запросом, bind с неверным паролем о�
 4. рецепт сертификата в README (`openssl req -x509` без `basicConstraints`) давал `CA:TRUE`, и строгая
    проверка rustls отказывала: «CA used as end entity». Рецепт исправлен на `CA:FALSE` + `keyUsage` +
    `extendedKeyUsage`; найдено при первой же попытке подключиться своим клиентом к серверу из README;
-5. `pkill -f 'rust-rest-ldap -c'` убивал собственную оболочку (шаблон совпадал с её командной строкой) —
-   в живой проверке используется `pkill -x rust-rest-ldap`.
+5. `pkill -f 'rrl-directory -c'` убивал собственную оболочку (шаблон совпадал с её командной строкой) —
+   в живой проверке используется `pkill -x rrl-directory`.
 
 Как проверено: 793 теста. `filter_parse` (21): равенство, presence против `=*`, подстроки с порядком
 initial/any/final, экранированная звёздочка как символ, прочие экранирования, UTF-8, `&`/`|`/`!`,
@@ -2738,7 +2738,7 @@ RFC 4533 (пункт C6): курсор по `entryCSN`, который пере�
 
 Решение: **оставить один крейт**. Дробить, когда клиент публикуется как библиотека или когда
 утилиты ставятся на хост, который не должен нести серверный код; тогда выносить
-`codec + model + dn + client` как `rust-rest-ldap-client`.
+`codec + model + dn + client` как `rrl-directory-client`.
 
 ### 59. axum оставлен: решение и его цена (план D15 — закрыт отказом)
 
@@ -4156,7 +4156,7 @@ fail-fast, как и договорились: молчаливая подста
   из `/proc/self/task/<tid>/comm` совпадает с ожидаемым;
 - `a_blocking_task_is_named_too` — `spawn_blocking` тоже попадает в список;
 - мутация «убрать `.thread_name`» → **все три красные**;
-- живьём: сервер поднят, `ps -L` показывает `18 ldap-rt` и `1 rust-rest-ldap` (главный поток
+- живьём: сервер поднят, `ps -L` показывает `18 ldap-rt` и `1 rrl-directory` (главный поток
   сохраняет имя программы), 20 параллельных поисков состава не меняют.
 
 Приватный модуль стал публичным (`pub mod runtime`), потому что сборку рантайма теперь использует
@@ -5650,7 +5650,7 @@ enum Framing + unwrap + context_token_inner + wrap_reply + context_token_wrap + 
 LDAP-сервера. Это единственная постановка, которая что-то доказывает.
 
 ```sh
-make test          # в rust-rest-ldap через ./scripts/cargo.sh
+make test          # в rrl-directory через ./scripts/cargo.sh
 ```
 
 **Путь к соседнему репозиторию — не константа.** `scripts/cargo.sh` ищет KDC в `$RR_LDAP_KDC`,
@@ -5729,7 +5729,7 @@ KDC (dev-dependency лежит по пути `../rust-heimdal-kdc`, которо
 
 ```
 docker run ... -v $HOME/DevOps/3part/rust-heimdal-kdc-wc:/rust-heimdal-kdc:ro \
-  rust-rest-ldap-metrics:1.99.1 cargo llvm-cov --lcov --output-path /w/target/coverage/lcov.info \
+  rrl-directory-metrics:1.99.1 cargo llvm-cov --lcov --output-path /w/target/coverage/lcov.info \
   --no-cfg-coverage --features kdc
 ```
 
@@ -5950,7 +5950,7 @@ KDC (сроки тикетов, RRL-2.18/2.21) и в SASL (RRL-2.15). Права
 отсутствующий RPC, был выключенным SMB.
 
 **Что мерил.** Стенд `rust-kdc/stand/ad-join`, `./run.sh all`, клиент — Samba 4.17.12 из образа
-(Debian bookworm), сервер — сборка этого репозитория `~/.cache/rrl/target/release/rust-rest-ldap`.
+(Debian bookworm), сервер — сборка этого репозитория `~/.cache/rrl/target/release/rrl-directory`.
 
 **Отказ, который был.** Шаг 4 (`net ads join -k`) печатал
 
@@ -6201,5 +6201,5 @@ Error was NT_STATUS_OBJECT_NAME_NOT_FOUND`; в журнале сервера —
 `net ads join` печатает `The request is not supported` — то есть клиент прочитал наш отказ.
 
 **Что осталось.** Ответ `CreateUser2` и `SetUserInfo2` (пароль машины) — это обратный вызов из
-`ServerConfig` в каталог: путь записи учётной записи в `rust-rest-ldap` уже есть и покрыт тестом
+`ServerConfig` в каталог: путь записи учётной записи в `rrl-directory` уже есть и покрыт тестом
 `a_member_can_add_its_computer_account`, но каталог живёт в другом крейте.

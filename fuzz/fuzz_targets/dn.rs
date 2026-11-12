@@ -10,8 +10,8 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {
-        let _ = rust_rest_ldap::dn::normalize(text);
-        let _ = rust_rest_ldap::dn::is_valid(text);
-        let _ = rust_rest_ldap::dn::split_first_rdn(text);
+        let _ = rrl_directory::dn::normalize(text);
+        let _ = rrl_directory::dn::is_valid(text);
+        let _ = rrl_directory::dn::split_first_rdn(text);
     }
 });

@@ -5,17 +5,17 @@
 //! against the real data shipped in `examples/`, built through the real mapping, and
 //! against the synthesized domain and OU entries.
 
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::schema::{Mode, Schema, ViolationCode};
+use rrl_directory::directory::Directory;
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::schema::{Mode, Schema, ViolationCode};
 
 fn example_directory() -> Directory {
-    let users: Vec<rust_rest_ldap::model::User> = serde_json::from_str(
+    let users: Vec<rrl_directory::model::User> = serde_json::from_str(
         &std::fs::read_to_string("examples/file/users.json").expect("users.json"),
     )
     .expect("parse users");
 
-    let groups: Vec<rust_rest_ldap::model::Group> = serde_json::from_str(
+    let groups: Vec<rrl_directory::model::Group> = serde_json::from_str(
         &std::fs::read_to_string("examples/file/groups.json").expect("groups.json"),
     )
     .expect("parse groups");

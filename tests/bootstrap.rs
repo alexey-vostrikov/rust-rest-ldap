@@ -11,11 +11,11 @@
 
 use std::path::Path;
 
-use rust_rest_ldap::backend::Backend;
-use rust_rest_ldap::bootstrap::{self, Error, Outcome, Spec};
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::password::verify::verify;
-use rust_rest_ldap::password::{PasswordPolicy, policy::PasswordConfig};
+use rrl_directory::backend::Backend;
+use rrl_directory::bootstrap::{self, Error, Outcome, Spec};
+use rrl_directory::directory::Directory;
+use rrl_directory::password::verify::verify;
+use rrl_directory::password::{PasswordPolicy, policy::PasswordConfig};
 
 const BASE: &str = "dc=example,dc=com";
 const USERS_OU: &str = "users";

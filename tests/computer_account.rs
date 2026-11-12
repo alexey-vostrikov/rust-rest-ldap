@@ -17,13 +17,13 @@ use rasn_ldap::{
     AddRequest, AttributeDescription, LdapDn, LdapMessage, ProtocolOp, ResultCode, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::backend::{Backend, EntryChange};
-use rust_rest_ldap::config::{Args, Config};
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::ldap::{Action, handle};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::reload::Source;
-use rust_rest_ldap::security::{Security, shared_schema};
+use rrl_directory::backend::{Backend, EntryChange};
+use rrl_directory::config::{Args, Config};
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::ldap::{Action, handle};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::reload::Source;
+use rrl_directory::security::{Security, shared_schema};
 
 const BASE: &str = "dc=ad,dc=example,dc=com";
 const ADMIN_DN: &str = "cn=administrator,cn=users,dc=ad,dc=example,dc=com";
@@ -51,7 +51,7 @@ sasl:
         keytab.display(),
         BASE = BASE
     );
-    rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
+    rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
 }
 
 async fn source(path: &std::path::Path, keytab: &std::path::Path) -> (Arc<Source>, Backend) {
@@ -117,7 +117,7 @@ fn security(source: &Arc<Source>, backend: &Backend) -> Security {
         // Without an issuer the write path is an ordinary directory's and issues nothing - which is
         // what `objectSid is missing` meant here before this line existed.
         domain: Some(std::sync::Arc::new(
-            rust_rest_ldap::sid::domain::Issuer::open(backend, [7u8; 16]).expect("an issuer"),
+            rrl_directory::sid::domain::Issuer::open(backend, [7u8; 16]).expect("an issuer"),
         )),
         ..Security::default()
     }

@@ -6,17 +6,17 @@
 //! useless.
 
 use rasn_ldap::{ExtendedRequest, LdapDn, LdapMessage, LdapOid, ProtocolOp, ResultCode};
-use rust_rest_ldap::backend::{Backend, EntryChange};
-use rust_rest_ldap::config::{Args, Config};
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::extop::{PASSWORD_MODIFY_OID, WHOAMI_OID};
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::ldap::{Action, handle};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::password::StoreScheme;
-use rust_rest_ldap::password::store::hash as hash_password;
-use rust_rest_ldap::reload::Source;
-use rust_rest_ldap::security::Security;
+use rrl_directory::backend::{Backend, EntryChange};
+use rrl_directory::config::{Args, Config};
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::extop::{PASSWORD_MODIFY_OID, WHOAMI_OID};
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::ldap::{Action, handle};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::password::StoreScheme;
+use rrl_directory::password::store::hash as hash_password;
+use rrl_directory::reload::Source;
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
@@ -382,7 +382,7 @@ bind:
 "#,
         path.display()
     );
-    rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
+    rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
 }
 
 fn bind_message(dn: &str, secret: &str) -> LdapMessage {

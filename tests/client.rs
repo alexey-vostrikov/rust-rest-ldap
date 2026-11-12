@@ -13,19 +13,19 @@ use rasn_ldap::{
     AttributeDescription, AttributeValueAssertion, Filter, LdapDn, LdapMessage, ProtocolOp,
     ResultCode, SearchRequest, SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::client::{Client, Error, Limits, Options};
-use rust_rest_ldap::config::{Args, Config};
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::reload::Source;
-use rust_rest_ldap::security::Security;
+use rrl_directory::client::{Client, Error, Limits, Options};
+use rrl_directory::config::{Args, Config};
+use rrl_directory::directory::Directory;
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::reload::Source;
+use rrl_directory::security::Security;
 
 /// The live handle the server takes, starting from `security`.
-fn live_security(security: Security) -> rust_rest_ldap::security::Shared {
+fn live_security(security: Security) -> rrl_directory::security::Shared {
     let running =
-        rust_rest_ldap::config::resolve(rust_rest_ldap::config::Args::default(), None, |_| None)
+        rrl_directory::config::resolve(rrl_directory::config::Args::default(), None, |_| None)
             .expect("the default configuration resolves");
-    rust_rest_ldap::security::live(running, security)
+    rrl_directory::security::live(running, security)
 }
 
 const BASE: &str = "dc=example,dc=com";
@@ -63,7 +63,7 @@ fn config(path: &std::path::Path) -> Config {
          backends:\n  redb:\n    path: {}\n",
         path.display()
     );
-    rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
+    rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
 }
 
 /// A directory-in-a-socket: the real server on a real port, serving alice and bob.
@@ -76,12 +76,12 @@ async fn server() -> (String, tokio::task::JoinHandle<()>) {
     std::mem::forget(directory);
 
     let config = config(&dir);
-    let backend = rust_rest_ldap::backend::Backend::from_config(
+    let backend = rrl_directory::backend::Backend::from_config(
         "redb",
         Some(&serde_json::json!({"path": dir.display().to_string()})),
     )
     .expect("backend");
-    let data = rust_rest_ldap::backend::DirectoryData {
+    let data = rrl_directory::backend::DirectoryData {
         entries: vec![
             entry(ALICE_DN, "alice", "alice@example.com"),
             entry(
@@ -98,7 +98,7 @@ async fn server() -> (String, tokio::task::JoinHandle<()>) {
                 .entries
                 .iter()
                 .cloned()
-                .map(|entry| rust_rest_ldap::backend::EntryChange::Upsert { entry })
+                .map(|entry| rrl_directory::backend::EntryChange::Upsert { entry })
                 .collect::<Vec<_>>(),
         )
         .await
@@ -113,7 +113,7 @@ async fn server() -> (String, tokio::task::JoinHandle<()>) {
     let (stop, shutdown) = tokio::sync::watch::channel(false);
 
     let serving = tokio::spawn(async move {
-        let _ = rust_rest_ldap::server::serve(
+        let _ = rrl_directory::server::serve(
             listener,
             None,
             false,
@@ -300,15 +300,15 @@ async fn responses_are_matched_by_message_id_even_when_they_come_back_reversed()
         Box::pin(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-            let first = rust_rest_ldap::ldap::codec::read_message(&mut stream)
+            let first = rrl_directory::ldap::codec::read_message(&mut stream)
                 .await
                 .expect("first");
-            let second = rust_rest_ldap::ldap::codec::read_message(&mut stream)
+            let second = rrl_directory::ldap::codec::read_message(&mut stream)
                 .await
                 .expect("second");
 
-            let first = rust_rest_ldap::ldap::codec::decode(&first).expect("decode");
-            let second = rust_rest_ldap::ldap::codec::decode(&second).expect("decode");
+            let first = rrl_directory::ldap::codec::decode(&first).expect("decode");
+            let second = rrl_directory::ldap::codec::decode(&second).expect("decode");
 
             // Answer the SECOND request first, both messages of the pair each time.
             for answer in [
@@ -316,7 +316,7 @@ async fn responses_are_matched_by_message_id_even_when_they_come_back_reversed()
                 answer(first.message_id, "cn=first"),
             ] {
                 for message in answer {
-                    let bytes = rust_rest_ldap::ldap::codec::encode(&message).expect("encode");
+                    let bytes = rrl_directory::ldap::codec::encode(&message).expect("encode");
                     stream.write_all(&bytes).await.expect("write");
                 }
             }
@@ -355,12 +355,12 @@ async fn responses_are_matched_by_message_id_even_when_they_come_back_reversed()
 /// answer, and the client has to keep reading after it.
 fn answer(message_id: rasn_ldap::MessageId, cn: &str) -> Vec<LdapMessage> {
     vec![
-        rust_rest_ldap::ldap::responses::search_result_entry(
+        rrl_directory::ldap::responses::search_result_entry(
             message_id,
             cn,
             &[Attribute::single("cn", cn.trim_start_matches("cn="))],
         ),
-        rust_rest_ldap::ldap::responses::search_done(message_id, ResultCode::Success, ""),
+        rrl_directory::ldap::responses::search_done(message_id, ResultCode::Success, ""),
     ]
 }
 
@@ -370,7 +370,7 @@ async fn a_silent_server_gives_a_timeout_and_not_an_eternal_wait() {
         Box::pin(async move {
             // Read the request, then say nothing at all, keeping the socket open.
             let mut stream = stream;
-            let _ = rust_rest_ldap::ldap::codec::read_message(&mut stream).await;
+            let _ = rrl_directory::ldap::codec::read_message(&mut stream).await;
             std::future::pending::<()>().await;
         })
     })
@@ -406,14 +406,14 @@ async fn a_connection_that_dies_mid_result_is_an_error_not_a_short_answer() {
         Box::pin(async move {
             use tokio::io::AsyncWriteExt;
 
-            let request = rust_rest_ldap::ldap::codec::read_message(&mut stream)
+            let request = rrl_directory::ldap::codec::read_message(&mut stream)
                 .await
                 .expect("request");
-            let request = rust_rest_ldap::ldap::codec::decode(&request).expect("decode");
+            let request = rrl_directory::ldap::codec::decode(&request).expect("decode");
 
             // Only the entry: the server dies before it can say the result is complete.
             let entry = answer(request.message_id, "cn=only").remove(0);
-            let bytes = rust_rest_ldap::ldap::codec::encode(&entry).expect("encode");
+            let bytes = rrl_directory::ldap::codec::encode(&entry).expect("encode");
             stream.write_all(&bytes).await.expect("write");
             stream.flush().await.expect("flush");
             // No SearchResultDone, and then the socket goes away.
@@ -442,13 +442,13 @@ async fn an_answer_over_the_size_limit_is_refused_before_it_is_read_in_full() {
         Box::pin(async move {
             use tokio::io::AsyncWriteExt;
 
-            let request = rust_rest_ldap::ldap::codec::read_message(&mut stream)
+            let request = rrl_directory::ldap::codec::read_message(&mut stream)
                 .await
                 .expect("request");
-            let request = rust_rest_ldap::ldap::codec::decode(&request).expect("decode");
+            let request = rrl_directory::ldap::codec::decode(&request).expect("decode");
 
             let big = huge_entry(request.message_id, 4096);
-            let bytes = rust_rest_ldap::ldap::codec::encode(&big).expect("encode");
+            let bytes = rrl_directory::ldap::codec::encode(&big).expect("encode");
             let _ = stream.write_all(&bytes).await;
             std::future::pending::<()>().await;
         })
@@ -476,7 +476,7 @@ async fn an_answer_over_the_size_limit_is_refused_before_it_is_read_in_full() {
 }
 
 fn huge_entry(message_id: rasn_ldap::MessageId, length: usize) -> LdapMessage {
-    rust_rest_ldap::ldap::responses::search_result_entry(
+    rrl_directory::ldap::responses::search_result_entry(
         message_id,
         "cn=huge",
         &[Attribute::single("description", &"x".repeat(length))],
@@ -573,20 +573,20 @@ async fn tls_server(ldaps: bool) -> (String, std::path::PathBuf, tokio::task::Jo
     std::mem::forget(directory);
 
     let config = config(&path.join("directory.redb"));
-    let backend = rust_rest_ldap::backend::Backend::from_config(
+    let backend = rrl_directory::backend::Backend::from_config(
         "redb",
         Some(&serde_json::json!({"path": path.join("directory.redb").display().to_string()})),
     )
     .expect("backend");
     let entry = entry(ALICE_DN, "alice", "alice@example.com");
     backend
-        .apply(&[rust_rest_ldap::backend::EntryChange::Upsert { entry }])
+        .apply(&[rrl_directory::backend::EntryChange::Upsert { entry }])
         .await
         .expect("seed");
 
     let security = Security::from_config(&config);
     let (source, _directory) = Source::load(&config, backend).await.expect("source");
-    let acceptor = rust_rest_ldap::tls::acceptor(&cert_path, &key_path).expect("acceptor");
+    let acceptor = rrl_directory::tls::acceptor(&cert_path, &key_path).expect("acceptor");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -594,7 +594,7 @@ async fn tls_server(ldaps: bool) -> (String, std::path::PathBuf, tokio::task::Jo
     let addr = listener.local_addr().expect("addr");
 
     let serving = tokio::spawn(async move {
-        let _ = rust_rest_ldap::server::serve(
+        let _ = rrl_directory::server::serve(
             listener,
             Some(acceptor),
             // `ldaps` decides whether the first byte is a TLS record or an LDAP message.
@@ -621,7 +621,7 @@ async fn ldaps_checks_the_certificate_against_the_file_it_was_given() {
         Options {
             // The certificate names `localhost`, and so does the URL: that is the point of
             // serving it as the trust anchor.
-            trust: rust_rest_ldap::client::Trust::File(cert),
+            trust: rrl_directory::client::Trust::File(cert),
             ..Options::default()
         },
     )
@@ -665,7 +665,7 @@ async fn starttls_upgrades_a_plain_connection_and_the_search_runs_over_it() {
     let client = Client::connect(
         &url,
         Options {
-            trust: rust_rest_ldap::client::Trust::File(cert),
+            trust: rrl_directory::client::Trust::File(cert),
             ..Options::default()
         },
     )
@@ -699,7 +699,7 @@ async fn a_search_over_the_entry_limit_stops_rather_than_filling_memory() {
     let client = Client::connect(
         &url,
         Options {
-            limits: rust_rest_ldap::client::Limits {
+            limits: rrl_directory::client::Limits {
                 max_entries: Some(1),
                 ..Default::default()
             },
@@ -734,7 +734,7 @@ async fn the_insecure_policy_accepts_what_no_authority_signed_and_says_so_in_its
     let client = Client::connect(
         &url,
         Options {
-            trust: rust_rest_ldap::client::Trust::Insecure,
+            trust: rrl_directory::client::Trust::Insecure,
             ..Options::default()
         },
     )

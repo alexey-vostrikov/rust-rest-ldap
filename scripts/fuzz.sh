@@ -11,7 +11,7 @@ set -eu
 TARGET="${1:?usage: scripts/fuzz.sh <target> [seconds]}"
 SECONDS_TO_RUN="${2:-60}"
 
-IMAGE="${RR_LDAP_IMAGE:-rust-rest-ldap-build:1.99.1}"
+IMAGE="${RR_LDAP_IMAGE:-rrl-directory-build:1.99.1}"
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cargo_cache="${RR_LDAP_CARGO_CACHE:-$HOME/.cache/rrl/cargo}"
 rustup_cache="${RR_LDAP_RUSTUP_CACHE:-$HOME/.cache/rrl/rustup}"

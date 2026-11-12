@@ -9,12 +9,12 @@ use rasn_ldap::{
     AttributeDescription, AttributeValueAssertion, CompareRequest, LdapDn, LdapMessage, ProtocolOp,
     ResultCode,
 };
-use rust_rest_ldap::acl::Requester;
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::compare::handle_compare;
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::acl::Requester;
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::compare::handle_compare;
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
@@ -256,7 +256,7 @@ fn the_result_matches_a_search_for_the_same_value() {
         OctetString::from("admins".as_bytes()),
     ));
     let by_filter =
-        rust_rest_ldap::ldap::filter::matches(alice_entry.attributes(), alice_entry.dn(), &filter)
+        rrl_directory::ldap::filter::matches(alice_entry.attributes(), alice_entry.dn(), &filter)
             .expect("filter");
 
     assert_eq!(

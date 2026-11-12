@@ -11,14 +11,14 @@
 use std::sync::Arc;
 
 use redb::ReadableTableMetadata;
-use rust_rest_ldap::catalog::Catalog;
-use rust_rest_ldap::catalog::index::Plan;
-use rust_rest_ldap::catalog::search::{Request, Search};
-use rust_rest_ldap::catalog::store::Store;
-use rust_rest_ldap::directory::{Directory, Scope};
-use rust_rest_ldap::index::{Index, IndexConfig, Kind};
-use rust_rest_ldap::ldap::filter;
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
+use rrl_directory::catalog::Catalog;
+use rrl_directory::catalog::index::Plan;
+use rrl_directory::catalog::search::{Request, Search};
+use rrl_directory::catalog::store::Store;
+use rrl_directory::directory::{Directory, Scope};
+use rrl_directory::index::{Index, IndexConfig, Kind};
+use rrl_directory::ldap::filter;
+use rrl_directory::model::{Attribute, Attributes, Entry};
 
 const BASE: &str = "dc=example,dc=com";
 
@@ -105,7 +105,7 @@ fn old_model(entries: &[Entry]) -> (Directory, Index) {
 fn names(entries: &[(u64, Entry)]) -> Vec<String> {
     let mut found: Vec<String> = entries
         .iter()
-        .map(|(_, entry)| rust_rest_ldap::dn::first_value(entry.dn()).unwrap_or_default())
+        .map(|(_, entry)| rrl_directory::dn::first_value(entry.dn()).unwrap_or_default())
         .collect();
     found.sort();
     found
@@ -117,7 +117,7 @@ fn insensitive(_: &str) -> bool {
 
 /// Parses a filter the way a client would send it, so the test compares what the server compares.
 fn parsed(text: &str) -> rasn_ldap::Filter {
-    rust_rest_ldap::ldap::filter_parse::parse(text).expect("the filter parses")
+    rrl_directory::ldap::filter_parse::parse(text).expect("the filter parses")
 }
 
 fn search(catalog: &Arc<Catalog>, text: &str, base: &str, scope: Scope) -> Vec<String> {
@@ -276,10 +276,10 @@ fn the_same_filters_return_the_same_entries_from_the_old_model() {
         let mut expected: Vec<String> = in_scope
             .iter()
             .filter(|(_, entry)| {
-                rust_rest_ldap::directory::in_scope_for(entry.dn(), BASE, Scope::Subtree)
+                rrl_directory::directory::in_scope_for(entry.dn(), BASE, Scope::Subtree)
                     && filter::matches(entry.attributes(), entry.dn(), &filter).unwrap_or(false)
             })
-            .map(|(_, entry)| rust_rest_ldap::dn::first_value(entry.dn()).unwrap_or_default())
+            .map(|(_, entry)| rrl_directory::dn::first_value(entry.dn()).unwrap_or_default())
             .collect();
         expected.sort();
 
@@ -319,7 +319,7 @@ fn a_page_of_an_ordered_posting_is_removed_when_its_last_entry_goes() {
     let before = store
         .read()
         .expect("read")
-        .open_table(rust_rest_ldap::catalog::index::IDX_ORD)
+        .open_table(rrl_directory::catalog::index::IDX_ORD)
         .map(|table| table.len().expect("len"))
         .unwrap_or(0);
     assert!(before > 0, "the ordered index wrote something");
@@ -331,7 +331,7 @@ fn a_page_of_an_ordered_posting_is_removed_when_its_last_entry_goes() {
     let after = store
         .read()
         .expect("read")
-        .open_table(rust_rest_ldap::catalog::index::IDX_ORD)
+        .open_table(rrl_directory::catalog::index::IDX_ORD)
         .map(|table| table.len().expect("len"))
         .unwrap_or(0);
     assert_eq!(after, 0, "nothing is left of the ordered index");

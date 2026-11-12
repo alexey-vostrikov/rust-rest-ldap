@@ -1257,7 +1257,7 @@ backends:
 backend: redb
 backends:
   redb:
-    path: /var/lib/rust-rest-ldap/directory.redb
+    path: /var/lib/rrl-directory/directory.redb
 ";
 
         let cfg = resolve(Args::default(), Some(text), no_env).expect("file config");

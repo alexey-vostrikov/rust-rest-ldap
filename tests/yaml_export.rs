@@ -4,18 +4,18 @@
 //! operator who picks YAML for review must not silently get a different set of entries or a
 //! different set of values than one who picks LDIF. The formats differ; the data must not.
 
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldif;
-use rust_rest_ldap::yaml_export;
+use rrl_directory::directory::Directory;
+use rrl_directory::ldif;
+use rrl_directory::yaml_export;
 
 const BASE: &str = "dc=example,dc=com";
 
 fn example_directory() -> Directory {
-    let users: Vec<rust_rest_ldap::model::User> = serde_json::from_str(
+    let users: Vec<rrl_directory::model::User> = serde_json::from_str(
         &std::fs::read_to_string("examples/file/users.json").expect("users.json"),
     )
     .expect("parse users");
-    let groups: Vec<rust_rest_ldap::model::Group> = serde_json::from_str(
+    let groups: Vec<rrl_directory::model::Group> = serde_json::from_str(
         &std::fs::read_to_string("examples/file/groups.json").expect("groups.json"),
     )
     .expect("parse groups");
@@ -194,11 +194,11 @@ fn yaml_does_not_fold_where_ldif_must() {
     // long value that is the difference between a diff that reads as one changed value and
     // one that reads as several changed lines.
     let long = "Наименование отдела продаж и маркетинга ".repeat(6);
-    let entry = rust_rest_ldap::model::Entry::new(
+    let entry = rrl_directory::model::Entry::new(
         "cn=long,ou=users,dc=example,dc=com",
-        rust_rest_ldap::model::Attributes::new()
-            .push(rust_rest_ldap::model::Attribute::single("cn", "long"))
-            .push(rust_rest_ldap::model::Attribute::single(
+        rrl_directory::model::Attributes::new()
+            .push(rrl_directory::model::Attribute::single("cn", "long"))
+            .push(rrl_directory::model::Attribute::single(
                 "description",
                 &long,
             )),

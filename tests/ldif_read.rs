@@ -10,7 +10,7 @@
 //!   a value merges two changes into one;
 //! - a file with no trailing blank line ends its last record implicitly, not not-at-all.
 
-use rust_rest_ldap::ldif_read::{self, Change, Error, ModOp, Record};
+use rrl_directory::ldif_read::{self, Change, Error, ModOp, Record};
 
 /// Parses, expecting success.
 fn parse(text: &str) -> Vec<Record> {
@@ -571,17 +571,17 @@ fn a_200_character_value_survives_a_round_trip_through_the_exporter() {
     // The exporter folds at 76 octets; the reader has to join it back exactly, or a long
     // description changes every time a directory is exported and imported.
     let long = "ж".repeat(200);
-    let entry = rust_rest_ldap::model::Entry::new(
+    let entry = rrl_directory::model::Entry::new(
         "cn=a,dc=example,dc=com",
-        rust_rest_ldap::model::Attributes::new()
-            .push(rust_rest_ldap::model::Attribute::single("cn", "a"))
-            .push(rust_rest_ldap::model::Attribute::single(
+        rrl_directory::model::Attributes::new()
+            .push(rrl_directory::model::Attribute::single("cn", "a"))
+            .push(rrl_directory::model::Attribute::single(
                 "description",
                 &long,
             )),
     );
 
-    let text = rust_rest_ldap::ldif::export(&[entry], rust_rest_ldap::ldif::Options::default());
+    let text = rrl_directory::ldif::export(&[entry], rrl_directory::ldif::Options::default());
     let records = parse(&text);
 
     let Record::Entry(parsed) = &records[0] else {
@@ -605,15 +605,15 @@ fn a_whole_exported_directory_reads_back_as_itself() {
     // the same. Anything the reader loses shows up here rather than in a migration.
     let entries: Vec<_> = (0..5)
         .map(|index| {
-            rust_rest_ldap::model::Entry::new(
+            rrl_directory::model::Entry::new(
                 format!("cn=user{index},dc=example,dc=com"),
-                rust_rest_ldap::model::Attributes::new()
-                    .push(rust_rest_ldap::model::Attribute::single(
+                rrl_directory::model::Attributes::new()
+                    .push(rrl_directory::model::Attribute::single(
                         "cn",
                         &format!("user{index}"),
                     ))
-                    .push(rust_rest_ldap::model::Attribute::single("sn", "Иванов"))
-                    .push(rust_rest_ldap::model::Attribute::new(
+                    .push(rrl_directory::model::Attribute::single("sn", "Иванов"))
+                    .push(rrl_directory::model::Attribute::new(
                         "mail",
                         vec![
                             format!("user{index}@example.com"),
@@ -624,7 +624,7 @@ fn a_whole_exported_directory_reads_back_as_itself() {
         })
         .collect();
 
-    let text = rust_rest_ldap::ldif::export(&entries, rust_rest_ldap::ldif::Options::default());
+    let text = rrl_directory::ldif::export(&entries, rrl_directory::ldif::Options::default());
     let records = parse(&text);
     assert_eq!(records.len(), entries.len());
 
@@ -637,7 +637,7 @@ fn a_whole_exported_directory_reads_back_as_itself() {
         .collect();
 
     assert_eq!(
-        rust_rest_ldap::ldif::export(&parsed, rust_rest_ldap::ldif::Options::default()),
+        rrl_directory::ldif::export(&parsed, rrl_directory::ldif::Options::default()),
         text
     );
 }

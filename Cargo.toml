@@ -1,5 +1,5 @@
 [package]
-name = "rust-rest-ldap"
+name = "rrl-directory"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99.1"
@@ -7,10 +7,10 @@ description = "LDAP server with REST API & file backends"
 license = "MIT"
 readme = "README.md"
 
-default-run = "rust-rest-ldap"
+default-run = "rrl-directory"
 
 [[bin]]
-name = "rust-rest-ldap"
+name = "rrl-directory"
 path = "src/main.rs"
 
 [dependencies]

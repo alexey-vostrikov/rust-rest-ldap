@@ -35,11 +35,11 @@ use rasn_ldap::{
     AttributeDescription, Control, Filter, LdapDn, LdapOid, LdapString, ProtocolOp, ResultCode,
     SearchRequest, SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::client::{Client, Options};
-use rust_rest_ldap::config::{Args, Config};
-use rust_rest_ldap::ldap::paged;
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::client::{Client, Options};
+use rrl_directory::config::{Args, Config};
+use rrl_directory::ldap::paged;
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
@@ -73,7 +73,7 @@ indexes:
 }
 
 fn config(text: &str) -> Config {
-    rust_rest_ldap::config::resolve(Args::default(), Some(text), |_| None).expect("config")
+    rrl_directory::config::resolve(Args::default(), Some(text), |_| None).expect("config")
 }
 
 /// One person entry, cheap to build and distinguishable in a result.
@@ -107,9 +107,9 @@ fn user_entry(index: usize) -> Entry {
 }
 
 fn admin_entry() -> Entry {
-    let hash = rust_rest_ldap::password::hash(
+    let hash = rrl_directory::password::hash(
         ADMIN_PASSWORD,
-        rust_rest_ldap::password::StoreScheme::Argon2id,
+        rrl_directory::password::StoreScheme::Argon2id,
     )
     .expect("hash");
 
@@ -139,7 +139,7 @@ async fn server() -> (String, tempfile::TempDir, Duration) {
 
     let text = document(&database);
     let config = config(&text);
-    let backend = rust_rest_ldap::backend::Backend::from_config(
+    let backend = rrl_directory::backend::Backend::from_config(
         "redb",
         Some(&serde_json::json!({"path": database.display().to_string()})),
     )
@@ -149,11 +149,11 @@ async fn server() -> (String, tempfile::TempDir, Duration) {
     // numbers the performance question asks for.
     let started = Instant::now();
     let mut changes = Vec::with_capacity(ENTRIES + 1);
-    changes.push(rust_rest_ldap::backend::EntryChange::Upsert {
+    changes.push(rrl_directory::backend::EntryChange::Upsert {
         entry: admin_entry(),
     });
     for index in 0..ENTRIES {
-        changes.push(rust_rest_ldap::backend::EntryChange::Upsert {
+        changes.push(rrl_directory::backend::EntryChange::Upsert {
             entry: user_entry(index),
         });
     }
@@ -161,8 +161,8 @@ async fn server() -> (String, tempfile::TempDir, Duration) {
     let seeding = started.elapsed();
 
     let security = Security::from_config(&config);
-    let live = rust_rest_ldap::security::live(config.clone(), security);
-    let (source, _) = rust_rest_ldap::reload::Source::load(&config, backend)
+    let live = rrl_directory::security::live(config.clone(), security);
+    let (source, _) = rrl_directory::reload::Source::load(&config, backend)
         .await
         .expect("source");
 
@@ -173,7 +173,7 @@ async fn server() -> (String, tempfile::TempDir, Duration) {
     let (_stop, shutdown) = tokio::sync::watch::channel(false);
 
     tokio::spawn(async move {
-        let _ = rust_rest_ldap::server::serve(
+        let _ = rrl_directory::server::serve(
             listener,
             None,
             false,

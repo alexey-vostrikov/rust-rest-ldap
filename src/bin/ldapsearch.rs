@@ -14,12 +14,12 @@ use rasn_ldap::{
     Control, LdapDn, LdapString, ResultCode, SearchRequest, SearchRequestDerefAliases,
     SearchRequestScope,
 };
-use rust_rest_ldap::cli_connection::Connection;
-use rust_rest_ldap::client::{Client, Options};
-use rust_rest_ldap::ldap::filter_parse;
-use rust_rest_ldap::ldap::{paged, sort};
-use rust_rest_ldap::ldif;
-use rust_rest_ldap::model::Entry;
+use rrl_directory::cli_connection::Connection;
+use rrl_directory::client::{Client, Options};
+use rrl_directory::ldap::filter_parse;
+use rrl_directory::ldap::{paged, sort};
+use rrl_directory::ldif;
+use rrl_directory::model::Entry;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -201,7 +201,7 @@ fn main() -> ExitCode {
             // branches on: `32` is a wrong base, `49` a wrong password, `4` a size limit.
             // Anything that never reached the server is a plain failure.
             match err {
-                rust_rest_ldap::client::Error::Server { code, .. } => exit_code(code),
+                rrl_directory::client::Error::Server { code, .. } => exit_code(code),
                 _ => ExitCode::FAILURE,
             }
         }
@@ -213,11 +213,11 @@ fn main() -> ExitCode {
 enum Failure {
     /// The command line did not describe a search.
     Usage(String),
-    Client(rust_rest_ldap::client::Error),
+    Client(rrl_directory::client::Error),
 }
 
-impl From<rust_rest_ldap::client::Error> for Failure {
-    fn from(err: rust_rest_ldap::client::Error) -> Self {
+impl From<rrl_directory::client::Error> for Failure {
+    fn from(err: rrl_directory::client::Error) -> Self {
         Failure::Client(err)
     }
 }
@@ -307,14 +307,14 @@ async fn collect(
         // reporting, and it is also the exit code.
         if outcome.code != ResultCode::Success {
             print_entries(cli, &entries);
-            return Err(Failure::Client(rust_rest_ldap::client::Error::Server {
+            return Err(Failure::Client(rrl_directory::client::Error::Server {
                 code: outcome.code,
                 message: outcome.diagnostic,
             }));
         }
 
         for message in &messages {
-            if let Some(entry) = rust_rest_ldap::client::entry_of(message) {
+            if let Some(entry) = rrl_directory::client::entry_of(message) {
                 entries.push(entry);
             }
         }
@@ -337,7 +337,7 @@ async fn collect(
 /// The paged-results cookie in an answer, if the server sent one.
 fn next_cookie(messages: &[rasn_ldap::LdapMessage]) -> Option<Vec<u8>> {
     for message in messages {
-        for control in rust_rest_ldap::client::controls_of(message) {
+        for control in rrl_directory::client::controls_of(message) {
             if control.control_type.as_ref() == paged::PAGED_RESULTS_OID.as_bytes() {
                 let value = control.control_value?;
                 return paged::decode(value.as_ref()).ok().map(|page| page.cookie);
@@ -472,7 +472,7 @@ fn exit_code(code: ResultCode) -> ExitCode {
 mod tests {
     use super::*;
     use clap::CommandFactory;
-    use rust_rest_ldap::client::Trust;
+    use rrl_directory::client::Trust;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("ldapsearch").chain(args.iter().copied()))

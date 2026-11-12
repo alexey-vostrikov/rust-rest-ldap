@@ -18,10 +18,10 @@ use rrl_kdc::hdb::HdbEntry;
 use rrl_kdc::hdb::ldap::dn_for;
 use rrl_kdc::name::Principal;
 
-use rust_rest_ldap::backend::{Backend, EntryChange};
-use rust_rest_ldap::kerberos::{KerberosConfig, Settings, bootstrap, serve};
-use rust_rest_ldap::model::Entry;
-use rust_rest_ldap::reload::Source;
+use rrl_directory::backend::{Backend, EntryChange};
+use rrl_directory::kerberos::{KerberosConfig, Settings, bootstrap, serve};
+use rrl_directory::model::Entry;
+use rrl_directory::reload::Source;
 
 const REALM: &str = "EXAMPLE.COM";
 const BASE_DN: &str = "dc=example,dc=com";
@@ -39,12 +39,11 @@ async fn source_with_account(dir: &std::path::Path, account: &str) -> Arc<Source
          kerberos:\n  enabled: true\n",
         store.display()
     );
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
-        Some(&text),
-        |_| None,
-    )
-    .expect("config");
+    let config =
+        rrl_directory::config::resolve(rrl_directory::config::Args::default(), Some(&text), |_| {
+            None
+        })
+        .expect("config");
     let backend = Backend::from_config("redb", config.backends.get("redb")).expect("backend");
 
     // The account, written the way the realm reads it back: `to_attributes`/`from_attributes` are
@@ -377,12 +376,11 @@ async fn the_realm_is_provisioned_once_and_survives_a_restart() {
          kerberos:\n  enabled: true\n",
         store.display()
     );
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
-        Some(&text),
-        |_| None,
-    )
-    .expect("config");
+    let config =
+        rrl_directory::config::resolve(rrl_directory::config::Args::default(), Some(&text), |_| {
+            None
+        })
+        .expect("config");
 
     let krbtgt_dn = {
         let principal = Principal::parse(&format!("krbtgt/{REALM}@{REALM}")).expect("principal");
@@ -448,6 +446,6 @@ async fn default_entries(source: &Source) -> usize {
     source
         .directory()
         .await
-        .entries(BASE_DN, rust_rest_ldap::directory::Scope::Subtree)
+        .entries(BASE_DN, rrl_directory::directory::Scope::Subtree)
         .len()
 }

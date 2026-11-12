@@ -18,9 +18,9 @@
 
 use std::sync::Arc;
 
-use rust_rest_ldap::backend::Backend;
-use rust_rest_ldap::config::{Args, Config};
-use rust_rest_ldap::reload::Source;
+use rrl_directory::backend::Backend;
+use rrl_directory::config::{Args, Config};
+use rrl_directory::reload::Source;
 
 const BASE: &str = "dc=example,dc=com";
 
@@ -30,7 +30,7 @@ fn schema_with(text: &str) -> Schema {
     schema
 }
 
-use rust_rest_ldap::schema::Schema;
+use rrl_directory::schema::Schema;
 
 fn config(users: &std::path::Path, groups: &std::path::Path, schema: &std::path::Path) -> Config {
     let text = format!(
@@ -49,7 +49,7 @@ backends:
         groups.display()
     );
 
-    rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
+    rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
 }
 
 fn write(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
@@ -239,7 +239,7 @@ backends:
         groups.display()
     );
     let config =
-        rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config");
+        rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config");
     let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");
     let (source, _) = Source::load(&config, backend).await.expect("load");
 
@@ -283,7 +283,7 @@ backends:
         groups.display()
     );
     let config =
-        rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config");
+        rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config");
     let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");
     let (source, _) = Source::load(&config, backend).await.expect("load");
 

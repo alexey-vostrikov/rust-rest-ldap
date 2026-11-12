@@ -11,17 +11,17 @@
 use std::sync::Arc;
 
 use rasn_ldap::{AuthenticationChoice, BindRequest, LdapDn, LdapMessage, ProtocolOp, ResultCode};
-use rust_rest_ldap::backend::{Backend, EntryChange};
-use rust_rest_ldap::config::{Args, Config};
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::bind;
-use rust_rest_ldap::ldap::session::Session;
-use rust_rest_ldap::ldap::{Action, handle};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::password::store::hash as hash_password;
-use rust_rest_ldap::password::{PasswordPolicy, StoreScheme, policy::PasswordConfig};
-use rust_rest_ldap::reload::Source;
-use rust_rest_ldap::security::Security;
+use rrl_directory::backend::{Backend, EntryChange};
+use rrl_directory::config::{Args, Config};
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::bind;
+use rrl_directory::ldap::session::Session;
+use rrl_directory::ldap::{Action, handle};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::password::store::hash as hash_password;
+use rrl_directory::password::{PasswordPolicy, StoreScheme, policy::PasswordConfig};
+use rrl_directory::reload::Source;
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ALICE_DN: &str = "cn=alice,ou=users,dc=example,dc=com";
@@ -95,7 +95,7 @@ fn entry(dn: &str, hash: &str) -> Entry {
 fn legacy_policy(upgrade: Option<bool>) -> PasswordPolicy {
     PasswordPolicy::from_config(Some(&PasswordConfig {
         upgrade_on_bind: upgrade,
-        allow_weak_hashes: Some(rust_rest_ldap::password::policy::WEAK_ACKNOWLEDGEMENT.to_string()),
+        allow_weak_hashes: Some(rrl_directory::password::policy::WEAK_ACKNOWLEDGEMENT.to_string()),
         allowed_weak_hashes: Some("ssha".to_string()),
         allow_weak: Vec::new(),
         store_scheme: None,
@@ -196,12 +196,12 @@ fn the_upgraded_hash_verifies_the_same_password() {
 
     let strict = PasswordPolicy::strict();
     assert_eq!(
-        rust_rest_ldap::password::verify(SECRET, &new_hash, &strict),
+        rrl_directory::password::verify(SECRET, &new_hash, &strict),
         Ok(true),
         "the new hash must accept the password that produced it"
     );
     assert_eq!(
-        rust_rest_ldap::password::verify("wrong", &new_hash, &strict),
+        rrl_directory::password::verify("wrong", &new_hash, &strict),
         Ok(false)
     );
 }
@@ -390,7 +390,7 @@ passwords:
 "#,
         path.display()
     );
-    rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
+    rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config")
 }
 
 #[tokio::test]
@@ -547,7 +547,7 @@ passwords:
         groups.display()
     );
     let config =
-        rust_rest_ldap::config::resolve(Args::default(), Some(&text), |_| None).expect("config");
+        rrl_directory::config::resolve(Args::default(), Some(&text), |_| None).expect("config");
     let backend = Backend::from_config(
         "file",
         Some(&serde_json::json!({

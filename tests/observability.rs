@@ -12,12 +12,12 @@ use rasn_ldap::{
     DelRequest, LdapDn, LdapMessage, ProtocolOp, ResultCode, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::ldap::{Action, handle};
-use rust_rest_ldap::metrics::{ChangeKind, Journal, Metrics, Operation};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::ldap::{Action, handle};
+use rrl_directory::metrics::{ChangeKind, Journal, Metrics, Operation};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
@@ -296,8 +296,8 @@ fn a_search_records_its_size_and_cost() {
 fn the_journal_is_off_unless_configured() {
     // A server with no journal configured must not start writing files: the default has to
     // be "nothing", not "somewhere surprising".
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
+    let config = rrl_directory::config::resolve(
+        rrl_directory::config::Args::default(),
         Some("base_dn: dc=example,dc=com\n"),
         |_| None,
     )
@@ -309,8 +309,8 @@ fn the_journal_is_off_unless_configured() {
 
 #[test]
 fn the_journal_path_comes_from_the_configuration() {
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
+    let config = rrl_directory::config::resolve(
+        rrl_directory::config::Args::default(),
         Some("base_dn: dc=example,dc=com\nobservability:\n  journal: /var/log/rrl.jsonl\n"),
         |_| None,
     )
@@ -333,7 +333,7 @@ fn a_journal_on_a_path_that_cannot_be_opened_is_an_error_at_startup() {
 
 #[test]
 fn the_journal_line_for_a_rename_carries_both_dns() {
-    let change = rust_rest_ldap::metrics::Change {
+    let change = rrl_directory::metrics::Change {
         kind: ChangeKind::Rename,
         dn: ALICE_DN.to_string(),
         new_dn: Some("cn=alicia,ou=users,dc=example,dc=com".to_string()),
@@ -390,7 +390,7 @@ fn the_search_filter_used_by_the_tests_is_the_one_they_expect() {
     let alice = dir.find(ALICE_DN).expect("alice");
 
     assert!(
-        rust_rest_ldap::ldap::filter::matches(
+        rrl_directory::ldap::filter::matches(
             alice.attributes(),
             alice.dn(),
             &equality("cn", "alice")
@@ -431,11 +431,11 @@ fn a_rename_is_one_journal_line_with_both_dns() {
             assert_eq!(action.changes.len(), 2);
             assert!(matches!(
                 action.changes[0],
-                rust_rest_ldap::backend::EntryChange::Delete { .. }
+                rrl_directory::backend::EntryChange::Delete { .. }
             ));
             assert!(matches!(
                 action.changes[1],
-                rust_rest_ldap::backend::EntryChange::Upsert { .. }
+                rrl_directory::backend::EntryChange::Upsert { .. }
             ));
         }
         other => panic!("expected a write, got {other:?}"),
@@ -449,7 +449,7 @@ fn a_password_change_is_journalled_as_such_not_as_a_modify() {
     let mut session = admin();
     let request = rasn_ldap::ExtendedRequest {
         request_name: rasn_ldap::LdapOid::from(
-            rust_rest_ldap::ldap::extop::PASSWORD_MODIFY_OID.as_bytes(),
+            rrl_directory::ldap::extop::PASSWORD_MODIFY_OID.as_bytes(),
         ),
         request_value: None,
     };

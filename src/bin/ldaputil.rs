@@ -24,9 +24,9 @@ use rasn_ldap::{
     LdapMessage, LdapOid, ProtocolOp, RelativeLdapDn, ResultCode, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::cli_connection::Connection;
-use rust_rest_ldap::client::{Client, Options};
-use rust_rest_ldap::ldap::{extop, filter_parse};
+use rrl_directory::cli_connection::Connection;
+use rrl_directory::client::{Client, Options};
+use rrl_directory::ldap::{extop, filter_parse};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -333,7 +333,7 @@ async fn descendants(client: &Client, base: &str) -> Result<Vec<String>, ExitCod
             _ => None,
         })
         // The base itself is deleted last, by the caller: a subtree search includes it.
-        .filter(|dn| rust_rest_ldap::dn::normalize(dn) != rust_rest_ldap::dn::normalize(base))
+        .filter(|dn| rrl_directory::dn::normalize(dn) != rrl_directory::dn::normalize(base))
         .collect();
 
     found.dedup();
@@ -716,14 +716,14 @@ fn result_code(messages: &[LdapMessage]) -> Option<ResultCode> {
 }
 
 /// The result code behind a client error, for the exit code.
-fn code_of(err: &rust_rest_ldap::client::Error) -> ResultCode {
+fn code_of(err: &rrl_directory::client::Error) -> ResultCode {
     match err {
-        rust_rest_ldap::client::Error::Server { code, .. } => *code,
+        rrl_directory::client::Error::Server { code, .. } => *code,
         _ => ResultCode::Other,
     }
 }
 
-fn failure(tool: Tool, err: &rust_rest_ldap::client::Error) -> ExitCode {
+fn failure(tool: Tool, err: &rrl_directory::client::Error) -> ExitCode {
     eprintln!("{}: {err}", tool.name());
     ExitCode::from(code_of(err) as u8)
 }

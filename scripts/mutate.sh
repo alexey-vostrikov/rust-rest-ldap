@@ -27,7 +27,7 @@ set -eu
 # No arguments means the whole tree: slow, but honest about what it costs.
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-image="${RR_LDAP_METRICS_IMAGE:-rust-rest-ldap-metrics:1.99.1}"
+image="${RR_LDAP_METRICS_IMAGE:-rrl-directory-metrics:1.99.1}"
 
 cargo_cache="${RR_LDAP_CARGO_CACHE:-$HOME/.cache/rrl/cargo}"
 rustup_cache="${RR_LDAP_RUSTUP_CACHE:-$HOME/.cache/rrl/rustup}"

@@ -10,12 +10,12 @@ use rasn_ldap::{
     AttributeDescription, AttributeValueAssertion, Filter, LdapMessage, ProtocolOp, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::index::IndexConfig;
-use rust_rest_ldap::ldap::search::handle_search;
-use rust_rest_ldap::ldap::session::Session;
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::directory::Directory;
+use rrl_directory::index::IndexConfig;
+use rrl_directory::ldap::search::handle_search;
+use rrl_directory::ldap::session::Session;
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 
@@ -183,7 +183,7 @@ fn search(directory: &Directory, filter: Filter) -> Vec<String> {
     );
 
     let mut session = Session::new();
-    session.set_identity(rust_rest_ldap::ldap::session::Identity::new(
+    session.set_identity(rrl_directory::ldap::session::Identity::new(
         "cn=admin,ou=users,dc=example,dc=com",
         true,
     ));
@@ -521,7 +521,7 @@ fn the_index_actually_narrows() {
     let directory = directory(true);
 
     let candidates = directory
-        .candidates(&rust_rest_ldap::index::Query::Equality {
+        .candidates(&rrl_directory::index::Query::Equality {
             attribute: "cn".into(),
             value: "user007".to_string(),
         })
@@ -542,7 +542,7 @@ fn the_substring_index_actually_narrows() {
     let directory = directory(true);
 
     let narrow = directory
-        .candidates(&rust_rest_ldap::index::Query::Substring {
+        .candidates(&rrl_directory::index::Query::Substring {
             attribute: "cn".into(),
             initial: None,
             any: vec!["user007".to_string()],
@@ -561,7 +561,7 @@ fn the_substring_index_actually_narrows() {
     // trigram shared by every value - "use", for instance - would narrow nothing at all,
     // which is a property of the data rather than of the index.
     let broad = directory
-        .candidates(&rust_rest_ldap::index::Query::Substring {
+        .candidates(&rrl_directory::index::Query::Substring {
             attribute: "cn".into(),
             initial: None,
             any: vec!["ser2".to_string()],
@@ -582,9 +582,9 @@ fn the_ordered_index_actually_narrows() {
     let directory = directory(true);
 
     let candidates = directory
-        .candidates(&rust_rest_ldap::index::Query::Range {
+        .candidates(&rrl_directory::index::Query::Range {
             attribute: "gidNumber".into(),
-            bound: rust_rest_ldap::index::RangeBound::AtLeast,
+            bound: rrl_directory::index::RangeBound::AtLeast,
             value: "2990".to_string(),
         })
         .expect("gidNumber has an ordered index");
@@ -602,7 +602,7 @@ fn without_indexes_there_are_no_candidates() {
 
     assert!(
         directory
-            .candidates(&rust_rest_ldap::index::Query::Equality {
+            .candidates(&rrl_directory::index::Query::Equality {
                 attribute: "cn".into(),
                 value: "user007".to_string(),
             })

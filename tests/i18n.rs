@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use rust_rest_ldap::i18n::{self, Catalog, Locale};
+use rrl_directory::i18n::{self, Catalog, Locale};
 
 fn russian() -> Catalog {
     Catalog::load(
@@ -129,8 +129,8 @@ fn a_key_missing_from_the_file_falls_back_to_english_not_to_nothing() {
 fn an_operator_asking_for_russian_gets_russian_diagnostics() {
     // The behaviour on the wire: language resolution from a configuration value, which
     // is what `locale: ru` produces.
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
+    let config = rrl_directory::config::resolve(
+        rrl_directory::config::Args::default(),
         Some("locale: ru\nbase_dn: dc=example,dc=com\n"),
         |_| None,
     )
@@ -146,8 +146,8 @@ fn the_environment_is_only_a_fallback_for_the_configuration() {
         "LANG" => Some("de_DE.UTF-8".to_string()),
         _ => None,
     };
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
+    let config = rrl_directory::config::resolve(
+        rrl_directory::config::Args::default(),
         Some("locale: ru\nbase_dn: dc=example,dc=com\n"),
         env,
     )
@@ -159,8 +159,8 @@ fn the_environment_is_only_a_fallback_for_the_configuration() {
         "an operator who wrote the language means it, whatever the host says"
     );
 
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
+    let config = rrl_directory::config::resolve(
+        rrl_directory::config::Args::default(),
         Some("base_dn: dc=example,dc=com\n"),
         env,
     )
@@ -172,8 +172,8 @@ fn the_environment_is_only_a_fallback_for_the_configuration() {
 
 #[test]
 fn an_unknown_language_in_the_configuration_is_an_error() {
-    let error = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
+    let error = rrl_directory::config::resolve(
+        rrl_directory::config::Args::default(),
         Some("locale: \"\"\nbase_dn: dc=example,dc=com\n"),
         |_| None,
     );
@@ -186,17 +186,17 @@ fn an_unknown_language_in_the_configuration_is_an_error() {
 fn client_facing_text_is_not_translated() {
     // The contract this step keeps: the protocol stays English ASCII. A response the
     // server sends must not depend on the operator's language, or scripts break.
-    let directory = rust_rest_ldap::directory::Directory::new(
+    let directory = rrl_directory::directory::Directory::new(
         "dc=example,dc=com",
         "users",
         "groups",
         vec![],
         vec![],
     );
-    let mut session = rust_rest_ldap::ldap::session::Session::new();
-    let security = rust_rest_ldap::security::Security::default();
+    let mut session = rrl_directory::ldap::session::Session::new();
+    let security = rrl_directory::security::Security::default();
 
-    let message = rust_rest_ldap::ldap::responses::compare_response(
+    let message = rrl_directory::ldap::responses::compare_response(
         1,
         rasn_ldap::ResultCode::NoSuchObject,
         "target entry not found",

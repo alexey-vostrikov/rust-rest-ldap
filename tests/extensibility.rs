@@ -13,12 +13,12 @@ use rasn_ldap::{
     LdapDn, LdapMessage, ProtocolOp, ResultCode, SearchRequest, SearchRequestDerefAliases,
     SearchRequestScope,
 };
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::session::Session;
-use rust_rest_ldap::ldap::{Action, handle};
-use rust_rest_ldap::mapping::direct;
-use rust_rest_ldap::model::Attribute;
-use rust_rest_ldap::security::Security;
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::session::Session;
+use rrl_directory::ldap::{Action, handle};
+use rrl_directory::mapping::direct;
+use rrl_directory::model::Attribute;
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 
@@ -55,15 +55,15 @@ fn directory() -> Arc<Directory> {
 fn security() -> Arc<Security> {
     // `{SSHA}` is what the fixture uses, so the strict default has to be relaxed for
     // this one scheme — which is exactly the per-scheme policy of the previous step.
-    let config = rust_rest_ldap::password::policy::PasswordConfig {
-        allow_weak_hashes: Some(rust_rest_ldap::password::policy::WEAK_ACKNOWLEDGEMENT.to_string()),
+    let config = rrl_directory::password::policy::PasswordConfig {
+        allow_weak_hashes: Some(rrl_directory::password::policy::WEAK_ACKNOWLEDGEMENT.to_string()),
         allowed_weak_hashes: Some("ssha".to_string()),
         upgrade_on_bind: None,
         allow_weak: Vec::new(),
         store_scheme: None,
     };
     Arc::new(Security {
-        passwords: rust_rest_ldap::password::PasswordPolicy::from_config(Some(&config))
+        passwords: rrl_directory::password::PasswordPolicy::from_config(Some(&config))
             .expect("policy"),
         // The fixture binds over a duplex stream, not TLS.
         allow_unencrypted_bind: true,

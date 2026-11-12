@@ -2293,53 +2293,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rrl-kdc"
-version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-kdc?branch=main#16b489f9895ed08ae9bf9835c8a70a505c8f8a67"
-dependencies = [
- "hmac 0.13.0",
- "rrl-crypto",
- "rrl-krb-common",
- "sha1",
- "sha2 0.11.1",
- "thiserror 2.0.21",
- "zeroize",
-]
-
-[[package]]
-name = "rrl-krb-common"
-version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#ab5aab864c724bd4f420022f0615c616edb4dc67"
-dependencies = [
- "hmac 0.13.0",
- "rrl-crypto",
- "sha1",
- "sha2 0.11.1",
-]
-
-[[package]]
-name = "rsa"
-version = "0.9.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
-dependencies = [
- "const-oid 0.9.6",
- "digest 0.10.7",
- "num-bigint-dig",
- "num-integer",
- "num-traits",
- "pkcs1",
- "pkcs8",
- "rand_core 0.6.4",
- "sha2 0.10.9",
- "signature",
- "spki",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "rust-rest-ldap"
+name = "rrl-directory"
 version = "0.1.0"
 dependencies = [
  "argon2",
@@ -2390,6 +2344,52 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "yescrypt",
+]
+
+[[package]]
+name = "rrl-kdc"
+version = "0.1.0"
+source = "git+https://github.com/alexey-vostrikov/rrl-kdc?branch=main#16b489f9895ed08ae9bf9835c8a70a505c8f8a67"
+dependencies = [
+ "hmac 0.13.0",
+ "rrl-crypto",
+ "rrl-krb-common",
+ "sha1",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "rrl-krb-common"
+version = "0.1.0"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#ab5aab864c724bd4f420022f0615c616edb4dc67"
+dependencies = [
+ "hmac 0.13.0",
+ "rrl-crypto",
+ "sha1",
+ "sha2 0.11.1",
+]
+
+[[package]]
+name = "rsa"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
+dependencies = [
+ "const-oid 0.9.6",
+ "digest 0.10.7",
+ "num-bigint-dig",
+ "num-integer",
+ "num-traits",
+ "pkcs1",
+ "pkcs8",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "signature",
+ "spki",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]

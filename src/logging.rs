@@ -1,6 +1,6 @@
 //! The subscriber that makes `tracing` events visible.
 //!
-//! `rust-rest-ldap` emits `tracing` events throughout, and so does `smb-server` - but `tracing`
+//! `rrl-directory` emits `tracing` events throughout, and so does `smb-server` - but `tracing`
 //! without a subscriber records nothing. That combination is worse than no logging at all: the
 //! call sites look instrumented, the code reads as if it reports, and an operator watching the log
 //! during a failure sees silence and concludes the failure happened elsewhere.

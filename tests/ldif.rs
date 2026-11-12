@@ -4,18 +4,18 @@
 //! question that matters for an operator: if I dump this directory and hand the file to
 //! `ldapadd`, does it describe the same directory back?
 
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldif::{Options, export};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
+use rrl_directory::directory::Directory;
+use rrl_directory::ldif::{Options, export};
+use rrl_directory::model::{Attribute, Attributes, Entry};
 
 const BASE: &str = "dc=example,dc=com";
 
 fn example_directory() -> Directory {
-    let users: Vec<rust_rest_ldap::model::User> = serde_json::from_str(
+    let users: Vec<rrl_directory::model::User> = serde_json::from_str(
         &std::fs::read_to_string("examples/file/users.json").expect("users.json"),
     )
     .expect("parse users");
-    let groups: Vec<rust_rest_ldap::model::Group> = serde_json::from_str(
+    let groups: Vec<rrl_directory::model::Group> = serde_json::from_str(
         &std::fs::read_to_string("examples/file/groups.json").expect("groups.json"),
     )
     .expect("parse groups");

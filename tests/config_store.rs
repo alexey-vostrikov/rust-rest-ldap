@@ -4,8 +4,8 @@
 //! generation, `-c` distinguishes a store from a file without a new key, and a commit through
 //! the store is what the next start reads.
 
-use rust_rest_ldap::config::Args;
-use rust_rest_ldap::config_store::Store;
+use rrl_directory::config::Args;
+use rrl_directory::config_store::Store;
 
 const CONFIG: &str = "base_dn: dc=example,dc=com\nlisten_addr: 127.0.0.1:1389\nbackend: \"null\"\n";
 
@@ -54,7 +54,7 @@ fn a_file_configuration_still_loads_through_the_ordinary_path() {
     std::fs::write(&file, CONFIG).expect("write");
 
     let config =
-        rust_rest_ldap::config::resolve(Args::default(), Some(CONFIG), |_| None).expect("config");
+        rrl_directory::config::resolve(Args::default(), Some(CONFIG), |_| None).expect("config");
     assert_eq!(config.base_dn, "dc=example,dc=com");
     assert_eq!(config.backend, "null");
 }
@@ -71,10 +71,10 @@ fn a_generation_is_a_valid_configuration_on_its_own() {
 
     // Parsing the whole file, header included, must give the same configuration as the body.
     let with_header = generation.read().expect("read");
-    let from_whole = rust_rest_ldap::config::resolve(Args::default(), Some(&with_header), |_| None)
+    let from_whole = rrl_directory::config::resolve(Args::default(), Some(&with_header), |_| None)
         .expect("the whole file must parse");
     let body = generation.body().expect("body");
-    let from_body = rust_rest_ldap::config::resolve(Args::default(), Some(&body), |_| None)
+    let from_body = rrl_directory::config::resolve(Args::default(), Some(&body), |_| None)
         .expect("the body must parse");
 
     assert_ne!(

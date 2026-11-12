@@ -205,7 +205,7 @@ fn derive(
     // reads. The hash is what a secure channel is checked against; the keys are what a ticket is
     // sealed in, and a machine account needs both.
     let nt_hash = nt_hash(&password.utf16)?;
-    if std::env::var_os("RRD_PW_DIAG").is_some() {
+    if std::env::var_os("RRL_PW_DIAG").is_some() {
         let hex: String = nt_hash.iter().map(|b| format!("{b:02x}")).collect();
         eprintln!(
             "pw-diag: derived for '{principal}' from {} octets, nt_hash={hex}",

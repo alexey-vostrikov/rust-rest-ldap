@@ -11,7 +11,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {
-        if let Ok(endpoint) = rust_rest_ldap::backend::http::Endpoint::parse(text) {
+        if let Ok(endpoint) = rrl_directory::backend::http::Endpoint::parse(text) {
             // The parsed endpoint is used to build paths; a hostile address must not be able to
             // make that produce something that is not a request target.
             let _ = endpoint.target("/ldap/user");

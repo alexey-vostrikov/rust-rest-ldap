@@ -19,11 +19,11 @@ use rasn_ldap::{
     Control, LdapDn, LdapOid, LdapString, ProtocolOp, ResultCode, SearchRequest,
     SearchRequestDerefAliases, SearchRequestScope,
 };
-use rust_rest_ldap::client::{Client, Options};
-use rust_rest_ldap::config::Config;
-use rust_rest_ldap::ldap::sync::{self, Mode, State};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::client::{Client, Options};
+use rrl_directory::config::Config;
+use rrl_directory::ldap::sync::{self, Mode, State};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 
@@ -31,7 +31,7 @@ fn person(cn: &str) -> Entry {
     // Stamped, because that is what an entry written through the protocol always is: `entryCSN`
     // is what a resumed refresh compares against, and an entry without one cannot be called
     // unchanged.
-    rust_rest_ldap::operational::stamp_write(
+    rrl_directory::operational::stamp_write(
         &raw_person(cn),
         "cn=admin,dc=example,dc=com",
         std::time::SystemTime::now(),
@@ -53,7 +53,7 @@ fn raw_person(cn: &str) -> Entry {
 
 async fn serve(entries: Vec<Entry>) -> String {
     let config = Config {
-        emulation: rust_rest_ldap::emulation::EmulationConfig::default(),
+        emulation: rrl_directory::emulation::EmulationConfig::default(),
         #[cfg(feature = "kdc")]
         kerberos: Default::default(),
         #[cfg(feature = "smb")]
@@ -78,8 +78,8 @@ async fn serve(entries: Vec<Entry>) -> String {
         http_listen_addr: None,
         callback_auth_token: None,
         passwords: Default::default(),
-        schema: rust_rest_ldap::schema::Schema::core(),
-        schema_mode: rust_rest_ldap::schema::Mode::Off,
+        schema: rrl_directory::schema::Schema::core(),
+        schema_mode: rrl_directory::schema::Mode::Off,
         schema_files: Vec::new(),
         schema_definitions: Vec::new(),
         indexes: Default::default(),
@@ -91,7 +91,7 @@ async fn serve(entries: Vec<Entry>) -> String {
         conflict_log: None,
         sasl: Default::default(),
         limits: Default::default(),
-        acl: rust_rest_ldap::acl::from_config(Some(&[rust_rest_ldap::acl::AccessRuleConfig {
+        acl: rrl_directory::acl::from_config(Some(&[rrl_directory::acl::AccessRuleConfig {
             subject: "anonymous".to_string(),
             base: None,
             attributes: vec!["*".to_string()],
@@ -111,8 +111,8 @@ async fn serve(entries: Vec<Entry>) -> String {
         observability: Default::default(),
         bootstrap: None,
         locale: (
-            rust_rest_ldap::i18n::Locale::english(),
-            rust_rest_ldap::i18n::Source::Default,
+            rrl_directory::i18n::Locale::english(),
+            rrl_directory::i18n::Source::Default,
         ),
         locale_file: None,
         document: None,
@@ -123,7 +123,7 @@ async fn serve(entries: Vec<Entry>) -> String {
     let database = std::env::temp_dir().join(format!("sync-{}-{serial}.redb", std::process::id()));
     let _ = std::fs::remove_file(&database);
 
-    let backend = rust_rest_ldap::backend::Backend::from_config(
+    let backend = rrl_directory::backend::Backend::from_config(
         "redb",
         Some(&serde_json::json!({ "path": database.display().to_string() })),
     )
@@ -132,17 +132,17 @@ async fn serve(entries: Vec<Entry>) -> String {
         .apply(
             &entries
                 .into_iter()
-                .map(|entry| rust_rest_ldap::backend::EntryChange::Upsert { entry })
+                .map(|entry| rrl_directory::backend::EntryChange::Upsert { entry })
                 .collect::<Vec<_>>(),
         )
         .await
         .expect("seed");
 
-    let (source, _directory) = rust_rest_ldap::reload::Source::load(&config, backend)
+    let (source, _directory) = rrl_directory::reload::Source::load(&config, backend)
         .await
         .expect("source");
     let security = Security::from_config(&config).with_schema(source.shared_schema());
-    let live = rust_rest_ldap::security::live(config, security);
+    let live = rrl_directory::security::live(config, security);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -151,7 +151,7 @@ async fn serve(entries: Vec<Entry>) -> String {
     let (_stop, shutdown) = tokio::sync::watch::channel(false);
 
     tokio::spawn(async move {
-        let _ = rust_rest_ldap::server::serve(
+        let _ = rrl_directory::server::serve(
             listener,
             None,
             false,
@@ -174,7 +174,7 @@ fn search() -> SearchRequest {
         0,
         0,
         false,
-        rust_rest_ldap::ldap::filter_parse::parse("(objectClass=*)").expect("filter"),
+        rrl_directory::ldap::filter_parse::parse("(objectClass=*)").expect("filter"),
         vec![LdapString::from("cn")],
     )
 }
@@ -921,7 +921,7 @@ async fn a_resumed_refresh_over_many_unchanged_entries_sends_one_set_not_a_messa
     // The UUIDs are the entries' own, so a client can match them to what it holds. These fixtures
     // carry no stored `entryUUID`, so the server derives one from the DN - which is the identity a
     // client was given in the first refresh and therefore the one it expects back.
-    let expected = sync::uuid_bytes(&rust_rest_ldap::directory::entry_uuid(
+    let expected = sync::uuid_bytes(&rrl_directory::directory::entry_uuid(
         "cn=user00,ou=users,dc=example,dc=com",
     ))
     .expect("sixteen octets");
@@ -1006,7 +1006,7 @@ async fn a_resumed_refresh_sends_a_changed_entry_with_its_attributes() {
 
     // One write through the protocol, which stamps a newer entryCSN.
     let mut changed = person("alice");
-    changed = rust_rest_ldap::operational::stamp_write(
+    changed = rrl_directory::operational::stamp_write(
         &changed,
         "cn=admin,dc=example,dc=com",
         std::time::SystemTime::now() + std::time::Duration::from_secs(1),
@@ -1125,7 +1125,7 @@ async fn a_size_limited_refresh_is_an_error_to_the_client_so_no_delete_hint_reac
     // not set `refreshDeletes` on an answer it cut short - the two halves agree, and neither
     // invites a client to delete a live entry.
     match outcome {
-        Err(rust_rest_ldap::client::Error::Server { code, .. }) => {
+        Err(rrl_directory::client::Error::Server { code, .. }) => {
             assert_eq!(code, ResultCode::SizeLimitExceeded);
         }
         Ok((messages, _)) => panic!(
@@ -1147,7 +1147,7 @@ async fn a_client_that_asks_for_an_unknown_mode_is_told_it_is_a_protocol_error()
     let outcome = client.search_with(search(), vec![sync_control(2)]).await;
 
     match outcome {
-        Err(rust_rest_ldap::client::Error::Server { code, message }) => {
+        Err(rrl_directory::client::Error::Server { code, message }) => {
             assert_eq!(code, ResultCode::ProtocolError);
             assert!(message.contains("mode"), "{message}");
         }

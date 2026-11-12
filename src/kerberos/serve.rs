@@ -69,12 +69,12 @@ fn krb_error_text(bytes: &[u8]) -> Option<String> {
 
 /// The octets of a datagram as hex, for the log.
 ///
-/// Gated by `RRD_KDC_HEX`: a realm or a name is inside an AS-REQ in a form no other log line shows,
+/// Gated by `RRL_KDC_HEX`: a realm or a name is inside an AS-REQ in a form no other log line shows,
 /// and a client that is refused for the case of its realm looks exactly like one refused for its
 /// name until the bytes are read. Off by default, because a KDC log is not a packet archive.
 fn hex_of(bytes: &[u8]) -> String {
-    if std::env::var_os("RRD_KDC_HEX").is_none() {
-        return String::from("<set RRD_KDC_HEX to log the octets>");
+    if std::env::var_os("RRL_KDC_HEX").is_none() {
+        return String::from("<set RRL_KDC_HEX to log the octets>");
     }
     let mut out = String::with_capacity(bytes.len() * 2);
     for octet in bytes {

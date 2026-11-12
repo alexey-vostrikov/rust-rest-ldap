@@ -4,11 +4,11 @@
 //! memory instead of re-read is a directory that can drift from its store. These tests hold both
 //! ends - the store is not read again, and what the server answers is what a reload would answer.
 
-use rust_rest_ldap::backend::{Backend, EntryChange};
-use rust_rest_ldap::directory::Scope;
-use rust_rest_ldap::index::Query;
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::reload::Source;
+use rrl_directory::backend::{Backend, EntryChange};
+use rrl_directory::directory::Scope;
+use rrl_directory::index::Query;
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::reload::Source;
 
 fn person(cn: &str, sn: &str) -> Entry {
     Entry::new(
@@ -31,12 +31,11 @@ async fn seeded(dir: &std::path::Path, count: usize) -> std::sync::Arc<Source> {
          indexes:\n  default: [pres, eq, sub]\n",
         store.display()
     );
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
-        Some(&text),
-        |_| None,
-    )
-    .expect("config");
+    let config =
+        rrl_directory::config::resolve(rrl_directory::config::Args::default(), Some(&text), |_| {
+            None
+        })
+        .expect("config");
 
     let backend = Backend::from_config("redb", config.backends.get("redb")).expect("backend");
     let changes: Vec<EntryChange> = (0..count)
@@ -114,7 +113,7 @@ async fn a_modify_replaces_the_entry_without_reading_the_store() {
     // it, the index must name the entry under its new value and not under the old one.
     let directory = source.directory().await;
     let index = directory.index();
-    let new_value = rust_rest_ldap::index::Query::Equality {
+    let new_value = rrl_directory::index::Query::Equality {
         attribute: "sn".into(),
         value: "changed".to_string(),
     };
@@ -127,7 +126,7 @@ async fn a_modify_replaces_the_entry_without_reading_the_store() {
         candidates.len()
     );
 
-    let old_value = rust_rest_ldap::index::Query::Equality {
+    let old_value = rrl_directory::index::Query::Equality {
         attribute: "sn".into(),
         value: "original".to_string(),
     };
@@ -177,7 +176,7 @@ async fn what_an_in_place_write_leaves_is_what_a_reload_would_have_read() {
 /// The ids cannot be compared: an in-place write keeps the ids it issued, and a rebuild issues
 /// them again in canonical order, so the same index over the same directory carries different
 /// numbers. What a client sees is which entries the answer names, and that has to match.
-fn answered_dns(directory: &rust_rest_ldap::directory::Directory, query: &Query) -> Vec<String> {
+fn answered_dns(directory: &rrl_directory::directory::Directory, query: &Query) -> Vec<String> {
     let Some(candidates) = directory.index().candidates(query) else {
         return Vec::new();
     };
@@ -221,7 +220,7 @@ fn probes() -> Vec<Query> {
 }
 
 /// Every probe's answer, taken from one snapshot before it is let go.
-fn answers(directory: &rust_rest_ldap::directory::Directory) -> Vec<(Query, Vec<String>)> {
+fn answers(directory: &rrl_directory::directory::Directory) -> Vec<(Query, Vec<String>)> {
     probes()
         .into_iter()
         .map(|query| {
@@ -233,7 +232,7 @@ fn answers(directory: &rust_rest_ldap::directory::Directory) -> Vec<(Query, Vec<
 
 fn assert_same_answers(
     in_place: &[(Query, Vec<String>)],
-    reloaded: &rust_rest_ldap::directory::Directory,
+    reloaded: &rrl_directory::directory::Directory,
 ) {
     for (query, expected) in in_place {
         assert_eq!(
@@ -244,10 +243,7 @@ fn assert_same_answers(
     }
 }
 
-fn reloaded_answers(
-    directory: &rust_rest_ldap::directory::Directory,
-    query: &Query,
-) -> Vec<String> {
+fn reloaded_answers(directory: &rrl_directory::directory::Directory, query: &Query) -> Vec<String> {
     answered_dns(directory, query)
 }
 
@@ -360,12 +356,11 @@ async fn a_file_backend_write_still_reloads_because_the_store_rewrites_its_docum
         users.display(),
         groups.display()
     );
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
-        Some(&text),
-        |_| None,
-    )
-    .expect("config");
+    let config =
+        rrl_directory::config::resolve(rrl_directory::config::Args::default(), Some(&text), |_| {
+            None
+        })
+        .expect("config");
     let backend = Backend::from_config("file", config.backends.get("file")).expect("backend");
     let (source, _) = Source::load(&config, backend).await.expect("load");
 
@@ -373,7 +368,7 @@ async fn a_file_backend_write_still_reloads_because_the_store_rewrites_its_docum
 
     // The backend finds the entry to replace by comparing it with what it stored, so the test
     // reads the stored value back instead of inventing one that merely looks the same.
-    let stored: Vec<rust_rest_ldap::model::User> =
+    let stored: Vec<rrl_directory::model::User> =
         serde_json::from_str(&std::fs::read_to_string(&users).expect("read")).expect("users");
     let user = stored.into_iter().next().expect("one user");
     let mut changed = user.clone();
@@ -507,12 +502,11 @@ async fn a_write_that_breaks_the_schema_is_refused_before_anything_is_patched() 
          schema:\n  mode: strict\n",
         store.display()
     );
-    let config = rust_rest_ldap::config::resolve(
-        rust_rest_ldap::config::Args::default(),
-        Some(&text),
-        |_| None,
-    )
-    .expect("config");
+    let config =
+        rrl_directory::config::resolve(rrl_directory::config::Args::default(), Some(&text), |_| {
+            None
+        })
+        .expect("config");
     let backend = Backend::from_config("redb", config.backends.get("redb")).expect("backend");
     // No `mail` in the seed: the write below would add one, and the assertion is that it did not.
     let seed = Entry::new(

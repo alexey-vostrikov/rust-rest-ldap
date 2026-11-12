@@ -120,7 +120,7 @@ impl smb_server::MachineSecrets for DirectorySecrets {
         })?;
 
         let nt_hash = nt_hash_of(entry.attributes())?;
-        if std::env::var_os("RRD_PW_DIAG").is_some() {
+        if std::env::var_os("RRL_PW_DIAG").is_some() {
             let hex: String = nt_hash.iter().map(|b| format!("{b:02x}")).collect();
             eprintln!(
                 "pw-diag: checked '{account}' with nt_hash={hex} at {}",

@@ -866,7 +866,7 @@ mod tests {
     };
 
     fn document(text: &str) -> Document {
-        Document::new(text, "file:/etc/rust-rest-ldap/config.yaml")
+        Document::new(text, "file:/etc/rrl-directory/config.yaml")
     }
 
     fn dns(entries: &[Entry]) -> Vec<String> {
@@ -1068,7 +1068,7 @@ access:
 
         assert_eq!(
             values(&entries[0], ORIGIN_ATTRIBUTE),
-            vec!["file:/etc/rust-rest-ldap/config.yaml"]
+            vec!["file:/etc/rrl-directory/config.yaml"]
         );
         assert!(
             find(&entries, "cn=file,cn=backends,cn=config")

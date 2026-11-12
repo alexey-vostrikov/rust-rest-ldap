@@ -13,9 +13,9 @@ use rasn_ldap::{
     AttributeDescription, ChangeOperation, LdapDn, ModifyRequest, ModifyRequestChanges,
     PartialAttribute, ProtocolOp, ResultCode,
 };
-use rust_rest_ldap::client::{Client, Options};
-use rust_rest_ldap::config::{Args, Config, Document};
-use rust_rest_ldap::security::Security;
+use rrl_directory::client::{Client, Options};
+use rrl_directory::config::{Args, Config, Document};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
@@ -41,7 +41,7 @@ bind:
 }
 
 fn config(text: &str) -> Config {
-    rust_rest_ldap::config::resolve(Args::default(), Some(text), |_| None).expect("config")
+    rrl_directory::config::resolve(Args::default(), Some(text), |_| None).expect("config")
 }
 
 /// A running server whose configuration lives in a generation store.
@@ -51,7 +51,7 @@ async fn server() -> (String, String, tempfile::TempDir) {
     let store = directory.path().join("config.d");
 
     let text = document(&database);
-    rust_rest_ldap::config_store::Store::open(&store)
+    rrl_directory::config_store::Store::open(&store)
         .commit(&text, "test", "initial")
         .expect("seed the store");
 
@@ -62,23 +62,23 @@ async fn server() -> (String, String, tempfile::TempDir) {
     );
     let config = Arc::new(config);
 
-    let backend = rust_rest_ldap::backend::Backend::from_config(
+    let backend = rrl_directory::backend::Backend::from_config(
         "redb",
         Some(&serde_json::json!({"path": database.display().to_string()})),
     )
     .expect("backend");
     backend
-        .apply(&[rust_rest_ldap::backend::EntryChange::Upsert {
+        .apply(&[rrl_directory::backend::EntryChange::Upsert {
             entry: admin_entry(),
         }])
         .await
         .expect("seed");
 
     let security = Security::from_config(&config).with_schema(
-        rust_rest_ldap::security::shared_schema(rust_rest_ldap::schema::Schema::core()),
+        rrl_directory::security::shared_schema(rrl_directory::schema::Schema::core()),
     );
-    let live = rust_rest_ldap::security::live((*config).clone(), security);
-    let (source, _) = rust_rest_ldap::reload::Source::load(&config, backend)
+    let live = rrl_directory::security::live((*config).clone(), security);
+    let (source, _) = rrl_directory::reload::Source::load(&config, backend)
         .await
         .expect("source");
 
@@ -89,7 +89,7 @@ async fn server() -> (String, String, tempfile::TempDir) {
     let (_stop, shutdown) = tokio::sync::watch::channel(false);
 
     tokio::spawn(async move {
-        let _ = rust_rest_ldap::server::serve(
+        let _ = rrl_directory::server::serve(
             listener,
             None,
             false,
@@ -109,12 +109,12 @@ async fn server() -> (String, String, tempfile::TempDir) {
 }
 
 /// The administrator, with the hash the server understands.
-fn admin_entry() -> rust_rest_ldap::model::Entry {
-    use rust_rest_ldap::model::{Attribute, Attributes, Entry};
+fn admin_entry() -> rrl_directory::model::Entry {
+    use rrl_directory::model::{Attribute, Attributes, Entry};
 
-    let hash = rust_rest_ldap::password::hash(
+    let hash = rrl_directory::password::hash(
         ADMIN_PASSWORD,
-        rust_rest_ldap::password::StoreScheme::Argon2id,
+        rrl_directory::password::StoreScheme::Argon2id,
     )
     .expect("hash");
     let attributes = Attributes::new()
@@ -249,7 +249,7 @@ async fn a_setting_that_needs_a_restart_says_so_and_still_commits() {
     // The store holds the new value even though the socket did not move: the generation is a
     // fact, and pretending otherwise would make the history disagree with the disk.
     let path = origin.strip_prefix("store:").expect("origin").to_string();
-    let text = rust_rest_ldap::config_store::Store::open(&path)
+    let text = rrl_directory::config_store::Store::open(&path)
         .read_current()
         .expect("read")
         .expect("generation");
@@ -311,7 +311,7 @@ async fn the_server_is_still_running_after_a_change_it_could_not_adopt() {
 
     let path = origin.strip_prefix("store:").expect("origin").to_string();
     assert_eq!(
-        rust_rest_ldap::config_store::Store::open(&path)
+        rrl_directory::config_store::Store::open(&path)
             .history()
             .expect("history")
             .len(),
@@ -335,7 +335,7 @@ async fn the_answer_to_a_change_names_the_generation_in_the_history() {
     remove(&admin, "cn=bind,cn=config", "restldap-AllowUnencryptedBind").await;
 
     let path = origin.strip_prefix("store:").expect("origin").to_string();
-    let store = rust_rest_ldap::config_store::Store::open(&path);
+    let store = rrl_directory::config_store::Store::open(&path);
     let history = store.history().expect("history");
 
     assert_eq!(history.len(), 2);

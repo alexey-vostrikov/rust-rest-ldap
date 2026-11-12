@@ -1,5 +1,5 @@
 [package]
-name = "rust-rest-ldap-fuzz"
+name = "rrl-directory-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -10,7 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rust-rest-ldap = { path = ".." }
+rrl-directory = { path = ".." }
 
 # One target per parser that reads something an outsider controls. A parser that panics is a
 # server that can be stopped from outside, which is why these are the ones worth fuzzing:

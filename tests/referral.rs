@@ -11,11 +11,11 @@ use rasn::types::OctetString;
 use rasn_ldap::{
     Control, LdapDn, LdapOid, LdapString, ResultCode, SearchRequest, SearchRequestScope,
 };
-use rust_rest_ldap::client::{Client, Options};
-use rust_rest_ldap::config::Config;
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::client::{Client, Options};
+use rrl_directory::config::Config;
+use rrl_directory::directory::Directory;
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const LOCAL_BASE: &str = "dc=example,dc=com";
 const REMOTE_BASE: &str = "dc=remote,dc=test";
@@ -42,7 +42,7 @@ async fn serve(
     let _ = Directory::from_entries(base, "users", "groups", entries.clone());
 
     let config = Config {
-        emulation: rust_rest_ldap::emulation::EmulationConfig::default(),
+        emulation: rrl_directory::emulation::EmulationConfig::default(),
         #[cfg(feature = "kdc")]
         kerberos: Default::default(),
         #[cfg(feature = "smb")]
@@ -67,8 +67,8 @@ async fn serve(
         http_listen_addr: None,
         callback_auth_token: None,
         passwords: Default::default(),
-        schema: rust_rest_ldap::schema::Schema::core(),
-        schema_mode: rust_rest_ldap::schema::Mode::Off,
+        schema: rrl_directory::schema::Schema::core(),
+        schema_mode: rrl_directory::schema::Mode::Off,
         schema_files: Vec::new(),
         schema_definitions: Vec::new(),
         indexes: Default::default(),
@@ -79,17 +79,17 @@ async fn serve(
         conflict_log: None,
         sasl: Default::default(),
         limits: Default::default(),
-        referrals: rust_rest_ldap::referral::Referrals::new(
+        referrals: rrl_directory::referral::Referrals::new(
             referrals
                 .iter()
-                .map(|(dn, url)| rust_rest_ldap::referral::Referral {
+                .map(|(dn, url)| rrl_directory::referral::Referral {
                     dn: dn.to_string(),
                     url: url.to_string(),
                 })
                 .collect(),
         )
         .expect("referrals"),
-        acl: rust_rest_ldap::acl::from_config(Some(&[rust_rest_ldap::acl::AccessRuleConfig {
+        acl: rrl_directory::acl::from_config(Some(&[rrl_directory::acl::AccessRuleConfig {
             subject: "anonymous".to_string(),
             base: None,
             attributes: vec!["*".to_string()],
@@ -106,8 +106,8 @@ async fn serve(
         observability: Default::default(),
         bootstrap: None,
         locale: (
-            rust_rest_ldap::i18n::Locale::english(),
-            rust_rest_ldap::i18n::Source::Default,
+            rrl_directory::i18n::Locale::english(),
+            rrl_directory::i18n::Source::Default,
         ),
         locale_file: None,
         document: None,
@@ -122,7 +122,7 @@ async fn serve(
     let database =
         std::env::temp_dir().join(format!("referral-{}-{serial}.redb", std::process::id()));
     let _ = std::fs::remove_file(&database);
-    let backend = rust_rest_ldap::backend::Backend::from_config(
+    let backend = rrl_directory::backend::Backend::from_config(
         "redb",
         Some(&serde_json::json!({ "path": database.display().to_string() })),
     )
@@ -132,13 +132,13 @@ async fn serve(
             &entries
                 .iter()
                 .cloned()
-                .map(|entry| rust_rest_ldap::backend::EntryChange::Upsert { entry })
+                .map(|entry| rrl_directory::backend::EntryChange::Upsert { entry })
                 .collect::<Vec<_>>(),
         )
         .await
         .expect("seed");
 
-    let (source, _directory) = rust_rest_ldap::reload::Source::load(&config, backend)
+    let (source, _directory) = rrl_directory::reload::Source::load(&config, backend)
         .await
         .expect("source");
 
@@ -150,7 +150,7 @@ async fn serve(
         referrals.len(),
         "the policy the server runs with must carry the referrals the test configured"
     );
-    let live = rust_rest_ldap::security::live(config, security);
+    let live = rrl_directory::security::live(config, security);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -159,7 +159,7 @@ async fn serve(
     let (stop, shutdown) = tokio::sync::watch::channel(false);
 
     tokio::spawn(async move {
-        let _ = rust_rest_ldap::server::serve(
+        let _ = rrl_directory::server::serve(
             listener,
             None,
             false,
@@ -190,7 +190,7 @@ async fn expect_refusal(
 
     match result {
         Ok((messages, _)) => result_code(&messages).expect("a done message"),
-        Err(rust_rest_ldap::client::Error::Server { code, .. }) => code,
+        Err(rrl_directory::client::Error::Server { code, .. }) => code,
         Err(other) => panic!("unexpected failure: {other}"),
     }
 }
@@ -203,7 +203,7 @@ fn search(base: &str, filter: &str) -> SearchRequest {
         0,
         0,
         false,
-        rust_rest_ldap::ldap::filter_parse::parse(filter).expect("filter"),
+        rrl_directory::ldap::filter_parse::parse(filter).expect("filter"),
         vec![LdapString::from("cn")],
     )
 }

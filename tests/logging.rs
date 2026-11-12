@@ -11,10 +11,10 @@
 
 use std::path::PathBuf;
 
-use rust_rest_ldap::config::{self, Args};
+use rrl_directory::config::{self, Args};
 
 /// A configuration whose only purpose is to point the log at a file at debug level.
-fn config(log: &std::path::Path, timestamp: bool, caller: bool) -> rust_rest_ldap::config::Config {
+fn config(log: &std::path::Path, timestamp: bool, caller: bool) -> rrl_directory::config::Config {
     let text =
         format!("base_dn: dc=example,dc=com\nlog_timestamp: {timestamp}\nlog_caller: {caller}\n");
     let args = Args {
@@ -33,7 +33,7 @@ fn an_event_reaches_the_file_the_configuration_named() {
     // `log_caller` off so the line holds the message and not a path that a test would
     // accidentally be asserting instead.
     let config = config(&log, false, false);
-    rust_rest_ldap::logging::install(&config).expect("install");
+    rrl_directory::logging::install(&config).expect("install");
 
     // One event at each level a caller uses: `info!` is what an operator reads by default,
     // `debug!` is what `-d` exists for, and a subscriber that installed but filtered debug out

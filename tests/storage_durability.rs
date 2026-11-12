@@ -16,12 +16,12 @@ use rasn_ldap::{
     ResultCode, SearchRequest, SearchRequestDerefAliases, SearchRequestScope,
 };
 use redb::Durability;
-use rust_rest_ldap::backend::{Backend, EntryChange};
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::session::Session;
-use rust_rest_ldap::ldap::{Action, handle};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::backend::{Backend, EntryChange};
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::session::Session;
+use rrl_directory::ldap::{Action, handle};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 
@@ -65,7 +65,7 @@ fn anonymous_search_count(directory: &Directory, filter: Filter) -> (usize, Resu
     // straight to the search handler's sibling: the dispatcher with a bound admin.
     let security = Security::default();
     let mut session = Session::new();
-    session.set_identity(rust_rest_ldap::ldap::session::Identity::new(
+    session.set_identity(rrl_directory::ldap::session::Identity::new(
         "cn=admin,ou=users,dc=example,dc=com",
         true,
     ));

@@ -12,8 +12,8 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use rust_rest_ldap::backend::{Backend, EntryChange, ObjectKind};
-use rust_rest_ldap::model::User;
+use rrl_directory::backend::{Backend, EntryChange, ObjectKind};
+use rrl_directory::model::User;
 
 /// One request as the mock service saw it.
 #[derive(Debug, Clone)]
@@ -353,8 +353,8 @@ async fn a_whole_entry_is_written_back_as_the_object_it_describes() {
     // whole entry. The service's model is smaller, so the entry is read back into a user.
     let (url, seen) = service(200, |_| "{}".to_string(), None).await;
 
-    let attributes = rust_rest_ldap::model::Attributes::new()
-        .push(rust_rest_ldap::model::Attribute::new(
+    let attributes = rrl_directory::model::Attributes::new()
+        .push(rrl_directory::model::Attribute::new(
             "objectClass",
             vec![
                 "top".to_string(),
@@ -362,16 +362,15 @@ async fn a_whole_entry_is_written_back_as_the_object_it_describes() {
                 "inetOrgPerson".to_string(),
             ],
         ))
-        .push(rust_rest_ldap::model::Attribute::single("cn", "alice"))
-        .push(rust_rest_ldap::model::Attribute::single("sn", "Smith"))
-        .push(rust_rest_ldap::model::Attribute::single("uid", "alice"))
-        .push(rust_rest_ldap::model::Attribute::single(
+        .push(rrl_directory::model::Attribute::single("cn", "alice"))
+        .push(rrl_directory::model::Attribute::single("sn", "Smith"))
+        .push(rrl_directory::model::Attribute::single("uid", "alice"))
+        .push(rrl_directory::model::Attribute::single(
             "mail",
             "alice@example.com",
         ));
 
-    let entry =
-        rust_rest_ldap::model::Entry::new("cn=alice,ou=users,dc=example,dc=com", attributes);
+    let entry = rrl_directory::model::Entry::new("cn=alice,ou=users,dc=example,dc=com", attributes);
 
     backend(&url, None, None)
         .update(&EntryChange::Upsert { entry })
@@ -399,19 +398,19 @@ async fn a_whole_entry_is_written_back_as_the_object_it_describes() {
 async fn a_group_entry_goes_to_the_groups_collection() {
     let (url, seen) = service(200, |_| "{}".to_string(), None).await;
 
-    let attributes = rust_rest_ldap::model::Attributes::new()
-        .push(rust_rest_ldap::model::Attribute::new(
+    let attributes = rrl_directory::model::Attributes::new()
+        .push(rrl_directory::model::Attribute::new(
             "objectClass",
             vec!["top".to_string(), "posixGroup".to_string()],
         ))
-        .push(rust_rest_ldap::model::Attribute::single("cn", "admins"))
-        .push(rust_rest_ldap::model::Attribute::new(
+        .push(rrl_directory::model::Attribute::single("cn", "admins"))
+        .push(rrl_directory::model::Attribute::new(
             "memberUid",
             vec!["alice".to_string()],
         ));
 
     let entry =
-        rust_rest_ldap::model::Entry::new("cn=admins,ou=groups,dc=example,dc=com", attributes);
+        rrl_directory::model::Entry::new("cn=admins,ou=groups,dc=example,dc=com", attributes);
 
     backend(&url, None, None)
         .update(&EntryChange::Upsert { entry })

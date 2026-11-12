@@ -8,7 +8,7 @@ use crate::config;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "rust-rest-ldap",
+    name = "rrl-directory",
     version,
     about = "LDAP server with REST API & file backends"
 )]
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn every_flag_maps_into_config_args() {
         let cli = Cli::parse_from([
-            "rust-rest-ldap",
+            "rrl-directory",
             "-c",
             "config.yaml",
             "-b",
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn no_flags_mean_no_overrides() {
-        let cli = Cli::parse_from(["rust-rest-ldap"]);
+        let cli = Cli::parse_from(["rrl-directory"]);
 
         let args: config::Args = cli.into();
 

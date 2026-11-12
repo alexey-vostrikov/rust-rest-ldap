@@ -9,12 +9,12 @@ use rasn_ldap::{
     AttributeDescription, AttributeValueAssertion, ChangeOperation, Control, Filter, LdapDn,
     ModifyRequest, ModifyRequestChanges, PartialAttribute, ProtocolOp, ResultCode,
 };
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::assertion::ASSERTION_OID;
-use rust_rest_ldap::ldap::modify::{self, Outcome};
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::assertion::ASSERTION_OID;
+use rrl_directory::ldap::modify::{self, Outcome};
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";

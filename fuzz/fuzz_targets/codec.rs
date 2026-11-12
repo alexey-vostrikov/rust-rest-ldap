@@ -11,6 +11,6 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     // The two entry points a connection uses: how much of the buffer is one message, and what
     // that message says. Both take bytes straight off the socket.
-    let _ = rust_rest_ldap::ldap::codec::parse_header(data);
-    let _ = rust_rest_ldap::ldap::codec::decode(data);
+    let _ = rrl_directory::ldap::codec::parse_header(data);
+    let _ = rrl_directory::ldap::codec::decode(data);
 });

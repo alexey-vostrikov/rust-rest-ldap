@@ -556,7 +556,7 @@ fn clone_string(text: &str) -> String {
 /// Writes `body` with the metadata header in front of it.
 fn with_header(body: &str, number: u64, created: &str, author: &str, note: &str) -> String {
     let mut out = String::new();
-    out.push_str("# Managed by rust-rest-ldap: a configuration generation.\n");
+    out.push_str("# Managed by rrl-directory: a configuration generation.\n");
     out.push_str("#\n");
     out.push_str(
         "# Everything above the first line that is not a comment is metadata. Editing this\n",

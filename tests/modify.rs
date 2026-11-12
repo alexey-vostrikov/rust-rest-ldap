@@ -9,11 +9,11 @@ use rasn_ldap::{
     AttributeDescription, AttributeValueAssertion, ChangeOperation, LdapMessage,
     ModifyRequestChanges, PartialAttribute, ProtocolOp, ResultCode,
 };
-use rust_rest_ldap::directory::Directory;
-use rust_rest_ldap::ldap::modify::{self, Outcome};
-use rust_rest_ldap::ldap::session::{Identity, Session};
-use rust_rest_ldap::model::{Attribute, Attributes, Entry};
-use rust_rest_ldap::security::Security;
+use rrl_directory::directory::Directory;
+use rrl_directory::ldap::modify::{self, Outcome};
+use rrl_directory::ldap::session::{Identity, Session};
+use rrl_directory::model::{Attribute, Attributes, Entry};
+use rrl_directory::security::Security;
 
 const BASE: &str = "dc=example,dc=com";
 const ADMIN_DN: &str = "cn=admin,ou=users,dc=example,dc=com";
@@ -386,7 +386,7 @@ fn a_write_that_would_break_the_schema_is_refused() {
 #[test]
 fn schema_off_lets_the_write_through() {
     let security = Security {
-        schema_mode: rust_rest_ldap::schema::Mode::Off,
+        schema_mode: rrl_directory::schema::Mode::Off,
         ..Security::default()
     };
 
@@ -454,7 +454,7 @@ fn a_filter_attribute_after_a_modify_reflects_the_new_value() {
     let filter = rasn_ldap::Filter::EqualityMatch(assertion);
 
     assert!(
-        rust_rest_ldap::ldap::filter::matches(updated.attributes(), updated.dn(), &filter)
+        rrl_directory::ldap::filter::matches(updated.attributes(), updated.dn(), &filter)
             .expect("filter"),
         "the stored entry must match the new value"
     );

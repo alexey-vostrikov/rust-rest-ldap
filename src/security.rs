@@ -435,8 +435,8 @@ mod tests {
 
         shared.publish_document(crate::config::Document {
             text: "base_dn: dc=example,dc=com\nschema:\n  mode: warn\n".to_string(),
-            origin: "store:/etc/rust-rest-ldap/config.d".to_string(),
-            store: Some(std::path::PathBuf::from("/etc/rust-rest-ldap/config.d")),
+            origin: "store:/etc/rrl-directory/config.d".to_string(),
+            store: Some(std::path::PathBuf::from("/etc/rrl-directory/config.d")),
         });
 
         let published = shared
@@ -450,7 +450,7 @@ mod tests {
         );
         assert_eq!(
             published.store.as_deref(),
-            Some(std::path::Path::new("/etc/rust-rest-ldap/config.d")),
+            Some(std::path::Path::new("/etc/rrl-directory/config.d")),
             "and the store travels with it, or the next change would find nothing to commit to"
         );
         assert_eq!(

@@ -14,6 +14,6 @@ fuzz_target!(|data: &[u8]| {
     // anything that is not a string. Filtering here keeps the corpus honest about what the
     // parser really receives.
     if let Ok(text) = std::str::from_utf8(data) {
-        let _ = rust_rest_ldap::ldap::filter_parse::parse(text);
+        let _ = rrl_directory::ldap::filter_parse::parse(text);
     }
 });
