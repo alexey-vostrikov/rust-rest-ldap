@@ -36,6 +36,107 @@ pub(crate) fn is_ntlm(token: &[u8]) -> bool {
     token.len() > TYPE_AT && &token[..8] == SIGNATURE
 }
 
+/// A `NegTokenResp` carrying `inner`, for a client that speaks SPNEGO rather than bare NTLM.
+///
+/// RFC 4178 §4.2: only the first token of a conversation is wrapped in the GSS framing; every later
+/// one is a bare `SEQUENCE`. `accept-completed` is 0 and `accept-incomplete` is 1 (§4.2.2), and a
+/// client told "completed" while it waits for its challenge stops the conversation.
+pub(crate) fn spnego_reply(completed: bool, inner: Option<&[u8]>) -> Vec<u8> {
+    let mut body = Vec::new();
+    // negState [0] ENUMERATED
+    body.extend_from_slice(&[0xa0, 0x03, 0x0a, 0x01, u8::from(!completed)]);
+    if let Some(inner) = inner {
+        // responseToken [2] OCTET STRING
+        let mut token = Vec::with_capacity(inner.len() + 4);
+        token.push(0x04);
+        encode_length(&mut token, inner.len());
+        token.extend_from_slice(inner);
+        body.push(0xa2);
+        encode_length(&mut body, token.len());
+        body.extend_from_slice(&token);
+    }
+    let mut out = vec![0x30];
+    encode_length(&mut out, body.len());
+    out.extend_from_slice(&body);
+    out
+}
+
+fn encode_length(out: &mut Vec<u8>, length: usize) {
+    if length < 0x80 {
+        out.push(length as u8);
+        return;
+    }
+    let bytes = length.to_be_bytes();
+    let start = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    out.push(0x80 | (bytes.len() - start) as u8);
+    out.extend_from_slice(&bytes[start..]);
+}
+
+/// The NTLM message carried inside a `GSS-SPNEGO` token, or `None` when this is not one.
+///
+/// A Windows LDAP client does not send a bare NTLM message: `wldap32` wraps it in a `NegTokenInit`
+/// whose `mechTypes` names NTLMSSP and whose `mechToken` holds the message. Refusing that as "an
+/// unknown ticket" is refusing the mechanism the client actually chose, and the client reports
+/// `49 invalidCredentials` - which reads as a wrong password.
+///
+/// The walk looks for an `OCTET STRING` that begins with the NTLM signature rather than following the
+/// grammar field by field: `NegTokenInit` and `NegTokenResp` put the message in different fields, and
+/// only the signature says which octets are the message.
+pub(crate) fn inside_spnego(token: &[u8]) -> Option<Vec<u8>> {
+    fn walk(bytes: &[u8], depth: u32) -> Option<Vec<u8>> {
+        if depth > 8 {
+            return None;
+        }
+        let mut offset = 0;
+        while offset + 2 <= bytes.len() {
+            let tag = bytes[offset];
+            let first = bytes[offset + 1];
+            let (length, header) = if first & 0x80 == 0 {
+                (first as usize, 2usize)
+            } else {
+                let count = (first & 0x7f) as usize;
+                if count == 0 || count > 4 || offset + 2 + count > bytes.len() {
+                    return None;
+                }
+                (
+                    usize::from_be_bytes({
+                        let mut width = [0u8; 8];
+                        width[8 - count..].copy_from_slice(&bytes[offset + 2..offset + 2 + count]);
+                        width
+                    }),
+                    header_of(count),
+                )
+            };
+            let start = offset + header;
+            let end = start.checked_add(length)?;
+            if end > bytes.len() {
+                return None;
+            }
+            let value = &bytes[start..end];
+            if tag == 0x04 && is_ntlm(value) {
+                return Some(value.to_vec());
+            }
+            // Constructed: SEQUENCE (`0x30`), and the context tags `[0]`-`[3]` a SPNEGO token uses.
+            if matches!(tag, 0x30 | 0x60 | 0xa0..=0xa3 | 0x6e | 0x6f)
+                && let Some(found) = walk(value, depth + 1)
+            {
+                return Some(found);
+            }
+            offset = end;
+        }
+        None
+    }
+
+    fn header_of(count: usize) -> usize {
+        count + 2
+    }
+
+    walk(token, 0)
+}
+
 /// The message type of a bare NTLM token, or `None` when the field is not there.
 fn message_type(token: &[u8]) -> Option<u32> {
     let raw: [u8; 4] = token.get(TYPE_AT..TYPE_AT + 4)?.try_into().ok()?;

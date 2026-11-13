@@ -288,10 +288,20 @@ const NTLMSSP_OID: [u8; 12] = [
 /// full DER walk to learn one fact would be a parser to keep correct for a message this server
 /// refuses anyway. A token that offers both Kerberos and NTLM still contains the OID, and is
 /// reported as offering NTLM - which is true, and the reason the refusal says what it says.
-pub fn offers_ntlmssp(token: &[u8]) -> bool {
-    token
-        .windows(NTLMSSP_OID.len())
-        .any(|window| window == NTLMSSP_OID)
+pub fn chose_ntlmssp(token: &[u8]) -> bool {
+    // The mechanism a client chose is the one its `mechToken` is built for - not any OID in its
+    // `mechTypes` offer. Measured on the AD-join stand: a Windows `wldap32` bind offers four
+    // mechanisms (MS KRB5, krb5, NEGOEX, NTLMSSP) and sends a Kerberos AP-REQ, so a substring match
+    // over the whole token refused the very ticket the client had just built.
+    #[cfg(feature = "smb")]
+    {
+        super::ntlm_bind::inside_spnego(token).is_some()
+    }
+    #[cfg(not(feature = "smb"))]
+    {
+        let _ = token;
+        false
+    }
 }
 
 /// Whether this request is a SASL bind this module handles.
@@ -423,12 +433,22 @@ pub fn handle_gssapi(
     // SPNEGO branches would refuse it as undecodable, and the refusal would read as a broken ticket
     // rather than as the mechanism a Windows machine uses before it has one. Measured on the AD-join
     // stand: `Add-Computer` sends exactly this and nothing else.
+    // An NTLM message inside a `GSS-SPNEGO` token - which is what `wldap32` sends, unlike the bare
+    // message a Samba member sends. Both reach the same acceptor; only the envelope differs, and the
+    // reply has to go back in the envelope it came in.
     #[cfg(feature = "smb")]
-    let ntlm = super::ntlm_bind::is_ntlm(&token);
+    let ntlm_inner = (!super::ntlm_bind::is_ntlm(&token))
+        .then(|| super::ntlm_bind::inside_spnego(&token))
+        .flatten();
+    #[cfg(feature = "smb")]
+    let ntlm = super::ntlm_bind::is_ntlm(&token) || ntlm_inner.is_some();
     // A four-octet token after a completed NTLM bind is RFC 4752's layer choice, not an LDAP message:
     // it arrives before any request and would otherwise be refused as a malformed one.
+    // Wrapped or not: the layer choice is four octets either way, and a client that wrapped its
+    // negotiate wraps this too.
     #[cfg(feature = "smb")]
-    let ntlm_layer = token.len() == 4 && session.ntlm_negotiate().is_some();
+    let ntlm_layer = session.ntlm_negotiate().is_some()
+        && (token.len() == 4 || ntlm_inner.as_ref().is_some_and(|inner| inner.len() == 4));
 
     // Every LDAP operation a client asks for, by name and number. `Add-Computer` moves through
     // several - a search for the domain, an add of the machine account, a modify of its attributes -
@@ -451,7 +471,9 @@ pub fn handle_gssapi(
     } else if ntlm {
         #[cfg(feature = "smb")]
         {
-            super::ntlm_bind::step(session, directory, &token, security)
+            let message = ntlm_inner.as_deref().unwrap_or(&token);
+            super::ntlm_bind::step(session, directory, message, security)
+                .map(|round| in_spnego(ntlm_inner.is_some(), round))
         }
         #[cfg(not(feature = "smb"))]
         unreachable!("`ntlm` is a constant false without the smb feature")
@@ -505,8 +527,34 @@ pub fn handle_gssapi(
             // A failed round is a failed bind: the connection goes back to anonymous and the
             // conversation is dropped, so a captured token cannot be replayed into a second try.
             session.reset();
+            // The reason, in the server's own words. A client reports `49 invalidCredentials` and
+            // nothing else, which reads as "wrong password" for a password that is right: the answer
+            // is a leftover round, an account with no hash, or a token this build cannot read.
+            eprintln!("sasl: bind refused: {err}");
             bind_response(message_id, ResultCode::InvalidCredentials, &err.to_string())
         }
+    }
+}
+
+/// The round's tokens put back into the envelope the client used.
+///
+/// A client that wrapped its message in SPNEGO reads the answer as a `NegTokenResp`; one that did not
+/// reads it as a bare NTLM message. Answering in the wrong one is not a detail: measured on the AD-join
+/// stand, wrapping the challenge for a client speaking bare NTLM makes it stop with "a directory
+/// service error has occurred".
+#[cfg(feature = "smb")]
+fn in_spnego(wrapped: bool, round: Round) -> Round {
+    if !wrapped {
+        return round;
+    }
+    let completed = round.code == ResultCode::Success;
+    Round {
+        code: round.code,
+        credentials: Some(super::ntlm_bind::spnego_reply(
+            completed,
+            round.credentials.as_deref(),
+        )),
+        ..round
     }
 }
 
@@ -663,7 +711,11 @@ fn begin(
     // A `GSS-SPNEGO` conversation whose inner mechanism is NTLMSSP is not a Kerberos token that
     // failed to parse - it is a client asking for a mechanism this server does not offer, and the
     // refusal has to say which. See `NTLMSSP_OID`.
-    if offers_ntlmssp(&token) {
+    if chose_ntlmssp(&token) {
+        if std::env::var_os("RRL_SMB_HEX").is_some() {
+            let hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!("sasl-hex: token={hex}");
+        }
         return Err(SaslError::Undecodable(
             "the SPNEGO token offers NTLMSSP, which this server does not accept: it accepts \
              Kerberos, so a Samba member joins with `net ads join -k` and a ticket from `kinit`"
@@ -764,7 +816,7 @@ fn spnego_accept(
         )));
     }
 
-    if offers_ntlmssp(&token) {
+    if chose_ntlmssp(&token) {
         return Err(SaslError::Undecodable(
             "the SPNEGO token offers NTLMSSP, which this server does not accept: it accepts \
              Kerberos, so a Samba member joins with `net ads join -k` and a ticket from `kinit`"
@@ -1292,18 +1344,90 @@ mod tests {
 
     /// The OID, in the framing a client puts it in: `[APPLICATION 0]` wrapping `[0]` wrapping the
     /// mechanism list. Only the bytes the scan looks for matter here.
-    fn spnego_offering(oid: &[u8]) -> Vec<u8> {
-        let mut token = vec![0x60, 0x00, 0x06, 0x00, 0x2b, 0x06];
-        token.extend_from_slice(oid);
+    /// A `NegTokenInit` offering `oids` and carrying `mech` as the mechanism token.
+    ///
+    /// Both parts, because they are two different statements: `mechTypes` is what the client can do,
+    /// `mechToken` is what it did. A test that builds only the offer cannot tell a correct reader from
+    /// one that reads the offer as the choice.
+    fn spnego_with(oids: &[&[u8]], mech: Option<&[u8]>) -> Vec<u8> {
+        fn length(out: &mut Vec<u8>, len: usize) {
+            if len < 0x80 {
+                out.push(len as u8);
+            } else {
+                out.push(0x81);
+                out.push(len as u8);
+            }
+        }
+        fn wrap(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            length(&mut out, body.len());
+            out.extend_from_slice(body);
+            out
+        }
+
+        let mut types = Vec::new();
+        for oid in oids {
+            types.extend_from_slice(&wrap(0x06, oid));
+        }
+        let mut init = wrap(0x30, &types);
+        if let Some(mech) = mech {
+            let mut with_token = wrap(0x04, mech);
+            with_token = wrap(0xa2, &with_token);
+            let mut body = wrap(0xa0, &init);
+            body.extend_from_slice(&with_token);
+            init = wrap(0x30, &body);
+        } else {
+            init = wrap(0x30, &wrap(0xa0, &init));
+        }
+        let mut spnego = wrap(0x06, &SPNEGO_OID);
+        spnego.extend_from_slice(&wrap(0xa0, &init));
+        wrap(0x60, &spnego)
+    }
+
+    /// `1.3.6.1.5.5.2`, the SPNEGO mechanism a `GSS-SPNEGO` bind names.
+    const SPNEGO_OID: [u8; 6] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
+
+    /// `1.3.6.1.4.1.311.2.2.10` as OID *content*, the way `mechTypes` carries it.
+    const NTLMSSP_OID_CONTENT: [u8; 10] =
+        [0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
+
+    /// The four mechanisms a Windows LDAP client offers, in the order it offers them.
+    fn windows_offer() -> Vec<u8> {
+        spnego_with(
+            &[
+                &[0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02],
+                &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02],
+                &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x1e],
+                &NTLMSSP_OID_CONTENT,
+            ],
+            None,
+        )
+    }
+
+    /// The old, wrong test: does the OID appear anywhere in the token.
+    ///
+    /// Kept beside the correct one so the difference is visible: this answers yes for the offer list
+    /// of a client that sent a Kerberos ticket.
+    fn offers_ntlmssp(token: &[u8]) -> bool {
+        token
+            .windows(NTLMSSP_OID.len())
+            .any(|window| window == NTLMSSP_OID)
+    }
+
+    /// An NTLM NEGOTIATE, as far as anything reading it needs: the signature and a message type.
+    fn ntlm_negotiate() -> Vec<u8> {
+        let mut token = b"NTLMSSP\0".to_vec();
+        token.extend_from_slice(&1u32.to_le_bytes());
+        token.extend_from_slice(&[0u8; 24]);
         token
     }
 
     #[test]
-    fn a_spnego_token_offering_ntlmssp_is_refused_by_name() {
-        // `net ads join` with a password puts NTLMSSP inside GSS-SPNEGO: Samba's own trace says
-        // `Starting GENSEC submechanism ntlmssp`, and the LDAP bind that follows is refused. Which
-        // refusal matters to the operator: "this is not a Kerberos ticket" sends them to look at
-        // the ticket, while the truth is that the client was never asked for one.
+    fn an_ntlm_message_inside_spnego_is_answered_in_the_same_envelope() {
+        // `wldap32` does not send a bare NTLM message: it wraps it in `NegTokenInit` and expects the
+        // challenge inside a `NegTokenResp`. Answering raw leaves the client with a token it cannot
+        // parse, which it reports as a directory service error; answering in the envelope leaves a
+        // client that spoke raw unable to parse it either. The envelope is therefore the client's.
         let (security, _dir) = security_with_keytab();
         let mut session = session();
 
@@ -1316,37 +1440,61 @@ mod tests {
                 Vec::new(),
             ),
             1,
-            &gssapi_request(Some(spnego_offering(&NTLMSSP_AS_SENT))),
+            &gssapi_request(Some(spnego_with(
+                &[&NTLMSSP_OID_CONTENT],
+                Some(&ntlm_negotiate()),
+            ))),
             &security,
         );
 
         let rasn_ldap::ProtocolOp::BindResponse(body) = &response.protocol_op else {
             panic!("expected a bind response");
         };
-        assert_eq!(body.result_code, ResultCode::InvalidCredentials);
-        assert!(
-            body.diagnostic_message.0.contains("NTLMSSP"),
-            "the refusal names the mechanism that arrived: {}",
-            body.diagnostic_message.0
+        assert_eq!(body.result_code, ResultCode::SaslBindInProgress);
+
+        let server_creds = body
+            .server_sasl_creds
+            .as_ref()
+            .expect("a challenge is a credential")
+            .as_ref();
+        assert_eq!(
+            &server_creds[..2],
+            &[0x30, 0x81],
+            "a `NegTokenResp` SEQUENCE, not a bare challenge: {:02x?}",
+            &server_creds[..8]
         );
         assert!(
-            body.diagnostic_message.0.contains("-k"),
-            "and says how a Samba member does reach Kerberos: {}",
-            body.diagnostic_message.0
+            server_creds.windows(8).any(|window| window == b"NTLMSSP\0"),
+            "and the challenge is inside it"
         );
-        assert!(session.identity().is_none());
+        assert!(session.identity().is_none(), "a challenge is not a logon");
     }
 
     #[test]
-    fn a_kerberos_token_is_not_mistaken_for_ntlm() {
-        // The scan must not answer yes to a ticket. The Kerberos OID sits in the same position in
-        // the same framing, so a substring that matched loosely would refuse every real bind - the
-        // kind of defect that only appears against a client that works.
-        let kerberos_oid = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
-        assert!(!offers_ntlmssp(&spnego_offering(&kerberos_oid)));
-        assert!(offers_ntlmssp(&spnego_offering(&NTLMSSP_AS_SENT)));
+    fn listing_ntlmssp_in_the_offer_is_not_the_same_as_choosing_it() {
+        // Measured on the AD-join stand, from the client's own bind: `wldap32` offers MS KRB5, krb5,
+        // NEGOEX and NTLMSSP - and sends a Kerberos AP-REQ. Reading the offer list as the choice
+        // refused the ticket the client had just built, and the client reported `49
+        // invalidCredentials`, which reads as a wrong password.
+        let offered = windows_offer();
+        assert!(!chose_ntlmssp(&offered), "an offer is not a choice");
+        assert!(
+            offers_ntlmssp(&offered),
+            "the OID really is in the offer list"
+        );
+
+        // Chosen: an NTLM message in the mechToken.
+        let chosen = spnego_with(&[&NTLMSSP_OID_CONTENT], Some(&ntlm_negotiate()));
+        assert!(chose_ntlmssp(&chosen));
+
+        // A Kerberos token in the mechToken is Kerberos, whatever the offer list says.
+        let kerberos = spnego_with(
+            &[&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02]],
+            Some(&ap_req_bytes()),
+        );
+        assert!(!chose_ntlmssp(&kerberos));
         // And a bare AP-REQ, which is what `-Y GSSAPI` sends: no negTokenInit, no OID list.
-        assert!(!offers_ntlmssp(&ap_req_bytes()));
+        assert!(!chose_ntlmssp(&ap_req_bytes()));
     }
 
     #[test]

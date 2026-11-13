@@ -193,7 +193,15 @@ pub(crate) fn logon_account(
         return None;
     }
 
-    let nt_hash = nt_hash_of(entry.attributes())?;
+    let nt_hash = match nt_hash_checked(entry.attributes()) {
+        Ok(hash) => hash,
+        Err(reason) => {
+            // Said where an operator looks for a failed logon, and only for this account: the reason
+            // names an attribute of one entry, never a password.
+            eprintln!("logon: '{}' is not answered for: {reason}", entry.dn());
+            return None;
+        }
+    };
     Some((nt_hash, entry.dn().to_string()))
 }
 
@@ -224,24 +232,38 @@ fn first_complete(
 
 /// The NT hash `supplementalCredentials` holds, or `None` when the account has none.
 fn nt_hash_of(attributes: &crate::model::Attributes) -> Option<[u8; 16]> {
+    nt_hash_checked(attributes).ok()
+}
+
+/// The same, saying why an account answered no.
+///
+/// A logon that fails is the one case where silence costs an operator a day: the client reports
+/// "invalid credentials", the password is right, and nothing says whether the entry has no hash, has one
+/// this build cannot read, or has none of the type a Windows logon is checked against.
+fn nt_hash_checked(attributes: &crate::model::Attributes) -> Result<[u8; 16], String> {
+    let attribute = rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS;
     let encoded = attributes
-        .get(rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS)?
-        .values
-        .first()?;
+        .get(attribute)
+        .and_then(|attribute| attribute.values.first())
+        .ok_or_else(|| format!("the account has no {attribute}"))?;
     let blob = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD
             .decode(encoded.trim())
-            .ok()?
+            .map_err(|err| format!("{attribute} is not base64: {err}"))?
     };
     // The NT hash is the RC4 key: `supplementalCredentials` holds it as a `rc4-hmac` credential, and
     // that is the only place a Windows logon's NT proof string can be checked against.
-    let credentials = rrl_kdc::hdb::ad_blob::credentials(&blob).ok()?;
+    let credentials = rrl_kdc::hdb::ad_blob::credentials(&blob)
+        .map_err(|err| format!("{attribute} does not parse: {err}"))?;
     let hash = credentials
-        .into_iter()
-        .find(|credential| credential.enctype == rrl_kdc::crypto::Enctype::Rc4Hmac)?
-        .key;
-    hash.try_into().ok()
+        .iter()
+        .find(|credential| credential.enctype == rrl_kdc::crypto::Enctype::Rc4Hmac)
+        .map(|credential| credential.key.clone())
+        .ok_or_else(|| format!("{attribute} carries no rc4-hmac key"))?;
+    hash.clone()
+        .try_into()
+        .map_err(|_| format!("the rc4-hmac key is {} octets, not sixteen", hash.len()))
 }
 
 /// The account's RID: the last sub-authority of its `objectSid`.
