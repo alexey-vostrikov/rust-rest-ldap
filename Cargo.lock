@@ -2736,7 +2736,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 [[package]]
 name = "smb-server"
 version = "0.9.1"
-source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#30491f9da210a58098543dd37267c261d808db2a"
+source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#abbe6349c2214e2903639cc76680f3fcf2bbbb0a"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
