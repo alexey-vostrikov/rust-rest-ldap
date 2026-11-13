@@ -303,13 +303,22 @@ impl Directory {
 
         let (mut users, mut groups, mut other): (Vec<Entry>, Vec<Entry>, Vec<Entry>) =
             (Vec::new(), Vec::new(), Vec::new());
+        // An entry the store carries at the base DN is the domain object, and it says more than the
+        // one synthesised above: `objectSid`, `dc`, the machine-account quota. Keeping only the
+        // synthesised one is what left a Windows client reading `objectGuid` and `objectSid` from an
+        // object that had neither - and stopping a join with `0x2`.
+        let mut stored_base: Option<Entry> = None;
         for entry in extra {
             // The naming context and the two units are synthesised above when the store does
             // not carry them - which is every JSON backend and every directory grown over the
             // protocol. A store that *does* carry them (an import, a migration from OpenLDAP)
             // would otherwise hold each one twice: a search would return two entries with the
             // same DN, and an export would write both.
-            if entry.dn() == base_dn || entry.dn() == users_ou_dn || entry.dn() == groups_ou_dn {
+            if entry.dn() == base_dn {
+                stored_base = Some(entry);
+                continue;
+            }
+            if entry.dn() == users_ou_dn || entry.dn() == groups_ou_dn {
                 continue;
             }
 
@@ -321,6 +330,28 @@ impl Directory {
                 other.push(entry);
             }
         }
+        // The stored entry wins on every attribute it carries; the synthesised one keeps what it has
+        // that the stored one lacks, so `entryUUID` and the operational names stay answered.
+        if let Some(stored) = stored_base {
+            let mut merged = entries[0].attributes().clone();
+            for attribute in stored.attributes().values() {
+                // A value the store kept but never filled - the `entryUUID` placeholder a
+                // provisioned entry carries - is not an answer, and `replace` would *remove* the
+                // synthesised one instead of leaving it: that is how `objectGuid` disappeared from an
+                // entry that had just started answering it.
+                if attribute.values.is_empty() {
+                    continue;
+                }
+                merged = merged.replace(attribute.clone());
+            }
+            // The identity of the naming context is a function of its DN, so it is set here rather
+            // than read: the stored entry carries the attribute as an unfilled placeholder - a value
+            // `""`, which is enough to make `get` answer and not enough to derive a GUID from.
+            merged = merged
+                .replace(Attribute::single(ATTR_ENTRY_UUID, &entry_uuid(&base_dn)).operational());
+            entries[0] = Entry::new(base_dn.clone(), merged);
+        }
+
         users.sort_by(|left, right| left.dn().cmp(right.dn()));
         groups.sort_by(|left, right| left.dn().cmp(right.dn()));
         other.sort_by(|left, right| left.dn().cmp(right.dn()));
@@ -377,7 +408,7 @@ impl Directory {
         let next_id = entries.len() as u32;
         let in_scope = entries
             .iter()
-            .filter(|entry| in_scope(entry.dn(), &base_dn, Scope::Subtree))
+            .filter(|entry| in_scope_for(entry.dn(), &base_dn, Scope::Subtree))
             .count();
 
         Self {
@@ -793,12 +824,29 @@ impl Directory {
 
     /// Entries matching `base_object` and `scope` together with their ids.
     pub fn entries_with_ids(&self, base_object: &str, scope: Scope) -> Vec<(usize, &Entry)> {
+        self.scope_matches(base_object, scope, |_| true)
+    }
+
+    /// The entries in scope whose record satisfies `keep`, compared on normalised DNs.
+    ///
+    /// Both sides are normalised here. The base always was, and the entry's DN never - so a search
+    /// for `cn=Configuration,…` found nothing at all, not even the entry itself, while the same entry
+    /// appeared in a search from the domain above it. Case only shows up on a DN that has an upper-case
+    /// letter in it, which no container this server created before had; `cn=Configuration` was the
+    /// first, and the join stopped there.
+    pub fn scope_matches<'a>(
+        &'a self,
+        base_object: &str,
+        scope: Scope,
+        keep: impl Fn(&Entry) -> bool,
+    ) -> Vec<(usize, &'a Entry)> {
         let base_object = dn::normalize(base_object);
 
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| in_scope(entry.dn(), &base_object, scope))
+            .filter(|(_, entry)| in_scope_for(entry.dn(), &base_object, scope))
+            .filter(|(_, entry)| keep(entry))
             .collect()
     }
 
@@ -1039,7 +1087,9 @@ impl Directory {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| in_scope(entry.dn(), &base_object, scope))
+            // Normalised on both sides, like `entries_with_ids`: the base was, the entry's DN was
+            // not, and the two disagree exactly on a DN with an upper-case letter.
+            .filter(|(_, entry)| in_scope_for(entry.dn(), &base_object, scope))
             // Ids, not positions: a caller intersects this with what the index answered, and a
             // bitmap of positions intersected with a bitmap of ids silently keeps the wrong
             // entries.
@@ -1066,7 +1116,7 @@ impl Directory {
 
         self.entries
             .iter()
-            .filter(|entry| in_scope(entry.dn(), &base_object, scope))
+            .filter(|entry| in_scope_for(entry.dn(), &base_object, scope))
             .collect()
     }
 
@@ -1195,7 +1245,13 @@ pub fn entry_uuid(dn: &str) -> String {
 /// implementation, so a pushed entry cannot be in the content when a fresh search would not have
 /// returned it.
 pub fn in_scope_for(entry_dn: &str, base_object: &str, scope: Scope) -> bool {
-    in_scope(entry_dn, base_object, scope)
+    // Normalised here, because both sides come from outside: a client spells the base as it likes and
+    // an entry keeps the case it was written with. Comparing the two as they are answered "not in
+    // scope" for every entry of a DN that has an upper-case letter - a search for `cn=Configuration,…`
+    // returned nothing at all, not even the entry itself, while the same entry appeared in a search
+    // from the domain above it. Cost: one allocation per entry compared, and only for the entries a
+    // search has already narrowed to.
+    in_scope(&dn::normalize(entry_dn), &dn::normalize(base_object), scope)
 }
 
 fn in_scope(entry_dn: &str, base_object: &str, scope: Scope) -> bool {
@@ -1570,6 +1626,50 @@ mod tests {
 
     fn dns(entries: &[&Entry]) -> Vec<String> {
         entries.iter().map(|entry| entry.dn().to_string()).collect()
+    }
+
+    #[test]
+    fn a_dn_with_an_upper_case_letter_is_in_its_own_scope() {
+        // The base was normalised and the entry's DN never was, so the two disagreed exactly on a DN
+        // that carries an upper-case letter. Measured on the AD-join stand: a search for
+        // `cn=Configuration,dc=ad,dc=example,dc=com` returned nothing, not even the entry itself,
+        // while the same entry appeared in a search from the domain above it - and a Windows client
+        // that reads `CN=Partitions` there stopped with `0x37`.
+        let configuration = "cn=Configuration,dc=example,dc=com";
+        let directory = Directory::from_entries(
+            BASE,
+            "users",
+            "groups",
+            vec![Entry::new(
+                configuration,
+                Attributes::new().push(Attribute::single("cn", "Configuration")),
+            )],
+        );
+
+        for base in [
+            configuration,
+            "cn=configuration,dc=example,dc=com",
+            "CN=CONFIGURATION,DC=EXAMPLE,DC=COM",
+        ] {
+            let found = directory.entries(base, Scope::Base);
+            assert_eq!(
+                found.len(),
+                1,
+                "'{base}' has to find the entry it names, whatever its case"
+            );
+            assert!(in_scope_for(configuration, base, Scope::Base));
+        }
+        // And a child is inside it, which is what a subtree search from the partition relies on.
+        assert!(in_scope_for(
+            "cn=Partitions,cn=Configuration,dc=example,dc=com",
+            configuration,
+            Scope::Subtree
+        ));
+        assert!(in_scope_for(
+            "CN=Partitions,CN=Configuration,DC=example,DC=com",
+            "cn=configuration,dc=example,dc=com",
+            Scope::OneLevel
+        ));
     }
 
     #[test]

@@ -39,6 +39,9 @@ pub const SUBSCHEMA_SUBENTRY_DN: &str = "cn=Subschema";
 /// Attribute description returned for every entry when `+` is requested.
 pub const ATTR_HAS_SUBORDINATES: &str = "hasSubordinates";
 pub const ATTR_ENTRY_UUID: &str = "entryUUID";
+
+/// AD's name for the same identity, as a binary GUID.
+pub const ATTR_OBJECT_GUID: &str = "objectGuid";
 pub const ATTR_OBJECT_CLASS: &str = "objectClass";
 /// Server-internal flag: never projected, never filterable.
 pub const ATTR_LDAP_ADMIN: &str = "ldapAdmin";
@@ -401,6 +404,16 @@ impl Attributes {
                 _ if requested.eq_ignore_ascii_case(ATTR_SUBSCHEMA_SUBENTRY) => {
                     push_unique(subschema(), &mut out, &mut seen);
                 }
+                // AD's name for the identity this entry already has. Answered by name rather than
+                // carried, because the value is derived from `entryUUID` and a second copy in the
+                // store would be a second thing to keep in step. Measured on the AD-join stand: a
+                // Windows client reads `objectGuid` and `objectSid` on the domain and stops the join
+                // with `0x2` when either is missing.
+                _ if requested.eq_ignore_ascii_case(ATTR_OBJECT_GUID) => {
+                    if let Some(attribute) = self.object_guid() {
+                        push_unique(attribute, &mut out, &mut seen);
+                    }
+                }
                 _ => {
                     if let Some(attribute) = self.get(requested) {
                         push_unique(attribute.clone(), &mut out, &mut seen);
@@ -412,6 +425,25 @@ impl Attributes {
         out
     }
 
+    /// AD's `objectGuid` for this entry, in the octets AD puts on the wire.
+    ///
+    /// The value is the entry's own identity - `objectGUID` where an AD import wrote one, `entryUUID`
+    /// otherwise - in the binary form. A GUID's first three fields are little-endian on the wire, and
+    /// that is the only difference from the text: `374fb594-2e90-502d-…` travels as
+    /// `94 b5 4f 37 90 2e 2d 50 …`.
+    fn object_guid(&self) -> Option<Attribute> {
+        if let Some(carried) = self.get(ATTR_OBJECT_GUID) {
+            return Some(carried.clone().binary());
+        }
+        let text = self.get(ATTR_ENTRY_UUID)?.values.first()?;
+        let octets = guid_octets(text)?;
+        Some(
+            Attribute::new(ATTR_OBJECT_GUID, vec![encode_binary(&octets)])
+                .binary()
+                .operational(),
+        )
+    }
+
     /// Regular (non-operational, non-sensitive, non-internal) attributes.
     fn push_regular(&self, out: &mut Vec<Attribute>, seen: &mut Vec<Arc<str>>) {
         for attribute in &self.inner {
@@ -420,6 +452,92 @@ impl Attributes {
                 push_unique(attribute.clone(), out, seen);
             }
         }
+    }
+}
+
+/// The sixteen octets of a GUID, from its text form.
+///
+/// `None` for anything that is not a GUID: this is called on every entry a client asks for
+/// `objectGuid` by name, and an `entryUUID` that is not one answer that with silence rather than a
+/// value invented from whatever bytes were there.
+pub fn guid_octets(text: &str) -> Option<[u8; 16]> {
+    let groups: Vec<&str> = text.trim().split('-').collect();
+    let widths = [8usize, 4, 4, 4, 12];
+    if groups.len() != widths.len()
+        || groups
+            .iter()
+            .zip(widths)
+            .any(|(group, width)| group.len() != width)
+    {
+        return None;
+    }
+    let field = |index: usize| -> Option<Vec<u8>> {
+        let group = groups[index];
+        if !group.len().is_multiple_of(2) {
+            return None;
+        }
+        (0..group.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&group[at..at + 2], 16).ok())
+            .collect()
+    };
+    let mut octets = Vec::with_capacity(16);
+    // The first three fields are little-endian on the wire, the last two big-endian.
+    for index in 0..3 {
+        let mut bytes = field(index)?;
+        bytes.reverse();
+        octets.extend_from_slice(&bytes);
+    }
+    for index in 3..5 {
+        octets.extend_from_slice(&field(index)?);
+    }
+    octets.try_into().ok()
+}
+
+#[cfg(test)]
+mod guid_tests {
+    use super::*;
+
+    #[test]
+    fn a_guid_is_written_with_its_first_three_fields_reversed() {
+        // What AD puts on the wire for `374fb594-2e90-502d-a624-65febc6a9c9b`. The reversal is not
+        // optional: a client parses these sixteen octets as a GUID, and the plain text order gives it
+        // a different identity - an object it then cannot match against the one it asked about.
+        assert_eq!(
+            guid_octets("374fb594-2e90-502d-a624-65febc6a9c9b"),
+            Some([
+                0x94, 0xb5, 0x4f, 0x37, 0x90, 0x2e, 0x2d, 0x50, 0xa6, 0x24, 0x65, 0xfe, 0xbc, 0x6a,
+                0x9c, 0x9b
+            ])
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_guid_has_no_octets() {
+        // The projection runs for every entry a client asks `objectGuid` about, and an invented
+        // value would be an identity that matches nothing.
+        assert_eq!(guid_octets("8f0e4b6a"), None);
+        assert_eq!(guid_octets(""), None);
+        assert_eq!(guid_octets("374fb594-2e90-502d-a624-65febc6a9c9"), None);
+        assert_eq!(guid_octets("zzzzzzzz-2e90-502d-a624-65febc6a9c9b"), None);
+    }
+
+    #[test]
+    fn object_guid_comes_from_the_entrys_own_uuid() {
+        let attributes = Attributes::new().push(
+            Attribute::single(ATTR_ENTRY_UUID, "374fb594-2e90-502d-a624-65febc6a9c9b")
+                .operational(),
+        );
+        let selected = attributes.select("dc=example,dc=com", &["objectGuid".to_string()]);
+        let guid = selected
+            .iter()
+            .find(|attribute| attribute.name.as_ref() == ATTR_OBJECT_GUID)
+            .expect("answered by name");
+        assert_eq!(guid.values.len(), 1);
+        assert_ne!(
+            guid.values[0], "374fb594-2e90-502d-a624-65febc6a9c9b",
+            "binary, not the text"
+        );
     }
 }
 

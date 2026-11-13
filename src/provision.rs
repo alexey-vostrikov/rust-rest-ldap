@@ -27,6 +27,171 @@ pub fn containers(base_dn: &str) -> Vec<String> {
     vec![format!("cn=computers,{base_dn}")]
 }
 
+/// The configuration naming context: `cn=Configuration,<forest root>`.
+///
+/// Windows reads it before it joins. `NetpLdapGetLsaPrimaryDomain` takes the base from the root DSE's
+/// `configurationNamingContext` and then reads `CN=Partitions`, where one `crossRef` per naming
+/// context describes which DN answers for which DNS name. A directory that publishes no such context
+/// leaves the client with no base to search at all, and it stops in `NetpGetNCData` with `0x37`
+/// ("the specified network resource or device is no longer available") - measured on the AD-join
+/// stand, where that was the last thing between a Windows Server 2022 and the domain.
+///
+/// This server keeps the partition inside the domain tree rather than beside it: for a
+/// single-domain forest the two DNs coincide, and an implementation that hangs the partition from
+/// the directory it already has answers every search the client makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Partition {
+    /// The domain naming context, as configured.
+    pub base_dn: String,
+    /// The DNS name of the domain, which is what a `crossRef` publishes as `dnsRoot`.
+    pub dns_domain: String,
+    /// The short name the `crossRef` is filed under, and the key of its RDN.
+    pub netbios: String,
+}
+
+impl Partition {
+    /// `cn=Configuration,<base_dn>`.
+    pub fn dn(&self) -> String {
+        format!("cn=Configuration,{}", self.base_dn)
+    }
+
+    /// What the domain's own `crossRef` is filed under.
+    fn cross_ref_dn(&self) -> String {
+        format!("cn={},cn=Partitions,{}", self.netbios, self.dn())
+    }
+
+    /// The entries of the partition, parents first.
+    ///
+    /// `systemFlags: 3` is what AD writes on the `crossRef` of a domain naming context (the two bits
+    /// are "this is a naming context" and "it has no `msDS-NC-Replica-Locations`"), and a client that
+    /// reads the flag to decide whether a context is writable here gets the same answer a real
+    /// controller gives. The `dMD` entry is the schema container: this server keeps no schema
+    /// partition, and a client that asks for one by name finds an object rather than nothing.
+    pub fn entries(&self) -> Vec<Entry> {
+        let mut configuration = Attributes::new()
+            .push(Attribute::new(
+                crate::model::ATTR_OBJECT_CLASS,
+                vec!["top".to_string(), "configuration".to_string()],
+            ))
+            .push(Attribute::single("cn", "Configuration"));
+        configuration = with_guid(configuration);
+        let mut partitions = Attributes::new()
+            .push(Attribute::new(
+                crate::model::ATTR_OBJECT_CLASS,
+                vec!["top".to_string(), "crossRefContainer".to_string()],
+            ))
+            .push(Attribute::single("cn", "Partitions"));
+        partitions = with_guid(partitions);
+        let mut cross_ref = Attributes::new()
+            .push(Attribute::new(
+                crate::model::ATTR_OBJECT_CLASS,
+                vec!["top".to_string(), "crossRef".to_string()],
+            ))
+            .push(Attribute::single("cn", &self.netbios))
+            // `nETBIOSName` is the attribute a client reads the domain's short name from - not `cn`,
+            // which happens to hold the same text here. Measured on the AD-join stand:
+            // `NetpGetNCData: Failed to read the NetBIOS name: 0x57` for a crossRef that carried
+            // `cn` and `nCName` and nothing called `nETBIOSName`.
+            .push(Attribute::single("nETBIOSName", &self.netbios))
+            .push(Attribute::single("nCName", &self.base_dn))
+            .push(Attribute::single("dnsRoot", &self.dns_domain))
+            .push(Attribute::single("systemFlags", "3"));
+        cross_ref = with_guid(cross_ref);
+        let mut schema = Attributes::new()
+            .push(Attribute::new(
+                crate::model::ATTR_OBJECT_CLASS,
+                vec!["top".to_string(), "dMD".to_string()],
+            ))
+            .push(Attribute::single("cn", "Schema"));
+        schema = with_guid(schema);
+
+        vec![
+            Entry::new(self.dn(), configuration),
+            Entry::new(format!("cn=Partitions,{}", self.dn()), partitions),
+            Entry::new(self.cross_ref_dn(), cross_ref),
+            Entry::new(format!("cn=Schema,{}", self.dn()), schema),
+        ]
+    }
+
+    /// Creates the ones that are missing, and says which it created.
+    pub async fn ensure(&self, backend: &Backend) -> Result<Vec<String>, String> {
+        let existing: Vec<String> = backend
+            .load()
+            .await
+            .map_err(|err| format!("the store could not be read: {err}"))?
+            .entries
+            .iter()
+            .map(|entry| entry.dn().to_owned())
+            .collect();
+
+        let mut created = Vec::new();
+        for entry in self.entries() {
+            if existing
+                .iter()
+                .any(|have| have.eq_ignore_ascii_case(entry.dn()))
+            {
+                continue;
+            }
+            let dn = entry.dn().to_string();
+            backend
+                .apply(&[EntryChange::Upsert { entry }])
+                .await
+                .map_err(|err| format!("'{dn}' could not be created: {err}"))?;
+            created.push(dn);
+        }
+        Ok(created)
+    }
+}
+
+/// The domain object itself: the entry at the naming context's own DN.
+///
+/// AD keeps it as a `domainDNS` object and a client reads it as one - `NetpGetDomainData` asks for
+/// `objectGuid` and `objectSid` on the domain DN and stops the join with `0x2` ("the system cannot
+/// find the file specified") when the entry is not there. Measured on the AD-join stand, that was the
+/// step after the NC data was finally readable.
+///
+/// The SID is the store's own domain SID, the one the accounts' SIDs are minted under: a domain
+/// object carrying a different one would describe a domain that does not exist here.
+pub fn domain_object(base_dn: &str, sid: &crate::sid::Sid, functionality: &str) -> Entry {
+    // The RDN's own value, which is what `dc` has to say: `dc=ad,dc=example,dc=com` holds `ad`.
+    let label = base_dn
+        .split(',')
+        .next()
+        .and_then(|rdn| rdn.split_once('='))
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_default();
+
+    let attributes = Attributes::new()
+        .push(Attribute::new(
+            crate::model::ATTR_OBJECT_CLASS,
+            vec![
+                "top".to_string(),
+                "domain".to_string(),
+                "domainDNS".to_string(),
+            ],
+        ))
+        .push(Attribute::single("dc", &label))
+        // `Sid::attribute`, not a hand-built string: the value is base64 of the octets **and** the
+        // attribute has to carry the binary flag, or the SID the schema validates is read out of
+        // text - `a SID has revision 1, this one says 65` is the base64's first letter being taken
+        // for a revision - and the attribute is dropped with the entry standing.
+        .push(sid.attribute("objectSid"))
+        // AD's default. A client reads it before it lets a non-administrator add a machine account,
+        // and a domain object without it answers "the attribute is not there" for a join that has
+        // otherwise been authorised.
+        .push(Attribute::single("ms-DS-MachineAccountQuota", "10"))
+        // The domain's functional level, which a client reads from this object rather than from the
+        // root DSE: `NetpGetDomainData` answers `0x2` for a domain object that does not say what
+        // level it is.
+        .push(Attribute::single("msDS-Behavior-Version", functionality));
+    Entry::new(base_dn.to_string(), with_guid(attributes))
+}
+
+/// The `objectGUID` every object AD creates carries, left for the store to fill.
+fn with_guid(attributes: Attributes) -> Attributes {
+    attributes.push(Attribute::single(crate::model::ATTR_ENTRY_UUID, "").operational())
+}
+
 /// Creates the ones that are missing, and says which it created.
 ///
 /// Missing is read from the store rather than assumed: a directory grown from an import already

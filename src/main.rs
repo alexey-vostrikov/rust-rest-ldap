@@ -509,6 +509,33 @@ async fn serve() {
         }
     }
 
+    // The configuration partition, which only a domain has: its `CN=Partitions` is where a Windows
+    // client reads which DN answers for which DNS name, and it stops before that read if the root DSE
+    // names no such context.
+    #[cfg(feature = "kdc")]
+    let partition = match config.kerberos.realm.as_deref() {
+        Some(realm) if config.kerberos.enabled => {
+            let partition = rrl_directory::provision::Partition {
+                base_dn: config.base_dn.clone(),
+                dns_domain: realm.to_ascii_lowercase(),
+                // The first label of the realm, which is what a NetBIOS name is: AD files the
+                // domain's own `crossRef` under it, and a client looks the context up by that name.
+                netbios: realm.split('.').next().unwrap_or("AD").to_ascii_uppercase(),
+            };
+            match partition.ensure(&backend).await {
+                Ok(created) if !created.is_empty() => {
+                    eprintln!("provision: created {}", created.join(", "));
+                }
+                Ok(_) => {}
+                Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+            }
+            Some(partition)
+        }
+        _ => None,
+    };
+    #[cfg(not(feature = "kdc"))]
+    let partition = None;
+
     // Before the first write, because a change stamped before this point carries the id of
     // "no node" and a peer could not tell it from its own.
     rrl_directory::replication::set_server_id(config.server_id);
@@ -569,6 +596,27 @@ async fn serve() {
         match rrl_directory::sid::domain::Issuer::open(&backend, entropy) {
             Ok(issuer) => {
                 println!("domain: {} (next RID {})", issuer.sid(), issuer.peek());
+                // The domain object, which carries the SID the accounts are minted under. Written
+                // here rather than with the containers because it needs that SID, and the SID needs
+                // the store: a domain object with an invented one would describe another domain.
+                if partition.is_some() {
+                    let entry = rrl_directory::provision::domain_object(
+                        &config.base_dn,
+                        &issuer.sid(),
+                        config.emulation.functionality(),
+                    );
+                    let dn = entry.dn().to_string();
+                    match backend
+                        .apply(&[rrl_directory::backend::EntryChange::Upsert { entry }])
+                        .await
+                    {
+                        Ok(_) => eprintln!("provision: created {dn}"),
+                        Err(err) => fatal(&i18n::t(
+                            "error.server",
+                            &[("detail", &format!("'{dn}' could not be created: {err}"))],
+                        )),
+                    }
+                }
                 Some(Arc::new(issuer))
             }
             Err(err) => fatal(&i18n::t("error.server", &[("detail", &err.to_string())])),
@@ -637,9 +685,10 @@ async fn serve() {
                 dns_host_name: host.clone(),
                 ldap_service_name: format!("{realm}:host/{host}@{realm}"),
                 server_name: host,
-                // This tree has no configuration partition: a name pointing at a DN that does not
-                // exist is worse than an absent attribute, and a client that needs one asks.
-                configuration_naming_context: None,
+                // Published only when the partition was really created: a name pointing at a DN
+                // that does not exist is worse than an absent attribute, and a client that needs one
+                // asks for it by name.
+                configuration_naming_context: partition.as_ref().map(|partition| partition.dn()),
                 emulation: config.emulation.clone(),
             })
         }
