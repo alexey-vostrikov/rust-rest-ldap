@@ -180,6 +180,21 @@ pub fn domain_object(base_dn: &str, sid: &crate::sid::Sid, functionality: &str) 
         // and a domain object without it answers "the attribute is not there" for a join that has
         // otherwise been authorised.
         .push(Attribute::single("ms-DS-MachineAccountQuota", "10"))
+        // Where a domain keeps its machine and user containers. A Windows client reads this before
+        // it creates anything: with no value it cannot say where a computer account belongs, and the
+        // path it takes instead is a DCERPC one that needs an endpoint mapper this server does not
+        // publish - `NetpGetComputerObjectDn: Unable to bind to DS ... 0x6ba`, measured on the stand.
+        // `B:32:` is AD's own spelling: a 32-digit GUID, no dashes, and the DN.
+        .push(Attribute::new(
+            "wellKnownObjects",
+            vec![
+                format!(
+                    "B:32:{}:cn=computers,{base_dn}",
+                    crate::ldap::wkguid::COMPUTERS
+                ),
+                format!("B:32:{}:ou=users,{base_dn}", crate::ldap::wkguid::USERS),
+            ],
+        ))
         // The domain's functional level, which a client reads from this object rather than from the
         // root DSE: `NetpGetDomainData` answers `0x2` for a domain object that does not say what
         // level it is.
