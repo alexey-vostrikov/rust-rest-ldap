@@ -198,9 +198,13 @@ impl Session {
         self.wrap.as_mut()
     }
 
-    /// Installs the layer a successful bind established.
-    pub fn set_wrap(&mut self, wrap: super::sasl_bind::Wrap) {
-        self.wrap = Some(wrap);
+    /// Installs the layer a successful bind established, or removes it.
+    ///
+    /// `None` is a real answer, not an absence of one: a libsasl client that negotiates `none` in the
+    /// RFC 4752 round must not be answered with ciphertext, and a layer left installed from before
+    /// that round would do exactly that.
+    pub fn set_wrap(&mut self, wrap: Option<super::sasl_bind::Wrap>) {
+        self.wrap = wrap;
     }
 
     /// Whether the first SPNEGO token was sent and the client's answer is expected.

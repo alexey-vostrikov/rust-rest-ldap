@@ -300,6 +300,18 @@ pub fn handle(
                 dn = %request.base_object.0,
                 scope = ?request.scope,
                 filter = ?request.filter,
+                // What the client asked to have back. A client that stops after a search usually read
+                // the entry and found a field missing, and the field it wanted is named right here -
+                // without it, "the client did not like the answer" is all a log can say.
+                // Who is asking. A search refused with `noSuchObject` from the access rules is
+                // indistinguishable from a base that does not exist, and the difference is the whole
+                // answer: an anonymous session on a connection that has just bound.
+                requester = ?session.requester(),
+                attributes = ?request
+                    .attributes
+                    .iter()
+                    .map(|attribute| attribute.0.to_string())
+                    .collect::<Vec<_>>(),
                 "ldap: search"
             );
             let messages = search::handle_search(

@@ -132,6 +132,11 @@ impl Exchange {
     ) {
         (self.tokens, self.identity)
     }
+
+    /// The per-message key alone, for a layer that has all the identity it needs.
+    fn into_tokens(self) -> krb5::token::PerMessageTokens<krb5::token::ContextKey> {
+        self.tokens
+    }
 }
 
 /// The SASL security layer of one connection: confidentiality of every message after the bind.
@@ -150,6 +155,14 @@ impl Exchange {
 /// retransmissions, and a duplicated wrap is either a bug or an attack.
 pub struct Wrap {
     tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+    /// What the peer asked the layer to do, once it has said.
+    ///
+    /// `None` while the answer is not yet known, which happens on the one path that never negotiates:
+    /// a Windows LDAP client treats the completed Kerberos context as the security layer and starts
+    /// protecting its very next message, without an RFC 4752 round. It seals with `TOK_ID 0x0504`,
+    /// the integrity-only wrap, where Samba seals with `0x0505` - so the layer is read from the first
+    /// token the client sends rather than assumed from the mechanism.
+    mode: Option<Layer>,
     send: u64,
     /// The peer's next sequence number, once its first message has shown where it starts.
     ///
@@ -166,11 +179,69 @@ pub struct Wrap {
     pending: bool,
 }
 
+/// What the layer does to each message: integrity only, or integrity and confidentiality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// RFC 4121 §4.2.4: the token carries the message in the clear with a trailing checksum.
+    Integrity,
+    /// RFC 4121 §4.2.3: the token carries the message encrypted.
+    Confidentiality,
+}
+
+impl Layer {
+    /// The layer a wrap token announces.
+    ///
+    /// `TOK_ID` is `05 04` for **every** wrap token; whether the message inside it is encrypted is the
+    /// `Sealed` bit of the Flags octet (RFC 4121 §4.2.1, bit 1). Reading `05 05` as "sealed" is a
+    /// plausible mistake that cost a measurement: no such token id exists, every token read as
+    /// integrity, and the answer to a sealed one was `Wrap token has Sealed=true, but the integrity
+    /// service was requested`.
+    fn of_token(token: &[u8]) -> Option<Self> {
+        match token {
+            [0x05, 0x04, flags, ..] => Some(if flags & 0x02 != 0 {
+                Self::Confidentiality
+            } else {
+                Self::Integrity
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl Wrap {
-    /// A layer that takes effect after the next message this side writes.
+    /// A confidential layer that takes effect after the next message this side writes.
+    ///
+    /// Only the framing tests need to build one directly; every production path reaches
+    /// [`Wrap::implied`] or [`Wrap::negotiated`], which know what the peer asked for.
+    #[cfg(test)]
     fn pending(tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>) -> Self {
+        Self::negotiated(tokens, Layer::Confidentiality)
+    }
+
+    /// A layer the RFC 4752 round settled on, taking effect after the next message written.
+    fn negotiated(
+        tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+        layer: Layer,
+    ) -> Self {
         Self {
             tokens,
+            mode: Some(layer),
+            send: 0,
+            recv: None,
+            pending: true,
+        }
+    }
+
+    /// A layer that is not negotiated but implied, and learns what it is from the first token.
+    ///
+    /// A Windows LDAP client does this: the completed Kerberos context *is* the security layer, and
+    /// the next message it sends is already wrapped. Nothing announces it, so nothing can be assumed -
+    /// and a server that expected `0x0505` refused the `0x0504` it was sent with "the client is
+    /// sending SASL-wrapped data", which reads as a protocol the server does not speak.
+    fn implied(tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>) -> Self {
+        Self {
+            tokens,
+            mode: None,
             send: 0,
             recv: None,
             pending: true,
@@ -182,15 +253,51 @@ impl Wrap {
     pub fn active_for_test(tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>) -> Self {
         Self {
             tokens,
+            mode: Some(Layer::Confidentiality),
             send: 0,
             recv: None,
             pending: false,
         }
     }
 
-    /// Whether a message written now must be sealed.
+    /// The layer in force, or `None` while it is implied and the peer has not said.
+    #[cfg(test)]
+    pub fn layer(&self) -> Option<Layer> {
+        self.mode
+    }
+
+    /// Whether a message written now must be protected.
+    ///
+    /// False while the layer is implied and the peer has not yet shown what it does: answering a
+    /// client that has not started wrapping with a wrapped answer would be answering in a framing it
+    /// is still reading as plain BER.
     pub fn is_active(&self) -> bool {
+        !self.pending && self.mode.is_some()
+    }
+
+    /// Whether an incoming frame may be wrapped, which is the moment `pending` clears.
+    pub fn expects_layer(&self) -> bool {
         !self.pending
+    }
+
+    /// Whether the layer has yet to learn what the peer does.
+    pub fn is_undecided(&self) -> bool {
+        self.mode.is_none()
+    }
+
+    /// Takes the layer from a token the peer sent. Says what was learned the first time.
+    pub fn learn(&mut self, token: &[u8]) -> Result<Layer, String> {
+        let layer = Layer::of_token(token).ok_or_else(|| {
+            format!(
+                "the client sent a message that is not an RFC 4121 wrap token: it starts with {:02x?}, \
+                 and a wrap token starts with 05 04",
+                token.get(..4).unwrap_or(&[])
+            )
+        })?;
+        if self.mode.is_none() {
+            self.mode = Some(layer);
+        }
+        Ok(self.mode.unwrap_or(layer))
     }
 
     /// Lets the layer take effect: called once the announcing response has been written.
@@ -200,10 +307,14 @@ impl Wrap {
 
     /// Seals one LDAP message, with the four-octet length RFC 4422 §3.2 puts in front of it.
     pub fn seal(&mut self, message: &[u8]) -> Result<Vec<u8>, String> {
-        let token = self
-            .tokens
-            .emit_wrap(self.send, message)
-            .map_err(|err| format!("the SASL layer could not seal a reply: {err}"))?;
+        let token = match self.mode.unwrap_or(Layer::Confidentiality) {
+            Layer::Confidentiality => self.tokens.emit_wrap(self.send, message),
+            // Integrity only: the message travels in the clear behind a checksum, and the answer has
+            // to be in the same shape. A client that asked for integrity and is answered with
+            // ciphertext has no key schedule for it and reads the frame as garbage.
+            Layer::Integrity => self.tokens.emit_wrap_unsealed(self.send, message, 0),
+        }
+        .map_err(|err| format!("the SASL layer could not seal a reply: {err}"))?;
         self.send += 1;
         let mut framed = Vec::with_capacity(4 + token.len());
         framed.extend_from_slice(&(token.len() as u32).to_be_bytes());
@@ -213,10 +324,12 @@ impl Wrap {
 
     /// Opens one sealed message: the token's own length prefix has already been stripped.
     pub fn open(&mut self, token: &[u8]) -> Result<Vec<u8>, String> {
-        let verified = self
-            .tokens
-            .unwrap(token)
-            .map_err(|err| format!("the client's SASL layer could not be opened: {err}"))?;
+        let layer = self.learn(token)?;
+        let verified = match layer {
+            Layer::Confidentiality => self.tokens.unwrap(token),
+            Layer::Integrity => self.tokens.verify_wrap_unsealed(token),
+        }
+        .map_err(|err| format!("the client's SASL layer could not be opened: {err}"))?;
         // The first message names the starting point; every one after it must be exactly one more.
         // Accepting a jump would reopen the replay the sequence number exists to close, and
         // accepting the initial value from the client is not a concession: RFC 4121 §4.2.1 lets it
@@ -485,13 +598,13 @@ pub fn handle_gssapi(
                     spnego_accept(session, directory, &gssapi, token, security)
                 } else {
                     session.reset();
-                    begin(session, directory, &gssapi, token, security)
+                    begin(session, directory, &gssapi, token, security, &mechanism)
                 }
             }
             None if token.is_empty() && mechanism.eq_ignore_ascii_case(SPNEGO_MECHANISM) => {
                 offer_spnego(session)
             }
-            None => begin(session, directory, &gssapi, token, security),
+            None => begin(session, directory, &gssapi, token, security, &mechanism),
         }
     };
 
@@ -510,7 +623,7 @@ pub fn handle_gssapi(
             // Installed after the identity, because `reset` (inside a successful bind's own path
             // nowhere) would drop it; and it stays "pending" until the response below is written.
             if let Some(wrap) = wrap {
-                session.set_wrap(wrap);
+                session.set_wrap(Some(wrap));
             }
             sasl_response(message_id, code, &diagnostic, credentials)
         }
@@ -675,6 +788,7 @@ fn begin(
     gssapi: &crate::sasl::Gssapi,
     token: Vec<u8>,
     security: &Security,
+    mechanism: &str,
 ) -> Result<Round, SaslError> {
     if token.is_empty() {
         return Err(SaslError::Sequence(
@@ -739,19 +853,43 @@ fn begin(
         .per_message_tokens()
         .map_err(|err| SaslError::Ticket(err.to_string()))?;
 
+    // A second set for the layer. A Windows LDAP client does not run the RFC 4752 round: the
+    // completed context *is* the security layer, and its next message arrives already wrapped.
+    // Without an installed layer that message read as "the client is sending SASL-wrapped data", and
+    // the join stopped in `NetpGetNCData` with `0x37`. A libsasl client still gets its round - the
+    // mask it sends is a plain LDAP bind, and `accept_choice` replaces this layer with the one it
+    // asked for, or with none.
+    let layer = context
+        .per_message_tokens()
+        .map_err(|err| SaslError::Ticket(err.to_string()))?;
+
+    // A `GSS-SPNEGO` client is finished the moment it has the AP-REP: a Windows `wldap32` sends no
+    // further token at all and no RFC 4752 round, so a server that answers `saslBindInProgress` here
+    // waits for a bind that never comes - and the client, told `accept-completed` inside SPNEGO,
+    // carries on with its next request on a session this side never authenticated. Measured: the
+    // search for the domain arrived with `Requester { dn: None, admin: false }`, was refused
+    // `noSuchObject` by the access rules, and the join stopped in `NetpGetDomainData` with `0x2`.
+    //
+    // `GSSAPI` (libsasl) keeps the round: it has one, and it needs the layer mask.
+    let complete = mechanism.eq_ignore_ascii_case(SPNEGO_MECHANISM);
+
     session.set_sasl(Exchange {
         tokens,
         principal: context.client_principal.clone(),
-        identity,
+        identity: identity.clone(),
         stage: Stage::OfferSent,
     });
 
     Ok(Round {
-        code: ResultCode::SaslBindInProgress,
+        code: if complete {
+            ResultCode::Success
+        } else {
+            ResultCode::SaslBindInProgress
+        },
         credentials: Some(reply),
-        identity: None,
+        identity: complete.then_some(identity),
         diagnostic: String::new(),
-        wrap: None,
+        wrap: Some(Wrap::implied(layer)),
     })
 }
 
@@ -846,6 +984,15 @@ fn spnego_accept(
     let tokens = context
         .per_message_tokens()
         .map_err(|err| SaslError::Ticket(err.to_string()))?;
+    // A second set for the layer, which learns from the first frame the client sends. A Windows LDAP
+    // client does not close this conversation with an empty bind: the completed context *is* the
+    // security layer, and its next message arrives already wrapped. Measured on the AD-join stand,
+    // where the request after this answer was a `0x0504` wrap token and the server, having installed
+    // no layer, answered "the client is sending SASL-wrapped data" - and the join stopped in
+    // `NetpGetNCData` with `0x37`.
+    let layer = context
+        .per_message_tokens()
+        .map_err(|err| SaslError::Ticket(err.to_string()))?;
 
     session.set_spnego_offered(false);
     session.set_sasl(Exchange {
@@ -860,7 +1007,7 @@ fn spnego_accept(
         credentials: Some(reply),
         identity: None,
         diagnostic: String::new(),
-        wrap: None,
+        wrap: Some(Wrap::implied(layer)),
     })
 }
 
@@ -894,7 +1041,10 @@ fn spnego_finish(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslErr
         credentials: None,
         identity: Some(identity),
         diagnostic: String::new(),
-        wrap: Some(Wrap::pending(tokens)),
+        // Implied rather than assumed sealed: what the client does is read from its first protected
+        // frame. Samba seals (`0x0505`), a client that asked for integrity signs (`0x0504`), and a
+        // server that guessed wrong answered in a framing the client could not open.
+        wrap: Some(Wrap::implied(tokens)),
     })
 }
 
@@ -925,8 +1075,14 @@ fn offer_layer(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslError
         // zero, i.e. no layers at all, and a client answers "mechanism too weak" because there is
         // nothing it may select. libsasl builds the same four octets as `sasldata[0] |=
         // LAYER_NONE` plus `sasldata[1..3] = maxbufsize`.
-        const NO_LAYER: u8 = 1;
-        let mask = vec![NO_LAYER, 0, 0, 0];
+        // What this server can do, in RFC 4752 §3.1's one-octet mask: none (0x01), integrity
+        // (0x02) and confidentiality (0x04). Advertising `none` alone is a server that cannot hold a
+        // conversation a Windows client demands - and the client then protects its traffic anyway,
+        // which reads on this side as a framing it does not know.
+        const NO_LAYER: u8 = 0x01;
+        const INTEGRITY: u8 = 0x02;
+        const CONFIDENTIALITY: u8 = 0x04;
+        let mask = vec![NO_LAYER | INTEGRITY | CONFIDENTIALITY, 0, 0, 0];
 
         wrap_signed(&mask, exchange.tokens())?
     };
@@ -960,15 +1116,23 @@ fn accept_choice(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslErr
         )));
     }
 
-    const NO_LAYER: u8 = 1;
-    if chosen[0] & NO_LAYER == 0 {
-        return Err(SaslError::Layer(
-            "the client selected a security layer and this server offers only \"none\": TLS is \
-             where the encryption belongs. A client that insists on a SASL layer needs a server \
-             that implements one"
-                .to_string(),
-        ));
-    }
+    // RFC 4752 §3.1 numbers the layers in one octet, and the client sets exactly one of them:
+    // 0x01 none, 0x02 integrity, 0x04 confidentiality. Anything else is a client that did not read
+    // the mask this server sent, and a layer it did not choose would scramble the conversation.
+    const NO_LAYER: u8 = 0x01;
+    const INTEGRITY: u8 = 0x02;
+    const CONFIDENTIALITY: u8 = 0x04;
+    let layer = match chosen[0] {
+        NO_LAYER => None,
+        INTEGRITY => Some(Layer::Integrity),
+        CONFIDENTIALITY => Some(Layer::Confidentiality),
+        other => {
+            return Err(SaslError::Layer(format!(
+                "the client selected security layer {other:#04x}, which is not one of none (0x01), \
+                 integrity (0x02) or confidentiality (0x04): the answer to a mask this server sent"
+            )));
+        }
+    };
 
     // Anything after the four octets is the authorization identity the client would like to act
     // as. Not honoured: becoming somebody else is a right an access rule grants, not a field in a
@@ -984,14 +1148,22 @@ fn accept_choice(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslErr
         }
     }
 
+    // Installed from the exchange's own tokens, which is the key the client will protect its traffic
+    // with - the same one it just proved it holds by wrapping the choice.
+    let wrap = layer.map(|layer| {
+        let tokens = session
+            .take_sasl()
+            .expect("the exchange is taken once, here")
+            .into_tokens();
+        Wrap::negotiated(tokens, layer)
+    });
+
     Ok(Round {
         code: ResultCode::Success,
         credentials: None,
         identity: Some(identity),
         diagnostic: String::new(),
-        // The libsasl path negotiates the layer in the mask instead: this server offers "none", so
-        // there is nothing to wrap and nothing to keep.
-        wrap: None,
+        wrap,
     })
 }
 
@@ -1602,8 +1774,9 @@ mod tests {
 
         assert_eq!(
             plain,
-            vec![0x01, 0x00, 0x00, 0x00],
-            "one mask byte (\"no layer\") followed by a three-octet buffer size of zero"
+            vec![0x07, 0x00, 0x00, 0x00],
+            "one mask byte - none (0x01), integrity (0x02) and confidentiality (0x04) - followed by \
+             a three-octet buffer size of zero"
         );
     }
 
@@ -1775,14 +1948,51 @@ mod tests {
     }
 
     #[test]
-    fn a_client_that_insists_on_a_security_layer_is_refused() {
-        // Only "no layer" is offered, so only "no layer" may be chosen. Accepting a layer this
-        // server does not implement would mean the client encrypts what the server reads as
-        // plaintext - a connection that fails on the first search rather than at the bind.
+    fn a_client_that_chooses_a_layer_gets_that_layer() {
+        // RFC 4752 §3.1: one octet, and the client sets exactly the one it wants. This server offers
+        // all three, so all three are answers it has to keep - and the one it must not do is answer
+        // in ciphertext a client that asked for integrity, which was the shape of the failure a
+        // Windows client hit: it protected its traffic, the server read it as plain, and the join
+        // stopped on a framing nobody had agreed to.
+        for (byte, expected) in [
+            (0x02u8, Some(Layer::Integrity)),
+            (0x04u8, Some(Layer::Confidentiality)),
+            (0x01u8, None),
+        ] {
+            let (security, _dir) = security_with_keytab();
+            let mut session = exchanging(Stage::ChoiceExpected);
+            let choice = client_choice(&[byte, 0x00, 0x00, 0x00], &initiator_tokens());
+
+            let directory = crate::directory::Directory::from_entries(
+                "dc=example,dc=com",
+                "users",
+                "groups",
+                Vec::new(),
+            );
+            let response = handle_gssapi(
+                &mut session,
+                &directory,
+                1,
+                &gssapi_request(Some(choice)),
+                &security,
+            );
+
+            let body = bind_response_body(&response);
+            assert_eq!(body.result_code, ResultCode::Success, "layer {byte:#04x}");
+            // `None` for a layer means "no layer at all", which is the answer to 0x01 - so the
+            // absence of a `Wrap` and a `Wrap` with no mode are the same statement here.
+            let installed = session.wrap().and_then(|wrap| wrap.layer());
+            assert_eq!(installed, expected, "layer {byte:#04x}");
+        }
+    }
+
+    #[test]
+    fn a_layer_this_server_did_not_offer_is_refused_by_number() {
+        // 0x08 is not in the mask. A server that read it as "something is set, seal then" would
+        // protect a conversation the client believes is plain.
         let (security, _dir) = security_with_keytab();
         let mut session = exchanging(Stage::ChoiceExpected);
-        // Integrity only: bit 1 set, bit 0 clear.
-        let choice = client_choice(&[0x02, 0x00, 0x00, 0x00], &initiator_tokens());
+        let choice = client_choice(&[0x08, 0x00, 0x00, 0x00], &initiator_tokens());
 
         let directory = crate::directory::Directory::from_entries(
             "dc=example,dc=com",
@@ -1790,7 +2000,6 @@ mod tests {
             "groups",
             Vec::new(),
         );
-
         let response = handle_gssapi(
             &mut session,
             &directory,
@@ -1802,8 +2011,8 @@ mod tests {
         let body = bind_response_body(&response);
         assert_eq!(body.result_code, ResultCode::InvalidCredentials);
         assert!(
-            body.diagnostic_message.0.contains("offers only"),
-            "{}",
+            body.diagnostic_message.0.contains("0x08"),
+            "the refusal names the octet it could not read: {}",
             body.diagnostic_message.0
         );
     }

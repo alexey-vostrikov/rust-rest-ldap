@@ -130,7 +130,14 @@ fn check_limit(frame: FrameSize) -> Result<(), FrameError> {
 pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, CodecError> {
     let mut head = [0u8; 2];
     read_exact_or_eof(reader, &mut head).await?;
+    read_plain_message(reader, head).await
+}
 
+/// The rest of a plain message, its tag and first length octet already read.
+async fn read_plain_message<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    head: [u8; 2],
+) -> Result<Vec<u8>, CodecError> {
     if head[0] != SEQUENCE_TAG {
         // Not LDAP as this server speaks it - but one shape is worth naming rather than closing on
         // silence. A SASL security layer puts a four-octet big-endian length in front of an
@@ -206,9 +213,60 @@ pub async fn read_message_with<R: AsyncRead + Unpin>(
     reader: &mut R,
     wrap: Option<&mut super::sasl_bind::Wrap>,
 ) -> Result<Vec<u8>, CodecError> {
-    let Some(wrap) = wrap.filter(|wrap| wrap.is_active()) else {
+    // `expects_layer`, not `is_active`: a layer that is implied rather than negotiated has nothing to
+    // seal until the peer shows what it does, and the frames it sends are wrapped from the first one.
+    let Some(wrap) = wrap.filter(|wrap| wrap.expects_layer()) else {
         return read_message(reader).await;
     };
+
+    // The layer has yet to learn what the peer does. One byte decides it: an LDAP message is a BER
+    // SEQUENCE and always starts with `0x30`, while a protected frame starts with the first octet of a
+    // four-octet big-endian length, which is zero for any token this server will accept. Guessing from
+    // the session instead is what made a Windows client's first request unreadable.
+    if wrap.is_undecided() {
+        let mut first = [0u8; 1];
+        read_exact_or_eof(reader, &mut first).await?;
+        if first[0] == SEQUENCE_TAG {
+            let mut head = [0u8; 2];
+            head[0] = first[0];
+            read_exact_or_eof(reader, &mut head[1..]).await?;
+            let message = read_plain_message(reader, head).await?;
+            if std::env::var_os("RRL_LAYER_DIAG").is_some() {
+                let head: String = message
+                    .iter()
+                    .take(48)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                eprintln!(
+                    "plain-diag: first=0x{:02x} len={} head={head}",
+                    first[0],
+                    message.len()
+                );
+            }
+            return Ok(message);
+        }
+        let mut rest = [0u8; 3];
+        read_exact_or_eof(reader, &mut rest).await?;
+        let len = u32::from_be_bytes([first[0], rest[0], rest[1], rest[2]]) as usize;
+        if len == 0 || len > MAX_FRAME_LEN {
+            return Err(CodecError::Frame(FrameError::TooLong(len)));
+        }
+        let mut token = vec![0u8; len];
+        reader
+            .read_exact(&mut token)
+            .await
+            .map_err(|_| CodecError::Frame(FrameError::Truncated))?;
+        let opened = wrap.open(&token).map_err(CodecError::Wrap)?;
+        if std::env::var_os("RRL_LAYER_DIAG").is_some() {
+            let head: String = opened.iter().take(40).map(|b| format!("{b:02x}")).collect();
+            eprintln!(
+                "layer-diag: token={} plain={} head={head}",
+                token.len(),
+                opened.len()
+            );
+        }
+        return Ok(opened);
+    }
 
     let mut head = [0u8; 4];
     read_exact_or_eof(reader, &mut head).await?;
@@ -224,7 +282,16 @@ pub async fn read_message_with<R: AsyncRead + Unpin>(
         .await
         .map_err(|_| CodecError::Frame(FrameError::Truncated))?;
 
-    wrap.open(&token).map_err(CodecError::Wrap)
+    let opened = wrap.open(&token).map_err(CodecError::Wrap)?;
+    if std::env::var_os("RRL_LAYER_DIAG").is_some() {
+        let head: String = opened.iter().take(40).map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "layer-diag: token={} plain={} head={head}",
+            token.len(),
+            opened.len()
+        );
+    }
+    Ok(opened)
 }
 
 /// Writes one LDAP message, sealing it when the session's layer is in force.
