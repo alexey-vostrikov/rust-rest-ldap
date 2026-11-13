@@ -288,7 +288,9 @@ fn rid_of(attributes: &crate::model::Attributes) -> Option<u32> {
     Some(u32::from_le_bytes(last.try_into().ok()?))
 }
 
-#[cfg(test)]
+// The module under test is the directory seen through `smb_server`'s traits, and those do not exist
+// without the `smb` feature: an unguarded `#[cfg(test)]` made the `kdc`-only build impossible to test.
+#[cfg(all(test, feature = "smb"))]
 mod tests {
     use super::*;
     use crate::model::{Attribute, Entry};

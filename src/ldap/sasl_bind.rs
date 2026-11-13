@@ -272,27 +272,17 @@ pub const MECHANISMS: [&str; 2] = ["GSSAPI", "GSS-SPNEGO"];
 /// another.
 const SPNEGO_MECHANISM: &str = "GSS-SPNEGO";
 
-/// The NTLMSSP OID, DER-encoded: `1.3.6.1.4.1.311.2.2.10`.
+/// Whether the client asked for NTLMSSP, as opposed to merely being able to.
 ///
-/// `GSS-SPNEGO` is a container, and which mechanism is inside decides who can answer: a client that
-/// put NTLMSSP there is asking for something this server does not offer, and saying "the token is
-/// not a Kerberos ticket" sends the operator to look at the ticket instead of at the client's
-/// choice. The OID is the only part of a negTokenInit that names the arm without parsing DER.
-const NTLMSSP_OID: [u8; 12] = [
-    0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
-];
-
-/// Whether a token offers NTLMSSP among its mechanisms.
+/// `GSS-SPNEGO` is a container, and which mechanism is inside decides who can answer.
 ///
-/// A scan, not a parse: the OID appears in the clear in every negTokenInit that offers NTLM, and a
-/// full DER walk to learn one fact would be a parser to keep correct for a message this server
-/// refuses anyway. A token that offers both Kerberos and NTLM still contains the OID, and is
-/// reported as offering NTLM - which is true, and the reason the refusal says what it says.
+/// The mechanism is read from the `mechToken`, never from the `mechTypes` offer: measured on the
+/// AD-join stand, a Windows client offers four mechanisms (MS KRB5, krb5, NEGOEX, NTLMSSP) and sends
+/// a Kerberos AP-REQ, so reading the offer as the choice refused the ticket it had just built - and
+/// the client reported `49 invalidCredentials`, which reads as a wrong password.
 pub fn chose_ntlmssp(token: &[u8]) -> bool {
-    // The mechanism a client chose is the one its `mechToken` is built for - not any OID in its
-    // `mechTypes` offer. Measured on the AD-join stand: a Windows `wldap32` bind offers four
-    // mechanisms (MS KRB5, krb5, NEGOEX, NTLMSSP) and sends a Kerberos AP-REQ, so a substring match
-    // over the whole token refused the very ticket the client had just built.
+    // With the SMB acceptor compiled in, the question is answered by finding an NTLM message where a
+    // mechanism token goes; without it there is nothing to accept NTLM with, and the answer is no.
     #[cfg(feature = "smb")]
     {
         super::ntlm_bind::inside_spnego(token).is_some()
@@ -443,12 +433,13 @@ pub fn handle_gssapi(
     #[cfg(feature = "smb")]
     let ntlm = super::ntlm_bind::is_ntlm(&token) || ntlm_inner.is_some();
     // A four-octet token after a completed NTLM bind is RFC 4752's layer choice, not an LDAP message:
-    // it arrives before any request and would otherwise be refused as a malformed one.
-    // Wrapped or not: the layer choice is four octets either way, and a client that wrapped its
+    // it arrives before any request and would otherwise be refused as a malformed one. Wrapped or not: the layer choice is four octets either way, and a client that wrapped its
     // negotiate wraps this too.
     #[cfg(feature = "smb")]
     let ntlm_layer = session.ntlm_negotiate().is_some()
         && (token.len() == 4 || ntlm_inner.as_ref().is_some_and(|inner| inner.len() == 4));
+    #[cfg(not(feature = "smb"))]
+    let ntlm_layer = false;
 
     // Every LDAP operation a client asks for, by name and number. `Add-Computer` moves through
     // several - a search for the domain, an add of the machine account, a modify of its attributes -
@@ -710,7 +701,8 @@ fn begin(
 
     // A `GSS-SPNEGO` conversation whose inner mechanism is NTLMSSP is not a Kerberos token that
     // failed to parse - it is a client asking for a mechanism this server does not offer, and the
-    // refusal has to say which. See `NTLMSSP_OID`.
+    // refusal has to say which. Reached only without the `smb` feature, where the NTLM acceptor is
+    // not compiled in.
     if chose_ntlmssp(&token) {
         if std::env::var_os("RRL_SMB_HEX").is_some() {
             let hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
@@ -1333,15 +1325,6 @@ mod tests {
         assert!(session.identity().is_none());
     }
 
-    /// NTLMSSP's OID spelled out, `1.3.6.1.4.1.311.2.2.10`, and deliberately not `NTLMSSP_OID`.
-    ///
-    /// A fixture built from the constant it tests moves with it: changing one octet of the constant
-    /// used to leave these tests green, because both sides changed together. These bytes come from
-    /// the OID's own arithmetic, so a wrong constant now fails instead of agreeing with itself.
-    const NTLMSSP_AS_SENT: [u8; 12] = [
-        0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
-    ];
-
     /// The OID, in the framing a client puts it in: `[APPLICATION 0]` wrapping `[0]` wrapping the
     /// mechanism list. Only the bytes the scan looks for matter here.
     /// A `NegTokenInit` offering `oids` and carrying `mech` as the mechanism token.
@@ -1410,8 +1393,8 @@ mod tests {
     /// of a client that sent a Kerberos ticket.
     fn offers_ntlmssp(token: &[u8]) -> bool {
         token
-            .windows(NTLMSSP_OID.len())
-            .any(|window| window == NTLMSSP_OID)
+            .windows(NTLMSSP_OID_CONTENT.len())
+            .any(|window| window == NTLMSSP_OID_CONTENT)
     }
 
     /// An NTLM NEGOTIATE, as far as anything reading it needs: the signature and a message type.
