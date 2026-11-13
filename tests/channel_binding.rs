@@ -129,10 +129,13 @@ fn a_ticket_bound_to_a_certificate_is_accepted_with_that_certificate() {
     let mut options = krb5::acceptor::AcceptOptions::default();
     options.channel_bindings = Some(binding);
 
-    let accepted = krb5::spnego::SpnegoAcceptor::with_options(&keytab, options)
-        .step(&ap_req(Some(&krb5::ChannelBindings::new(
-            b"tls-server-end-point:example".to_vec(),
-        ))))
+    let accepted = krb5::spnego::SpnegoAcceptor::with_options(options)
+        .step(
+            &keytab,
+            &ap_req(Some(&krb5::ChannelBindings::new(
+                b"tls-server-end-point:example".to_vec(),
+            ))),
+        )
         .expect("accepted on the session it was bound to");
     assert!(accepted.is_some(), "the acceptor answers with the AP-REP");
 }
@@ -148,9 +151,12 @@ fn a_ticket_bound_to_another_session_is_refused() {
         b"tls-server-end-point:the-real-one".to_vec(),
     ));
 
-    let refused = krb5::spnego::SpnegoAcceptor::with_options(&keytab, options).step(&ap_req(Some(
-        &krb5::ChannelBindings::new(b"tls-server-end-point:captured-elsewhere".to_vec()),
-    )));
+    let refused = krb5::spnego::SpnegoAcceptor::with_options(options).step(
+        &keytab,
+        &ap_req(Some(&krb5::ChannelBindings::new(
+            b"tls-server-end-point:captured-elsewhere".to_vec(),
+        ))),
+    );
 
     // The *reason* matters as much as the refusal: a test that only asserted `is_err` would pass on
     // an expired ticket or a broken key, and this one is here to prove the binding did the work.
@@ -171,8 +177,8 @@ fn a_ticket_with_no_binding_is_accepted_by_an_acceptor_that_has_one() {
         b"tls-server-end-point:ours".to_vec(),
     ));
 
-    let accepted = krb5::spnego::SpnegoAcceptor::with_options(&keytab, options)
-        .step(&ap_req(None))
+    let accepted = krb5::spnego::SpnegoAcceptor::with_options(options)
+        .step(&keytab, &ap_req(None))
         .expect("a client that did not bind is accepted");
 
     assert!(accepted.is_some());

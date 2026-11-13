@@ -832,10 +832,12 @@ fn begin(
     // One cache for the whole process: a captured AP-REQ replayed on a *new* connection has to be
     // refused, and a per-connection cache would refuse nothing.
     let options = accept_options(security, gssapi);
-    let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(gssapi.keytab(), options);
+    // The keytab is handed over per step rather than kept: an exchange can take several rounds,
+    // and holding a borrow across them would put a lifetime on every context that holds one.
+    let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(options);
 
     let reply = acceptor
-        .step(&token)
+        .step(gssapi.keytab(), &token)
         .map_err(|err| SaslError::Ticket(err.to_string()))?
         .ok_or_else(|| SaslError::Ticket("the acceptor produced no reply".to_string()))?;
 
@@ -955,10 +957,12 @@ fn spnego_accept(
     }
 
     let options = accept_options(security, gssapi);
-    let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(gssapi.keytab(), options);
+    // The keytab is handed over per step rather than kept: an exchange can take several rounds,
+    // and holding a borrow across them would put a lifetime on every context that holds one.
+    let mut acceptor = krb5::spnego::SpnegoAcceptor::with_options(options);
 
     let reply = acceptor
-        .step(&token)
+        .step(gssapi.keytab(), &token)
         .map_err(|err| SaslError::Ticket(err.to_string()))?
         .ok_or_else(|| SaslError::Ticket("the acceptor produced no reply".to_string()))?;
 
