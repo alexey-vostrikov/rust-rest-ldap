@@ -64,6 +64,17 @@ pub struct SmbConfig {
     /// The domain's NetBIOS name, `AD`. Derived from `dns_domain` when absent.
     #[serde(default)]
     pub domain_netbios: Option<String>,
+    /// The `ncacn_ip_tcp` port `drsuapi` is served on, the one the endpoint mapper names.
+    ///
+    /// A Windows join asks the endpoint mapper (port 135) where `drsuapi` lives and is told a **TCP
+    /// port**; it then opens that port and binds the replication interface there. A server that
+    /// offers no such port is a controller the join cannot reach, whatever else answers correctly -
+    /// measured: without it `NetpGetComputerObjectDn` fails with `RPC_S_SERVER_UNAVAILABLE`.
+    ///
+    /// Off unless set, because a port nobody asked for is a listener nobody wanted. A real domain
+    /// controller picks a dynamic port and publishes it through the mapper; this states it here
+    /// because the mapper is not implemented yet.
+    pub drsuapi_port: Option<u16>,
     /// A keytab for Kerberos in SESSION_SETUP.
     ///
     /// Without it the server accepts NTLM only, which a Samba member can use with an administrator's
@@ -101,6 +112,8 @@ pub struct Settings {
     pub keytab: Option<PathBuf>,
     /// The accounts resolved to their passwords.
     pub users: Vec<(String, String)>,
+    /// Where `drsuapi` is served over `ncacn_ip_tcp`, when it is served at all.
+    pub drsuapi_tcp: Option<SocketAddr>,
     /// The DNS name of the domain, `ad.example.com`.
     ///
     /// Answered by `lsarpc` when a member asks what domain it has reached. A client compares this
@@ -189,8 +202,17 @@ impl Settings {
             users.push((user.name.clone(), password));
         }
 
+        // A port of zero would ask the operating system to pick one that no client can be told
+        // about: the mapper is not implemented, so the number here *is* the answer a client gets.
+        let drsuapi_tcp = match config.drsuapi_port {
+            None => None,
+            Some(0) => return Err("smb.drsuapi_port is 0, which names no port".to_string()),
+            Some(port) => Some(SocketAddr::new(bind_ip, port)),
+        };
+
         Ok(Settings {
             bind: SocketAddr::new(bind_ip, port),
+            drsuapi_tcp,
             netbios_name,
             keytab: config.keytab.clone(),
             users,
@@ -222,6 +244,46 @@ mod tests {
             enabled: true,
             ..SmbConfig::default()
         }
+    }
+
+    #[test]
+    fn a_drsuapi_port_is_carried_as_an_address_on_the_same_interface() {
+        let settings = Settings::resolve(
+            &SmbConfig {
+                drsuapi_port: Some(49_152),
+                ..config()
+            },
+            Ipv4Addr::LOCALHOST.into(),
+            Some("SAMBA"),
+        )
+        .expect("resolves");
+        assert_eq!(
+            settings.drsuapi_tcp,
+            Some("127.0.0.1:49152".parse().expect("a literal address"))
+        );
+    }
+
+    #[test]
+    fn no_drsuapi_port_means_no_listener() {
+        let settings =
+            Settings::resolve(&config(), Ipv4Addr::LOCALHOST.into(), Some("SAMBA")).expect("ok");
+        assert_eq!(settings.drsuapi_tcp, None);
+    }
+
+    #[test]
+    fn a_drsuapi_port_of_zero_is_a_startup_error() {
+        // The mapper is not implemented, so the number in the configuration *is* what a client is
+        // told; zero would ask the operating system for one nobody can be told about.
+        let err = Settings::resolve(
+            &SmbConfig {
+                drsuapi_port: Some(0),
+                ..config()
+            },
+            Ipv4Addr::LOCALHOST.into(),
+            Some("SAMBA"),
+        )
+        .expect_err("refuses");
+        assert!(err.contains("drsuapi_port"), "{err}");
     }
 
     #[test]

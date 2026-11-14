@@ -16,6 +16,8 @@ pub struct Running {
     pub bind: std::net::SocketAddr,
     /// The name it answers to.
     pub netbios_name: String,
+    /// Where `drsuapi` answers over `ncacn_ip_tcp`, and the task serving it.
+    pub drsuapi: Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>,
     /// Stops the accept loop and closes each connection.
     shutdown: smb_server::ShutdownHandle,
     /// The task running it.
@@ -117,9 +119,54 @@ pub async fn start(
         }
     });
 
+    // `drsuapi` over `ncacn_ip_tcp`, when a port is stated: the endpoint the mapper names and a
+    // join binds before it learns where its own account goes. Taken before answering the caller, so
+    // a port already in use is this function's error and not a task that dies a second later.
+    let drsuapi = match settings.drsuapi_tcp {
+        None => None,
+        Some(addr) => {
+            let endpoint = smb_server::tcp::Endpoint {
+                addr,
+                nb_domain: settings
+                    .domain_netbios
+                    .clone()
+                    .unwrap_or_else(|| settings.netbios_name.clone()),
+                dns_domain: settings.dns_domain.clone().unwrap_or_default(),
+                nb_computer: settings.netbios_name.clone(),
+                dns_computer: settings.dns_domain.as_deref().map_or_else(
+                    || settings.netbios_name.clone(),
+                    |domain| {
+                        format!(
+                            "{}.{}",
+                            settings.netbios_name.to_ascii_lowercase(),
+                            domain.to_ascii_lowercase()
+                        )
+                    },
+                ),
+                // The same keytab SMB uses: a client's service ticket is for a principal this
+                // server already holds keys for, and a second keytab would be a second answer to
+                // one question.
+                keytab: settings.keytab.clone(),
+            };
+            // A listener that cannot be taken is a startup failure naming the address, which is what
+            // an operator can act on; the port is released again immediately, because the task
+            // binds it for real and two listeners for one address must not exist even for a moment.
+            std::net::TcpListener::bind(endpoint.addr)
+                .and_then(|probe| probe.set_nonblocking(true))
+                .map_err(|err| format!("drsuapi on {}: {err}", endpoint.addr))?;
+            let task = tokio::spawn(async move {
+                if let Err(err) = smb_server::tcp::serve(endpoint).await {
+                    eprintln!("drsuapi: {err}");
+                }
+            });
+            Some((addr, task))
+        }
+    };
+
     Ok(Running {
         bind,
         netbios_name: settings.netbios_name.clone(),
+        drsuapi,
         shutdown,
         task,
     })
